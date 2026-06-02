@@ -1,6 +1,20 @@
 import type * as vscode from 'vscode';
 import type { Finding, GlobalReport } from '../ai/types';
 
+/** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
+export interface Annotation {
+  id: string;
+  kind: 'translate' | 'explain' | 'note';
+  /** 1-based source line range the selection covered; 0 when not anchored. */
+  startLine: number;
+  endLine: number;
+  /** The original text the reviewer selected. */
+  sourceText: string;
+  /** The translation or note content. */
+  content: string;
+  createdAt: number;
+}
+
 /** Per-file review progress. */
 export interface PerFileState {
   /** Line numbers (1-based) that have been scrolled into view. */
@@ -13,6 +27,22 @@ export interface PerFileState {
   findings: Finding[];
   /** Finding ids the reviewer has manually confirmed. */
   confirmedFindings: string[];
+  /** Reviewer translations / notes, persisted with the review. */
+  annotations?: Annotation[];
+}
+
+/** The reviewer's final verdict for a review, persisted once submitted. */
+export interface ReviewConclusion {
+  /** Machine-readable verdict. */
+  verdict: 'approve' | 'request-changes' | 'comment';
+  /** Human-readable label shown in the UI. */
+  label: string;
+  /** Whether the verdict was written back to a PR or only recorded locally. */
+  target: 'pr' | 'local';
+  /** The PR number, when target is 'pr'. */
+  prNumber?: number;
+  /** When the conclusion was submitted (epoch ms). */
+  submittedAt: number;
 }
 
 /** A complete, persistable snapshot of one review. */
@@ -27,6 +57,8 @@ export interface ReviewSnapshot {
   /** Cross-file analysis report, once global analysis has run. */
   globalReport?: GlobalReport;
   globalDone: boolean;
+  /** The reviewer's final verdict, once submitted. */
+  conclusion?: ReviewConclusion;
   updatedAt: number;
 }
 

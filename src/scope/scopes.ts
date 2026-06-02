@@ -2,6 +2,17 @@ import * as git from './gitClient';
 import { ensureAuth, ensureGhAvailable, getCurrentPr } from '../gh/ghClient';
 import type { ReviewFile, ReviewScope, ReviewSet } from './types';
 
+/** Stable, order-independent short hash of a set of paths (FNV-1a, base36). */
+function hashPaths(paths: string[]): string {
+  const joined = [...paths].sort().join('\n');
+  let h = 0x811c9dc5;
+  for (let i = 0; i < joined.length; i++) {
+    h ^= joined.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
 /** PR associated with the current branch (via GitHub CLI). Lists files only. */
 export class PrScope implements ReviewScope {
   async load(cwd: string): Promise<ReviewSet> {
@@ -61,7 +72,7 @@ export class FileSystemScope implements ReviewScope {
     const headSha = await git.headShaOrLive(cwd);
     const files: ReviewFile[] = this.relPaths.map((path) => ({ path }));
     return {
-      scopeId: `files-${files.length}`,
+      scopeId: `files-${files.length}-${hashPaths(this.relPaths)}`,
       label: `选定的源码（${files.length}）`,
       headSha,
       files,

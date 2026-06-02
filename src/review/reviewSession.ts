@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
+import * as path from 'node:path';
 import type { ReviewSet } from '../scope/types';
 import type { Finding, GlobalReport } from '../ai/types';
-import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore } from './reviewStore';
+import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion } from './reviewStore';
 
 /**
  * Holds the in-memory state of the active review and persists it through a
@@ -58,12 +59,36 @@ export class ReviewSession {
       if (s && !Array.isArray(s.findings)) {
         s.findings = [];
       }
+      if (s && !Array.isArray(s.annotations)) {
+        s.annotations = [];
+      }
     }
     this._onDidChange.fire();
   }
 
   fileState(path: string): PerFileState | undefined {
     return this.snapshot?.perFile[path];
+  }
+
+  /**
+   * Resolves a file-scheme document/URI to its review-set relative path, or
+   * undefined if the file is not part of the active review set. This is the
+   * single source of truth for "is this document under review, and as what path".
+   */
+  relPathInSet(uri: vscode.Uri): string | undefined {
+    if (uri.scheme !== 'file' || !this.reviewSet) {
+      return undefined;
+    }
+    const root = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath
+      ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      return undefined;
+    }
+    const rel = path.relative(root, uri.fsPath).split(path.sep).join('/');
+    if (!rel || rel.startsWith('..')) {
+      return undefined;
+    }
+    return this.reviewSet.files.some((f) => f.path === rel) ? rel : undefined;
   }
 
   /** Coverage for a file: how many of its lines have been seen, out of total. */
@@ -112,7 +137,8 @@ export class ReviewSession {
       return false;
     }
     const fullySeen = s.totalLines > 0 && s.seenLines.length >= s.totalLines;
-    return fullySeen && s.analyzed;
+    const allConfirmed = s.findings.every((f) => s.confirmedFindings.includes(f.id));
+    return fullySeen && s.analyzed && allConfirmed;
   }
 
   /** Whether every line of the file has been seen (coverage complete). */
@@ -129,11 +155,75 @@ export class ReviewSession {
     }
     s.findings = findings;
     s.analyzed = true;
+    // Drop confirmations that no longer correspond to a current finding.
+    const ids = new Set(findings.map((f) => f.id));
+    s.confirmedFindings = s.confirmedFindings.filter((id) => ids.has(id));
     void this.persist();
   }
 
   findings(path: string): Finding[] {
     return this.fileState(path)?.findings ?? [];
+  }
+
+  /** Whether a specific finding has been confirmed read by the reviewer. */
+  isFindingConfirmed(path: string, findingId: string): boolean {
+    return !!this.fileState(path)?.confirmedFindings.includes(findingId);
+  }
+
+  /** Toggles confirmation of a single finding; returns the new state. */
+  toggleFindingConfirmed(path: string, findingId: string): boolean {
+    const s = this.fileState(path);
+    if (!s) {
+      return false;
+    }
+    const idx = s.confirmedFindings.indexOf(findingId);
+    let confirmed: boolean;
+    if (idx >= 0) {
+      s.confirmedFindings.splice(idx, 1);
+      confirmed = false;
+    } else {
+      s.confirmedFindings.push(findingId);
+      confirmed = true;
+    }
+    void this.persist();
+    return confirmed;
+  }
+
+  /** Count of unconfirmed findings for a file. */
+  unconfirmedCount(path: string): number {
+    const s = this.fileState(path);
+    if (!s) {
+      return 0;
+    }
+    return s.findings.filter((f) => !s.confirmedFindings.includes(f.id)).length;
+  }
+
+  /** Reviewer translations / notes attached to a file. */
+  annotations(path: string): Annotation[] {
+    return this.fileState(path)?.annotations ?? [];
+  }
+
+  /** Adds a translation / note to a file and persists it. */
+  addAnnotation(path: string, annotation: Annotation): void {
+    const s = this.fileState(path);
+    if (!s) {
+      return;
+    }
+    (s.annotations ??= []).push(annotation);
+    void this.persist();
+  }
+
+  /** Removes an annotation by id. */
+  removeAnnotation(path: string, id: string): void {
+    const s = this.fileState(path);
+    if (!s?.annotations) {
+      return;
+    }
+    const next = s.annotations.filter((a) => a.id !== id);
+    if (next.length !== s.annotations.length) {
+      s.annotations = next;
+      void this.persist();
+    }
   }
 
   /** Stores the cross-file global report (reviewer must still confirm it). */
@@ -158,6 +248,18 @@ export class ReviewSession {
 
   get globalConfirmed(): boolean {
     return !!this.snapshot?.globalDone;
+  }
+
+  /** Records the reviewer's final verdict so it survives reloads. */
+  setConclusion(conclusion: ReviewConclusion): void {
+    if (this.snapshot) {
+      this.snapshot.conclusion = conclusion;
+      void this.persist();
+    }
+  }
+
+  get conclusion(): ReviewConclusion | undefined {
+    return this.snapshot?.conclusion;
   }
 
   allFilesReady(): boolean {

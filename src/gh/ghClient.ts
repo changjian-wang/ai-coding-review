@@ -77,3 +77,19 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
 export async function getPrDiff(cwd: string): Promise<string> {
   return runGh(['pr', 'diff'], cwd);
 }
+
+/** Posts a review verdict to a PR via `gh pr review`. */
+export async function submitPrReview(
+  cwd: string,
+  prNumber: number,
+  verdict: 'approve' | 'request-changes' | 'comment',
+  body: string,
+): Promise<void> {
+  const flag =
+    verdict === 'approve' ? '--approve' : verdict === 'request-changes' ? '--request-changes' : '--comment';
+  const args = ['pr', 'review', String(prNumber), flag];
+  if (body.trim()) {
+    args.push('--body', body);
+  }
+  await runGh(args, cwd);
+}

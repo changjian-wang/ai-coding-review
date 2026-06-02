@@ -27,15 +27,20 @@
     "views": {
       "codereview": [
         {
-          "id": "codereview.changedFiles",
-          "name": "Review Files"
+          "id": "codereview.home",
+          "name": "Code Review"
         }
       ]
     },
     "viewsWelcome": [
       {
-        "view": "codereview.changedFiles",
-        "contents": "尚未选择审查范围。\n[选择要审查的源码](command:codereview.startReview)\n\n可选：直接挑选文件/文件夹、PR、分支对比、未提交的改动。审查对象始终是源码本身。"
+        "view": "codereview.home",
+        "contents": "Code Review Gate\n\n[选择要审查的源码](command:codereview.startReview)\n\n可选：直接挑选文件/文件夹、PR、分支对比、未提交的改动。审查对象始终是源码本身。\n\n开始后将打开「审查工作台」——所有操作都在工作台内完成。"
+      },
+      {
+        "view": "codereview.home",
+        "contents": "[打开审查工作台](command:codereview.openWorkbench)",
+        "when": "codereview.active"
       }
     ],
     "commands": [
@@ -48,6 +53,11 @@
         "command": "codereview.pickModel",
         "title": "Code Review: Select Analysis Model",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "codereview.openWorkbench",
+        "title": "Code Review: Open Workbench",
+        "icon": "$(layout)"
       },
       {
         "command": "codereview.openFile",
@@ -72,39 +82,18 @@
         "command": "codereview.submitConclusion",
         "title": "Code Review: Submit Conclusion",
         "icon": "$(check-all)"
+      },
+      {
+        "command": "codereview.locateFinding",
+        "title": "Code Review: Locate Finding"
+      },
+      {
+        "command": "codereview.jumpToNextUnseen",
+        "title": "Code Review: Jump to Next Unseen Line",
+        "icon": "$(arrow-down)"
       }
     ],
-    "menus": {
-      "view/title": [
-        {
-          "command": "codereview.startReview",
-          "when": "view == codereview.changedFiles",
-          "group": "navigation@1"
-        },
-        {
-          "command": "codereview.pickModel",
-          "when": "view == codereview.changedFiles",
-          "group": "navigation@2"
-        },
-        {
-          "command": "codereview.globalAnalysis",
-          "when": "view == codereview.changedFiles",
-          "group": "navigation@3"
-        },
-        {
-          "command": "codereview.submitConclusion",
-          "when": "view == codereview.changedFiles",
-          "group": "navigation@4"
-        }
-      ],
-      "editor/title": [
-        {
-          "command": "codereview.analyzeFile",
-          "when": "editorTextFocus",
-          "group": "navigation@9"
-        }
-      ]
-    }
+    "menus": {}
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -114,9 +103,14 @@
     "check-types": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.96.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "markdown-it": "^14.2.0"
   }
 }
