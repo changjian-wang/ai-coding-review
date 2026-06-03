@@ -10,6 +10,7 @@ import type {
   GlobalVerdict,
   VerdictKind,
 } from './types';
+import { languageDirective } from './lang';
 
 /** Raised when analysis cannot complete; message is user-facing. */
 export class AnalysisError extends Error {}
@@ -59,9 +60,13 @@ async function ask(
   system: string,
   user: string,
   token: vscode.CancellationToken,
+  options: { skipLanguageDirective?: boolean } = {},
 ): Promise<string> {
+  const fullSystem = options.skipLanguageDirective
+    ? system
+    : `${languageDirective()}\n\n${system}`;
   const messages = [
-    vscode.LanguageModelChatMessage.User(system),
+    vscode.LanguageModelChatMessage.User(fullSystem),
     vscode.LanguageModelChatMessage.User(user),
   ];
   let out = '';
@@ -86,18 +91,18 @@ export async function translateToChinese(
   token: vscode.CancellationToken,
 ): Promise<string> {
   const system = '你是专业的技术翻译。把用户给出的内容翻译成简洁、准确的简体中文，保留代码标识符与术语。只输出译文，不要任何解释、引号或 markdown 围栏。';
-  const out = await ask(model, system, text, token);
+  const out = await ask(model, system, text, token, { skipLanguageDirective: true });
   return out.trim();
 }
 
-/** Explains a snippet of code in Simplified Chinese, returning plain prose. */
+/** Explains a snippet of code, returning plain prose in the configured language. */
 export async function explainCode(
   model: vscode.LanguageModelChat,
   code: string,
   token: vscode.CancellationToken,
 ): Promise<string> {
   const system =
-    '你是资深代码审查助手。用简体中文解释用户给出的这段代码：它做什么、关键逻辑/控制流、涉及的副作用或边界条件，以及可能值得注意的风险点。' +
+    '你是资深代码审查助手。解释用户给出的这段代码：它做什么、关键逻辑/控制流、涉及的副作用或边界条件，以及可能值得注意的风险点。' +
     '语言简洁专业，可用短句或最多 3-5 条要点。只输出解释正文，不要复述原代码，不要 markdown 标题或代码围栏。';
   const out = await ask(model, system, code, token);
   return out.trim();
@@ -320,4 +325,68 @@ ${fileContent}
     t = fence[1].trim();
   }
   return t;
+}
+
+/** A single fix proposal: a minimal in-file replacement plus its rationale. */
+export interface FixProposal {
+  title: string;
+  rationale: string;
+  /** Exact substring of the current file content; must appear once. */
+  oldText: string;
+  /** Replacement text; may be empty (pure deletion). */
+  newText: string;
+}
+
+const FIX_PROPOSALS_SYSTEM_PROMPT = `你是一名资深工程师。给你一个源码文件以及一个针对某一行附近的代码审查发现，请提出修复方案。
+- 由你判断给出几个方案（1 到 3 个），优先质量而非数量；如果只有一种合理改法就只给 1 个。
+- 每个方案必须是「精确字符串替换」：oldText 取自当前文件、是连续若干行且在文件中只出现一次；newText 是替换后的内容（可以为空字符串表示删除）。
+- oldText 不要取得太大；只覆盖真正需要改的最小连续片段，但要留足上下文使其唯一定位。
+- 不要修改与本问题无关的格式或行尾空白。
+- 行号语义：用户给你的源码每行以「行号<TAB>内容」前缀；oldText/newText 只填「内容」部分，**不要带行号前缀**。
+只输出 JSON，不要解释、不要 markdown 围栏：
+{"proposals":[{"title":"一句话方案名","rationale":"为什么这样改、有什么 trade-off","oldText":"...","newText":"..."}]}`;
+
+/** Generates 1–N fix proposals for a finding; each is a precise oldText→newText edit. */
+export async function generateFixProposals(
+  model: vscode.LanguageModelChat,
+  fileRelPath: string,
+  fileContent: string,
+  finding: { title: string; detail: string; suggestion?: string; line: number; endLine?: number },
+  token: vscode.CancellationToken,
+): Promise<FixProposal[]> {
+  const numbered = numberifyLines(fileContent);
+  const range = finding.endLine && finding.endLine > finding.line
+    ? `第 ${finding.line}-${finding.endLine} 行`
+    : `第 ${finding.line} 行附近`;
+  const user = `文件：${fileRelPath}
+审查发现：${finding.title}（${range}）
+问题说明：${finding.detail}
+${finding.suggestion ? `建议方向：${finding.suggestion}\n` : ''}
+源码（每行以「行号<TAB>内容」给出）：
+
+${numbered}
+
+请按上述 JSON 结构给出修复方案。`;
+  const raw = await ask(model, FIX_PROPOSALS_SYSTEM_PROMPT, user, token);
+  const parsed = parseJson<{ proposals?: unknown[] }>(raw);
+  const list = Array.isArray(parsed.proposals) ? parsed.proposals : [];
+  const out: FixProposal[] = [];
+  for (const p of list) {
+    const o = p as Record<string, unknown>;
+    const oldText = typeof o.oldText === 'string' ? o.oldText : '';
+    const newText = typeof o.newText === 'string' ? o.newText : '';
+    if (!oldText) {
+      continue;
+    }
+    out.push({
+      title: String(o.title ?? '修复方案').trim() || '修复方案',
+      rationale: String(o.rationale ?? '').trim(),
+      oldText,
+      newText,
+    });
+  }
+  if (out.length === 0) {
+    throw new AnalysisError('模型未返回有效的修复方案。');
+  }
+  return out;
 }

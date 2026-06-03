@@ -9,17 +9,19 @@ import {
   analyzeFile,
   analyzeGlobal,
   generateFixDiff,
+  generateFixProposals,
   translateToChinese,
   explainCode,
   AnalysisError,
   type GlobalContextFile,
 } from './ai/analyzer';
-import { pickScope } from './scope/scopePicker';
+import { pickScope, buildFolderScope } from './scope/scopePicker';
 import { submitPrReview, postPrLineComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { runWithProgress } from './ui/progressSteps';
 import { WorkbenchPanel, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
 import { DocumentPanel, type DocModel } from './ui/documentPanel';
+import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
 import { transientInfo, transientWarning } from './ui/toast';
 
@@ -28,16 +30,43 @@ const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
 const docRenderCache = new Map<string, DocumentRender>();
+/** Most recently applied Copilot fix per finding: enables one-click revert from any UI. */
+const appliedFixes = new Map<string, { oldText: string; newText: string }>();
+/** Preferred default cwd for the next scope pick (set by openInNewWindow). */
+let preferredDefaultCwd: string | undefined;
+/** True once the 3:7 editor layout has been applied for the current review. */
+let layoutAppliedForCurrentReview = false;
+
+function fixKey(rel: string, findingId: string): string {
+  return `${rel}::${findingId}`;
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
   session = new ReviewSession(store, repo);
 
+  // Wire the fix-proposal cache so previously generated suggestions persist
+  // across reloads and rapid navigation between findings.
+  FixProposalPanel.init(context.workspaceState);
+
+  // Restore the per-workspace model choice so the workbench opens on the
+  // model the user last picked for this project (instead of always "Auto").
+  models.init(context.workspaceState);
+
+  // Older versions hid the activity bar globally and didn't always restore it.
+  // If the global setting is still `hidden`, reset it once so the user gets
+  // the activity bar back without having to fix it manually.
+  void restoreGloballyHiddenActivityBar(context);
+
+  const homeProvider = new WorkspaceProjectsProvider();
   context.subscriptions.push(
     session,
-    vscode.window.registerTreeDataProvider('codereview.home', new EmptyHomeProvider()),
+    vscode.window.registerTreeDataProvider('codereview.home', homeProvider),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => homeProvider.refresh()),
     vscode.commands.registerCommand('codereview.startReview', startReview),
+    vscode.commands.registerCommand('codereview.openOrStart', openOrStartReview),
+    vscode.commands.registerCommand('codereview.openInNewWindow', openInNewWindow),
     vscode.commands.registerCommand('codereview.pickModel', selectModel),
     vscode.commands.registerCommand('codereview.openWorkbench', openWorkbench),
     vscode.commands.registerCommand('codereview.openFile', openFileInPanel),
@@ -47,42 +76,178 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codereview.submitConclusion', submitConclusion),
     vscode.commands.registerCommand('codereview.locateFinding', locateInFile),
     vscode.commands.registerCommand('codereview.jumpToNextUnseen', jumpToNextUnseenCurrent),
+    createStatusBarEntry(),
   );
 
   // Keep the workbench webview in sync with session progress.
   context.subscriptions.push(session.onDidChange(() => WorkbenchPanel.refreshIfOpen()));
 }
 
-/** Empty provider for the launcher view so its welcome buttons show. */
-class EmptyHomeProvider implements vscode.TreeDataProvider<never> {
-  getTreeItem(): vscode.TreeItem {
-    return new vscode.TreeItem('');
+/** Adds a persistent status bar button that opens the workbench or starts a new review. */
+function createStatusBarEntry(): vscode.StatusBarItem {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  item.name = 'Code Review';
+  item.text = '$(checklist) Open in Code Review';
+  item.tooltip = 'Code Review：在独立窗口中打开审查工作台（可在窗口内选择审查范围）';
+  item.command = 'codereview.openInNewWindow';
+  item.show();
+  return item;
+}
+
+/**
+ * Lists every workspace folder as a clickable item in the activity-bar view.
+ * Clicking a folder opens Code Review for that project in a new window
+ * (mirrors VS Code's "Open in Agents Window" entry point).
+ */
+class WorkspaceProjectsProvider implements vscode.TreeDataProvider<vscode.WorkspaceFolder> {
+  private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  refresh(): void {
+    this._onDidChangeTreeData.fire();
   }
-  getChildren(): never[] {
-    return [];
+
+  getTreeItem(folder: vscode.WorkspaceFolder): vscode.TreeItem {
+    const item = new vscode.TreeItem(folder.name, vscode.TreeItemCollapsibleState.None);
+    item.description = folder.uri.fsPath;
+    item.tooltip = `以 Code Review 打开：${folder.uri.fsPath}`;
+    item.iconPath = new vscode.ThemeIcon('folder');
+    item.contextValue = 'codereview.workspaceProject';
+    item.command = {
+      command: 'codereview.openInNewWindow',
+      title: 'Open in Code Review',
+      arguments: [folder.uri.fsPath],
+    };
+    return item;
+  }
+
+  getChildren(): vscode.WorkspaceFolder[] {
+    return [...(vscode.workspace.workspaceFolders ?? [])];
   }
 }
 
+/** Status-bar entry: open the workbench if a review is in progress, else start one. */
+async function openOrStartReview(): Promise<void> {
+  if (session.reviewSet) {
+    await openWorkbench();
+    return;
+  }
+  await startReview();
+}
+
+/**
+ * "Open in Code Review" — the analogue of VS Code's "Open in Agents Window":
+ * pick a workspace folder (in multi-root setups), pop the workbench into a
+ * separate auxiliary window, and let the user pick the review scope inside it.
+ *
+ * Accepts a cwd in three forms because callers vary:
+ *   - string fsPath (from the TreeItem's command.arguments)
+ *   - WorkspaceFolder (when invoked as an inline action — VS Code injects it)
+ *   - Uri (defensive, for arbitrary callers)
+ */
+async function openInNewWindow(
+  cwdArg?: string | vscode.WorkspaceFolder | vscode.Uri,
+): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  let chosenCwd: string | undefined = resolveCwdArg(cwdArg);
+  if (!chosenCwd) {
+    if (folders.length === 0) {
+      void vscode.window.showErrorMessage('Code Review：请先打开一个工作区。');
+      return;
+    } else if (folders.length === 1) {
+      chosenCwd = folders[0].uri.fsPath;
+    } else {
+      const pick = await vscode.window.showQuickPick(
+        folders.map((f) => ({
+          label: `$(folder) ${f.name}`,
+          description: f.uri.fsPath,
+          cwd: f.uri.fsPath,
+        })),
+        {
+          title: 'Code Review · 选择要审查的项目',
+          placeHolder: '选择在哪个工作区文件夹中开始审查',
+        },
+      );
+      if (!pick) {
+        return;
+      }
+      chosenCwd = pick.cwd;
+    }
+  }
+  preferredDefaultCwd = chosenCwd;
+  // Auto-load the chosen project as the initial review set (whole folder, skipping
+  // node_modules / dist / bin / obj / ...). The user can still narrow down later
+  // via the 「切换范围…」 button inside the workbench.
+  await loadFolderAsReview(chosenCwd);
+  await openWorkbench();
+  // Pop the active editor (which is our workbench webview) into a separate
+  // window so it behaves like VS Code's "Open in Agents Window". This is a
+  // built-in command available since 1.85.
+  try {
+    await vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
+  } catch (err) {
+    console.warn('[codereview] moveEditorToNewWindow failed:', err);
+  }
+}
+
+/** Loads the entire folder at `cwd` as the current review set. */
+async function loadFolderAsReview(cwd: string): Promise<void> {
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Code Review：加载项目源码…' },
+    async () => {
+      try {
+        const picked = await buildFolderScope(cwd);
+        if (!picked) {
+          transientWarning(
+            '选中的项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
+          );
+          return;
+        }
+        const { scope: source, cwd: rootCwd } = picked;
+        const reviewSet = await source.load(rootCwd);
+        await session.start(reviewSet, rootCwd);
+        workbenchSelected = undefined;
+        docRenderCache.clear();
+        layoutAppliedForCurrentReview = false;
+        void vscode.commands.executeCommand('setContext', 'codereview.active', true);
+        transientInfo(`已加载 ${reviewSet.label} · ${reviewSet.files.length} 个文件`);
+      } catch (err) {
+        const message = String((err as Error)?.message ?? err);
+        void vscode.window.showErrorMessage(`Code Review：${message}`);
+      }
+    },
+  );
+}
+
+function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): string | undefined {
+  if (!arg) return undefined;
+  if (typeof arg === 'string') return arg.length > 0 ? arg : undefined;
+  if (arg instanceof vscode.Uri) return arg.fsPath;
+  if ('uri' in arg && arg.uri instanceof vscode.Uri) return arg.uri.fsPath;
+  return undefined;
+}
+
 async function startReview(): Promise<void> {
-  const cwd = workspaceFolderPath();
-  if (!cwd) {
+  const defaultCwd = preferredDefaultCwd ?? workspaceFolderPath();
+  if (!defaultCwd) {
     void vscode.window.showErrorMessage('Code Review：请先打开一个 Git 仓库工作区。');
     return;
   }
 
-  const source = await pickScope(cwd);
-  if (!source) {
+  const picked = await pickScope(defaultCwd);
+  if (!picked) {
     return;
   }
-
+  const { scope: source, cwd } = picked;
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: 'Code Review：加载源码…' },
     async () => {
       try {
         const reviewSet = await source.load(cwd);
-        await session.start(reviewSet);
+        await session.start(reviewSet, cwd);
         workbenchSelected = undefined;
         docRenderCache.clear();
+        layoutAppliedForCurrentReview = false;
         void vscode.commands.executeCommand('setContext', 'codereview.active', true);
         await openWorkbench();
         transientInfo(`已加载 ${reviewSet.label} · ${reviewSet.files.length} 个文件`);
@@ -105,11 +270,6 @@ async function selectModel(): Promise<void> {
 
 /** Opens (or reveals) the Review Workbench webview. */
 async function openWorkbench(): Promise<void> {
-  if (!session.reviewSet) {
-    transientWarning('请先开始一次审查（选择范围）');
-    return;
-  }
-  const wasOpen = WorkbenchPanel.isOpen;
   WorkbenchPanel.show(buildWorkbenchState, {
     open: (path) => void openFileInPanel(path),
     analyze: (path) => void analyzeByPath(path),
@@ -120,14 +280,16 @@ async function openWorkbench(): Promise<void> {
     showGlobal: showGlobalReport,
     submit: () => void submitConclusion(),
     pickModel: () => void selectModel(),
+    pickScope: () => void startReview(),
   });
-  if (!workbenchSelected) {
+  if (session.reviewSet && !workbenchSelected) {
     const first = [...session.reviewSet.files].sort((a, b) => a.path.localeCompare(b.path))[0];
     if (first) {
       await openFileInPanel(first.path);
     }
   }
-  if (!wasOpen) {
+  if (session.reviewSet && !layoutAppliedForCurrentReview) {
+    layoutAppliedForCurrentReview = true;
     await applyWorkbenchLayout();
   }
 }
@@ -212,6 +374,7 @@ function buildWorkbenchState(): WorkbenchState {
     : [];
 
   return {
+    hasReviewSet: !!reviewSet,
     label: reviewSet?.label ?? '（未开始）',
     files,
     selected: workbenchSelected,
@@ -321,6 +484,70 @@ function refreshDocPanel(relPath: string): void {
   const render = docRenderCache.get(relPath);
   if (render && DocumentPanel.currentPath === relPath) {
     DocumentPanel.update(buildDocModel(relPath, render));
+  }
+}
+
+/**
+ * Re-reads the file from disk / dirty editor, re-renders, and refreshes the
+ * document panel so the user sees the new content immediately after an edit
+ * (e.g. a Copilot fix was applied).
+ */
+async function reloadDocPanel(relPath: string): Promise<void> {
+  if (DocumentPanel.currentPath !== relPath) {
+    docRenderCache.delete(relPath);
+    return;
+  }
+  docRenderCache.delete(relPath);
+  const text = await readReviewFileText(relPath);
+  const render = renderFor(relPath, text);
+  session.setTotalLines(relPath, render.totalLines);
+  DocumentPanel.update(buildDocModel(relPath, render));
+}
+
+/**
+ * Reverts an applied Copilot fix by replacing newText with oldText in the file.
+ * Falls back to a warning when the snippet can no longer be uniquely located
+ * (file was edited by hand after applying). Returns whether the revert happened.
+ */
+async function revertAppliedFix(rel: string, findingId: string): Promise<boolean> {
+  const edit = appliedFixes.get(fixKey(rel, findingId));
+  if (!edit) {
+    return false;
+  }
+  const cwd = activeCwd();
+  if (!cwd) {
+    return false;
+  }
+  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+  try {
+    const doc = await vscode.workspace.openTextDocument(fileUri);
+    const text = doc.getText();
+    const idx = text.indexOf(edit.newText);
+    if (idx < 0) {
+      void vscode.window.showWarningMessage(
+        '无法自动撤销 Copilot 修复：文件中已找不到之前应用的片段（可能被手动改动过）。',
+      );
+      return false;
+    }
+    if (text.indexOf(edit.newText, idx + 1) >= 0) {
+      void vscode.window.showWarningMessage(
+        '之前应用的片段在文件里出现多次，无法唯一定位以自动撤销，请手动还原。',
+      );
+      return false;
+    }
+    const start = doc.positionAt(idx);
+    const end = doc.positionAt(idx + edit.newText.length);
+    const we = new vscode.WorkspaceEdit();
+    we.replace(fileUri, new vscode.Range(start, end), edit.oldText);
+    const ok = await vscode.workspace.applyEdit(we);
+    if (ok) {
+      appliedFixes.delete(fixKey(rel, findingId));
+      await reloadDocPanel(rel);
+    }
+    return ok;
+  } catch (err) {
+    console.warn('[codereview] revertAppliedFix failed:', err);
+    return false;
   }
 }
 
@@ -454,11 +681,11 @@ async function annotateWithNote(
  * (which includes unsaved edits) over the on-disk copy.
  */
 async function readReviewFileText(relPath: string): Promise<string> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
+  const cwd = activeCwd();
+  if (!cwd) {
     return '';
   }
-  const uri = vscode.Uri.joinPath(folder.uri, relPath);
+  const uri = vscode.Uri.joinPath(vscode.Uri.file(cwd), relPath);
   const open = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === uri.fsPath);
   if (open) {
     return open.getText();
@@ -482,8 +709,8 @@ async function analyzeCurrentFile(): Promise<void> {
 
 /** Analyzes a specific review file by its relative path. */
 async function analyzeByPath(rel: string): Promise<void> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
+  const cwd = activeCwd();
+  if (!cwd) {
     return;
   }
   const model = await models.resolve();
@@ -494,7 +721,7 @@ async function analyzeByPath(rel: string): Promise<void> {
 
   let document: vscode.TextDocument;
   try {
-    const uri = vscode.Uri.joinPath(folder.uri, rel);
+    const uri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
     document = await vscode.workspace.openTextDocument(uri);
   } catch {
     void vscode.window.showWarningMessage(`Code Review：无法打开 ${rel}`);
@@ -532,6 +759,12 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
   }
   const current = session.findingDisposition(rel, findingId);
   if (current?.kind === kind) {
+    // Toggling off. If the user is removing the 'fixed' mark and we still have
+    // the applied edit on record, also revert the file change — that's the
+    // intuitive meaning of "undo Copilot fix" from the document panel.
+    if (kind === 'fixed') {
+      await revertAppliedFix(rel, findingId);
+    }
     session.setFindingDisposition(rel, findingId, null);
     transientInfo(`已撤销 ${rel} 的处置`);
     WorkbenchPanel.refreshIfOpen();
@@ -543,26 +776,68 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     return;
   }
 
-  const cwd = workspaceFolderPath();
+  const cwd = activeCwd();
   if (!cwd) {
     return;
   }
 
   if (kind === 'fixed') {
     await locateInFile(rel, finding.line);
-    const prompt = composeFixPrompt(finding);
-    try {
-      await vscode.commands.executeCommand('inlineChat.start', { message: prompt, autoSend: true });
-    } catch {
-      try {
-        await vscode.env.clipboard.writeText(prompt);
-        transientWarning('未找到 Copilot Inline Chat，已复制提示词到剪贴板');
-      } catch {
-        // ignore clipboard failures
-      }
-    }
-    session.setFindingDisposition(rel, findingId, { kind: 'fixed', at: Date.now() });
-    transientInfo('已标记为「待 Copilot 修复」；接受补丁后保持此标记');
+    const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+    FixProposalPanel.show({
+      rel,
+      fileUri,
+      finding: {
+        id: finding.id,
+        line: finding.line,
+        title: finding.title,
+        detail: finding.detail,
+        suggestion: finding.suggestion,
+      },
+      generate: async (token) => {
+        const model = await models.resolve();
+        if (!model) {
+          const prompt = composeFixPrompt(finding);
+          try {
+            await vscode.env.clipboard.writeText(prompt);
+          } catch {
+            // ignore clipboard failures
+          }
+          throw new Error('未找到可用的 Copilot 模型；已把修复提示词复制到剪贴板，可粘到 Copilot Chat 使用。');
+        }
+        const content = await readReviewFileText(rel);
+        return generateFixProposals(
+          model,
+          rel,
+          content,
+          {
+            title: finding.title,
+            detail: finding.detail,
+            suggestion: finding.suggestion,
+            line: finding.line,
+            endLine: finding.endLine,
+          },
+          token,
+        );
+      },
+      onApplied: (edit) => {
+        appliedFixes.set(fixKey(rel, findingId), edit);
+        session.setFindingDisposition(rel, findingId, { kind: 'fixed', at: Date.now() });
+        WorkbenchPanel.refreshIfOpen();
+        refreshDocPanel(rel);
+        transientInfo('修复已应用，已标记为「已 Copilot 修复」');
+      },
+      onUndone: () => {
+        appliedFixes.delete(fixKey(rel, findingId));
+        session.setFindingDisposition(rel, findingId, null);
+        WorkbenchPanel.refreshIfOpen();
+        refreshDocPanel(rel);
+      },
+      onFileChanged: () => {
+        void reloadDocPanel(rel);
+      },
+    });
+    return;
   } else if (kind === 'commented') {
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
     const body = composeCommentBody(finding);
@@ -743,8 +1018,8 @@ async function generateCandidateDiff(fix: {
   detail: string;
   suggestion?: string;
 }): Promise<void> {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
+  const cwd = activeCwd();
+  if (!cwd) {
     return;
   }
   const model = await models.resolve();
@@ -861,7 +1136,7 @@ async function submitConclusion(): Promise<void> {
     if (confirm !== '提交到 GitHub') {
       return;
     }
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const cwd = activeCwd();
     if (!cwd) {
       return;
     }
@@ -904,6 +1179,33 @@ function workspaceFolderPath(): string | undefined {
 
 function workspaceFolderName(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.name;
+}
+
+/** Active review's cwd, falling back to the first workspace folder when no review is loaded. */
+function activeCwd(): string | undefined {
+  return session.getCwd();
+}
+
+/**
+ * Older versions hid `workbench.activityBar.location` globally and didn't always
+ * restore it. If we still see that lingering value, clear it once per machine so
+ * the activity bar reappears for the user.
+ */
+async function restoreGloballyHiddenActivityBar(context: vscode.ExtensionContext): Promise<void> {
+  const FLAG = 'codereview.activityBarRestored.v1';
+  if (context.globalState.get<boolean>(FLAG)) {
+    return;
+  }
+  try {
+    const wb = vscode.workspace.getConfiguration('workbench');
+    if (wb.inspect<string>('activityBar.location')?.globalValue === 'hidden') {
+      await wb.update('activityBar.location', undefined, vscode.ConfigurationTarget.Global);
+    }
+  } catch (err) {
+    console.warn('[codereview] activity bar restore failed:', err);
+  } finally {
+    await context.globalState.update(FLAG, true);
+  }
 }
 
 export function deactivate(): void {

@@ -2,7 +2,7 @@
   "name": "codereview",
   "displayName": "Code Review Gate",
   "description": "Distrust-driven code review: per-line coverage gate plus file-level and cross-file AI analysis, powered by the GitHub CLI and VS Code's Copilot models.",
-  "version": "0.0.1",
+  "version": "0.0.18",
   "publisher": "codereview-dev",
   "private": true,
   "license": "MIT",
@@ -36,12 +36,8 @@
     "viewsWelcome": [
       {
         "view": "codereview.home",
-        "contents": "Code Review Gate\n\n[选择要审查的源码](command:codereview.startReview)\n\n可选：直接挑选文件/文件夹、PR、分支对比、未提交的改动。审查对象始终是源码本身。\n\n开始后将打开「审查工作台」——所有操作都在工作台内完成。"
-      },
-      {
-        "view": "codereview.home",
-        "contents": "[打开审查工作台](command:codereview.openWorkbench)",
-        "when": "codereview.active"
+        "contents": "请先打开一个工作区。\n\n[打开文件夹…](command:vscode.openFolder)\n\nCode Review 会列出当前 workspace 中的所有项目，点击任一项目即可在独立窗口中开始审查。",
+        "when": "workbenchState == empty"
       }
     ],
     "commands": [
@@ -49,6 +45,16 @@
         "command": "codereview.startReview",
         "title": "Code Review: Start Review",
         "icon": "$(play)"
+      },
+      {
+        "command": "codereview.openOrStart",
+        "title": "Code Review: Open or Start Review",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "codereview.openInNewWindow",
+        "title": "Code Review: Open in New Window",
+        "icon": "$(window)"
       },
       {
         "command": "codereview.pickModel",
@@ -94,7 +100,36 @@
         "icon": "$(arrow-down)"
       }
     ],
-    "menus": {}
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "codereview.openInNewWindow",
+          "when": "view == codereview.home && viewItem == codereview.workspaceProject",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Code Review",
+      "properties": {
+        "codereview.language": {
+          "type": "string",
+          "enum": ["auto", "zh-CN", "en"],
+          "enumDescriptions": [
+            "跟随 VS Code 显示语言 / Follow VS Code display language",
+            "始终使用简体中文",
+            "Always use English"
+          ],
+          "default": "auto",
+          "description": "Code Review 中所有 LLM 输出（findings、修复方案、解释、跨文件结论等）使用的语言。 / Language used by all LLM outputs (findings, fix proposals, explanations, global conclusions)."
+        },
+        "codereview.focusedWorkbench": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开 Code Review 工作台时自动关闭左侧栏并隐藏活动栏，让工作台占满主编辑区；关闭工作台后自动恢复。 / When opening the Code Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

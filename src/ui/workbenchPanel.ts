@@ -33,6 +33,8 @@ export interface WorkbenchFinding {
 
 /** Serializable snapshot the webview renders. */
 export interface WorkbenchState {
+  /** True when a review has been started and we have a review set loaded. */
+  hasReviewSet: boolean;
   label: string;
   files: WorkbenchFile[];
   selected?: string;
@@ -61,6 +63,8 @@ export interface WorkbenchActions {
   showGlobal(): void;
   submit(): void;
   pickModel(): void;
+  /** Opens the scope picker (used both for first-time review and for switching). */
+  pickScope(): void;
 }
 
 type InboundMessage =
@@ -73,6 +77,7 @@ type InboundMessage =
   | { type: 'showGlobal' }
   | { type: 'submit' }
   | { type: 'pickModel' }
+  | { type: 'pickScope' }
   | { type: 'toggleFolder'; path: string };
 
 /**
@@ -104,7 +109,9 @@ export class WorkbenchPanel {
   static show(getState: () => WorkbenchState, actions: WorkbenchActions): WorkbenchPanel {
     if (WorkbenchPanel.current) {
       WorkbenchPanel.current.refresh();
-      WorkbenchPanel.current.panel.reveal(vscode.ViewColumn.One);
+      // Pass `undefined` to keep the panel in its current view column / window
+      // (it may have been moved to an auxiliary window via "move editor to new window").
+      WorkbenchPanel.current.panel.reveal(undefined, /* preserveFocus */ true);
       return WorkbenchPanel.current;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -116,10 +123,7 @@ export class WorkbenchPanel {
     const instance = new WorkbenchPanel(panel, getState, actions);
     WorkbenchPanel.current = instance;
     instance.refresh();
-    // Pop the workbench out into a separate editor window so the review UI does
-    // not consume the current window. The panel is the active editor right after
-    // creation, so the move command targets it.
-    void vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
+    void instance.applyFocusedMode();
     return instance;
   }
 
@@ -165,6 +169,9 @@ export class WorkbenchPanel {
       case 'pickModel':
         this.actions.pickModel();
         break;
+      case 'pickScope':
+        this.actions.pickScope();
+        break;
       case 'toggleFolder':
         if (this.expandedFolders.has(msg.path)) {
           this.expandedFolders.delete(msg.path);
@@ -179,6 +186,10 @@ export class WorkbenchPanel {
   private render(state: WorkbenchState): string {
     const nonce = String(Math.random()).slice(2);
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+
+    if (!state.hasReviewSet) {
+      return this.renderEmpty(nonce, csp);
+    }
 
     const pct = state.coverage.total > 0
       ? Math.round((state.coverage.seen / state.coverage.total) * 100)
@@ -250,7 +261,10 @@ export class WorkbenchPanel {
     background:linear-gradient(180deg, var(--purple-bg), transparent 220px); }
   .sb-head { padding:.7rem .85rem .55rem; border-bottom:1px solid var(--line); }
   .sb-title { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
-  .sb-label { font-weight:700; margin-top:.15rem; }
+  .sb-label { font-weight:700; margin-top:.15rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sb-row { display:flex; align-items:center; gap:.5rem; margin-top:.15rem; }
+  .sb-row .sb-label { flex:1; margin:0; }
+  .sb-switch { font-size:.7rem; padding:.22rem .5rem; }
 
   .filter-row { padding:.4rem .55rem; border-bottom:1px solid var(--line); }
   .filter-row input { width:100%; box-sizing:border-box; font-family:inherit; font-size:.78rem;
@@ -327,7 +341,10 @@ export class WorkbenchPanel {
     <div class="sidebar">
       <div class="sb-head">
         <div class="sb-title">审查范围</div>
-        <div class="sb-label">${esc(state.label)}</div>
+        <div class="sb-row">
+          <div class="sb-label" title="${escAttr(state.label)}">${esc(state.label)}</div>
+          <button id="pickScope" class="sb-switch" title="选择其他代码范围进行审查">切换范围…</button>
+        </div>
       </div>
       <div class="filter-row">
         <input id="filter" type="search" placeholder="过滤文件路径…" autocomplete="off" />
@@ -420,6 +437,7 @@ export class WorkbenchPanel {
   byId('global')?.addEventListener('click', () => send({ type:'global' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
+  byId('pickScope')?.addEventListener('click', () => send({ type:'pickScope' }));
   byId('submit')?.addEventListener('click', () => send({ type:'submit' }));
   document.querySelectorAll('.locate').forEach((b) => {
     b.addEventListener('click', () => send({ type:'locate', path:b.dataset.path, line:Number(b.dataset.line) }));
@@ -434,12 +452,62 @@ export class WorkbenchPanel {
 </html>`;
   }
 
+  /** Empty hero shown when the workbench is open but no review has been started yet. */
+  private renderEmpty(nonce: string, csp: string): string {
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="${csp}" />
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
+    font-family:var(--vscode-font-family); color:var(--vscode-foreground);
+    background:var(--vscode-editor-background); }
+  .hero { max-width:520px; padding:32px 40px; text-align:center; }
+  .hero h1 { font-size:1.4rem; margin:0 0 .8rem; font-weight:600; }
+  .hero p { font-size:.92rem; line-height:1.6; color:var(--vscode-descriptionForeground); margin:0 0 1.5rem; }
+  .hero button { font-family:inherit; font-size:.95rem; padding:.65rem 1.4rem; border-radius:6px;
+    background:var(--vscode-button-background); color:var(--vscode-button-foreground);
+    border:1px solid transparent; cursor:pointer; }
+  .hero button:hover { background:var(--vscode-button-hoverBackground); }
+  .hero .hint { font-size:.78rem; color:var(--vscode-descriptionForeground); margin-top:1.2rem; }
+</style>
+</head>
+<body>
+  <div class="hero">
+    <h1>Code Review · 工作台</h1>
+    <p>选择要审查的范围（本地文件 / 文件夹，或当前分支的 PR），开始一次审查。</p>
+    <button id="pickScope" autofocus>选择审查范围…</button>
+    <div class="hint">范围确定后即可在此窗口逐文件审查与全局分析。</div>
+  </div>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  document.getElementById('pickScope').addEventListener('click', () => vscode.postMessage({ type:'pickScope' }));
+</script>
+</body>
+</html>`;
+  }
+
   dispose(): void {
     WorkbenchPanel.current = undefined;
     this.panel.dispose();
     for (const d of this.disposables) {
       d.dispose();
     }
+  }
+
+  /**
+   * Closes the side bar so the workbench panel feels like a dedicated app shell.
+   * The activity bar is left alone so the user can still switch views.
+   * Controlled by `codereview.focusedWorkbench`.
+   */
+  private async applyFocusedMode(): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration('codereview');
+    if (!cfg.get<boolean>('focusedWorkbench', true)) {
+      return;
+    }
+    await vscode.commands.executeCommand('workbench.action.closeSidebar').then(undefined, () => undefined);
   }
 
   private renderNode(node: TreeNode, depth: number): string {

@@ -14,17 +14,36 @@ export class ReviewSession {
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
+  /** Workspace folder picked for this review (set by start()). */
+  private cwd?: string;
+  /** Repo name override for the active review (typically basename of cwd). */
+  private repoName?: string;
 
   constructor(
     private readonly store: ReviewStore,
-    private readonly repo: string,
+    private readonly defaultRepo: string,
   ) {}
 
+  /**
+   * Returns the working directory for the active review (the picked workspace
+   * folder). Falls back to the first workspace folder when no review is active.
+   */
+  getCwd(): string | undefined {
+    return this.cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
+
+  /** Returns the repo name used as the storage key prefix for the active review. */
+  getRepoName(): string {
+    return this.repoName ?? this.defaultRepo;
+  }
+
   /** Loads or initialises review progress for the given review set. */
-  async start(reviewSet: ReviewSet): Promise<void> {
+  async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
     this.reviewSet = reviewSet;
+    this.cwd = cwd;
+    this.repoName = cwd ? path.basename(cwd) : this.defaultRepo;
     const key: ReviewKey = {
-      repo: this.repo,
+      repo: this.repoName,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
     };
@@ -42,7 +61,7 @@ export class ReviewSession {
         };
       }
       snapshot = {
-        repo: this.repo,
+        repo: this.repoName,
         scopeId: reviewSet.scopeId,
         headSha: reviewSet.headSha,
         perFile,
@@ -91,7 +110,12 @@ export class ReviewSession {
     if (uri.scheme !== 'file' || !this.reviewSet) {
       return undefined;
     }
-    const root = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath
+    // Prefer the session's chosen cwd, then the URI's workspace folder, then
+    // the first workspace folder. Multi-root workspaces can have several roots
+    // and the review may belong to any of them.
+    const root =
+      this.cwd
+      ?? vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath
       ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!root) {
       return undefined;
