@@ -19,11 +19,17 @@ export class PrScope implements ReviewScope {
     await ensureGhAvailable(cwd);
     await ensureAuth(cwd);
     const pr = await getCurrentPr(cwd);
+    let files = pr.files;
+    try {
+      files = await git.diffFiles(cwd, `origin/${pr.baseRefName}...HEAD`);
+    } catch {
+      // Fall back to gh's file list when the base ref is not available locally.
+    }
     return {
       scopeId: `pr-${pr.number}`,
       label: `PR #${pr.number} · ${pr.title}`,
       headSha: pr.headRefOid,
-      files: pr.files,
+      files,
     };
   }
 }

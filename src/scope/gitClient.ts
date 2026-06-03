@@ -100,12 +100,52 @@ function parseNumstat(out: string): ReviewFile[] {
   return files;
 }
 
+function parseNameStatus(out: string): Map<string, ReviewFile['status']> {
+  const statusByPath = new Map<string, ReviewFile['status']>();
+  for (const line of out.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const parts = trimmed.split('\t');
+    const code = parts[0];
+    let status: ReviewFile['status'];
+    let filePath = parts[1];
+    if (code.startsWith('R')) {
+      status = 'renamed';
+      filePath = parts[2] ?? filePath;
+    } else if (code === 'A') {
+      status = 'added';
+    } else if (code === 'D') {
+      status = 'deleted';
+    } else {
+      status = 'modified';
+    }
+    if (filePath) {
+      statusByPath.set(filePath, status);
+    }
+  }
+  return statusByPath;
+}
+
+async function diffFilesWithStatus(cwd: string, args: string[]): Promise<ReviewFile[]> {
+  const [numstat, nameStatus] = await Promise.all([
+    git(['diff', '--numstat', ...args], cwd),
+    git(['diff', '--name-status', ...args], cwd),
+  ]);
+  const statuses = parseNameStatus(nameStatus);
+  return parseNumstat(numstat).map((file) => ({
+    ...file,
+    status: statuses.get(file.path) ?? file.status,
+  }));
+}
+
 /** Files changed for an arbitrary diff range, e.g. "main...HEAD". */
 export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[]> {
-  return parseNumstat(await git(['diff', '--numstat', range], cwd));
+  return diffFilesWithStatus(cwd, [range]);
 }
 
 /** Tracked changes in the working tree and index vs HEAD. */
 export async function workingTreeFiles(cwd: string): Promise<ReviewFile[]> {
-  return parseNumstat(await git(['diff', '--numstat', 'HEAD'], cwd));
+  return diffFilesWithStatus(cwd, ['HEAD']);
 }

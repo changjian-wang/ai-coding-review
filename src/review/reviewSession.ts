@@ -101,6 +101,10 @@ export class ReviewSession {
     return this.snapshot?.perFile[path];
   }
 
+  private isDeletedFile(path: string): boolean {
+    return this.reviewSet?.files.find((f) => f.path === path)?.status === 'deleted';
+  }
+
   /**
    * Resolves a file-scheme document/URI to its review-set relative path, or
    * undefined if the file is not part of the active review set. This is the
@@ -129,12 +133,18 @@ export class ReviewSession {
 
   /** Coverage for a file: how many of its lines have been seen, out of total. */
   coverage(path: string): { seen: number; total: number } {
+    if (this.isDeletedFile(path)) {
+      return { seen: 0, total: 0 };
+    }
     const s = this.fileState(path);
     return { seen: s?.seenLines.length ?? 0, total: s?.totalLines ?? 0 };
   }
 
   /** Records the file's total line count, the first time it is opened. */
   setTotalLines(path: string, total: number): void {
+    if (this.isDeletedFile(path)) {
+      return;
+    }
     const s = this.fileState(path);
     if (s && s.totalLines !== total) {
       s.totalLines = total;
@@ -147,6 +157,9 @@ export class ReviewSession {
    * changed (so callers can avoid redundant persistence / redraws).
    */
   markSeen(path: string, lines: Iterable<number>): boolean {
+    if (this.isDeletedFile(path)) {
+      return false;
+    }
     const s = this.fileState(path);
     if (!s) {
       return false;
@@ -168,6 +181,9 @@ export class ReviewSession {
 
   /** A file is "ready" when it has been analyzed and every finding has a disposition. */
   fileReady(path: string): boolean {
+    if (this.isDeletedFile(path)) {
+      return true;
+    }
     const s = this.fileState(path);
     if (!s || !s.analyzed) {
       return false;
@@ -178,6 +194,9 @@ export class ReviewSession {
 
   /** Whether every line of the file has been seen (coverage complete). */
   fileFullySeen(path: string): boolean {
+    if (this.isDeletedFile(path)) {
+      return true;
+    }
     const s = this.fileState(path);
     return !!s && s.totalLines > 0 && s.seenLines.length >= s.totalLines;
   }
@@ -233,6 +252,9 @@ export class ReviewSession {
 
   /** Count of findings that still have no disposition. */
   unconfirmedCount(path: string): number {
+    if (this.isDeletedFile(path)) {
+      return 0;
+    }
     const s = this.fileState(path);
     if (!s) {
       return 0;

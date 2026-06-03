@@ -17,7 +17,7 @@ import {
 } from './ai/analyzer';
 import type { Finding } from './ai/types';
 import { pickScope, buildFolderScope } from './scope/scopePicker';
-import { submitPrReview, postPrLineComment } from './gh/ghClient';
+import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { runWithProgress } from './ui/progressSteps';
 import { WorkbenchPanel, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
@@ -37,6 +37,14 @@ const appliedFixes = new Map<string, { oldText: string; newText: string }>();
 let preferredDefaultCwd: string | undefined;
 /** True once the 3:7 editor layout has been applied for the current review. */
 let layoutAppliedForCurrentReview = false;
+
+function reviewFileStatus(relPath: string): string | undefined {
+  return session.reviewSet?.files.find((f) => f.path === relPath)?.status;
+}
+
+function isDeletedReviewFile(relPath: string): boolean {
+  return reviewFileStatus(relPath) === 'deleted';
+}
 
 function fixKey(rel: string, findingId: string): string {
   return `${rel}::${findingId}`;
@@ -720,6 +728,9 @@ async function annotateWithNote(
  * (which includes unsaved edits) over the on-disk copy.
  */
 async function readReviewFileText(relPath: string): Promise<string> {
+  if (isDeletedReviewFile(relPath)) {
+    return '（文件已删除，当前分支中不存在源内容；请在整体审查中确认删除影响。）';
+  }
   const cwd = activeCwd();
   if (!cwd) {
     return '';
@@ -748,6 +759,10 @@ async function analyzeCurrentFile(): Promise<void> {
 
 /** Analyzes a specific review file by its relative path. */
 async function analyzeByPath(rel: string): Promise<void> {
+  if (isDeletedReviewFile(rel)) {
+    transientInfo(`${rel} 是删除文件，已作为无需源文件分析处理`);
+    return;
+  }
   const cwd = activeCwd();
   if (!cwd) {
     return;
@@ -802,6 +817,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
+    cacheKey: fixProposalCacheKey(rel, finding),
     fileUri,
     finding: {
       id: finding.id,
@@ -930,8 +946,21 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
         });
         transientInfo(`已写为 PR #${prNumber} 行评论`);
       } catch (err) {
-        void vscode.window.showErrorMessage(`Code Review：发送 PR 评论失败 — ${(err as Error).message}`);
-        return;
+        try {
+          const fallbackBody = `**${rel}:${finding.line}**\n\n${body}`;
+          await postPrComment(cwd, prNumber, fallbackBody);
+          session.setFindingDisposition(rel, findingId, {
+            kind: 'commented',
+            ref: `pr-${prNumber}:comment`,
+            at: Date.now(),
+          });
+          transientInfo(`行评论不可用，已写为 PR #${prNumber} 普通评论`);
+        } catch (fallbackErr) {
+          void vscode.window.showErrorMessage(
+            `Code Review：发送 PR 评论失败 — ${(fallbackErr as Error).message || (err as Error).message}`,
+          );
+          return;
+        }
       }
     } else {
       try {
@@ -981,6 +1010,31 @@ function composeFixPrompt(finding: { title: string; detail: string; suggestion?:
   }
   lines.push('请直接给出可应用的最小改动。');
   return lines.join('\n');
+}
+
+function hashString(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function fixProposalCacheKey(rel: string, finding: Finding): string {
+  const reviewSet = session.reviewSet;
+  const reviewPart = reviewSet
+    ? `${session.getRepoName()}::${reviewSet.scopeId}::${reviewSet.headSha}`
+    : 'no-review';
+  const findingPart = [
+    finding.id,
+    finding.line,
+    finding.endLine ?? '',
+    finding.title,
+    finding.detail,
+    finding.suggestion ?? '',
+  ].join('\0');
+  return `${reviewPart}::${rel}::${hashString(findingPart)}`;
 }
 
 function composeCommentBody(finding: { title: string; detail: string; suggestion?: string }): string {

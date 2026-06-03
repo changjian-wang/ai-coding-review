@@ -459,7 +459,19 @@ export class WorkbenchPanel {
       }
     });
   }
-  filterInput.addEventListener('input', applyFilter);
+  const reviewKey = ${JSON.stringify(state.label)};
+  const savedFilter = vscode.getState() || {};
+  if (savedFilter.filterScope === reviewKey && typeof savedFilter.filter === 'string') {
+    filterInput.value = savedFilter.filter;
+    applyFilter();
+  }
+  filterInput.addEventListener('input', () => {
+    const s = vscode.getState() || {};
+    s.filterScope = reviewKey;
+    s.filter = filterInput.value;
+    vscode.setState(s);
+    applyFilter();
+  });
   const sel = ${JSON.stringify(state.selected ?? null)};
   const byId = (id) => document.getElementById(id);
   byId('analyze')?.addEventListener('click', () => sel && send({ type:'analyze', path:sel }));
@@ -716,14 +728,6 @@ function compactTree(node: TreeNode): TreeNode {
     };
   }
   return { ...node, children: compactedChildren };
-}
-
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function escAttr(s: string): string {
-  return esc(s).replace(/"/g, '&quot;');
 }
 
 function formatTime(ms: number): string {

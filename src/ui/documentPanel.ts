@@ -627,7 +627,7 @@ function renderFindbar() {
   const fs = (model.findings || []);
   if (!fs.length) { fb.style.display = 'none'; return; }
   fb.style.display = 'block';
-  const unconfirmed = fs.filter((f) => !f.confirmed).length;
+  const unconfirmed = fs.filter((f) => !f.disposition).length;
   $('findbar-toggle').innerHTML =
     '<span class="fb-count">发现 ' + fs.length + '</span>' +
     (unconfirmed ? '<span class="fb-warn">' + unconfirmed + ' 未确认</span>' : '<span class="fb-ok">全部已确认</span>') +
@@ -636,11 +636,11 @@ function renderFindbar() {
   list.innerHTML = '';
   for (const f of fs) {
     const item = document.createElement('div');
-    item.className = 'finditem ' + f.severity + (f.confirmed ? ' confirmed' : '');
+    item.className = 'finditem ' + f.severity + (f.disposition ? ' confirmed' : '');
     item.innerHTML =
       '<span class="fi-dot"></span><span class="fi-title"></span>' +
       '<span class="fi-line">第 ' + f.line + ' 行</span>' +
-      (f.confirmed ? '<span class="fi-ok">✓</span>' : '');
+      (f.disposition ? '<span class="fi-ok">✓</span>' : '');
     item.querySelector('.fi-title').textContent = f.title;
     item.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line }));
     list.appendChild(item);

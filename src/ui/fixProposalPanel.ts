@@ -5,6 +5,8 @@ import { escAttr as escapeHtml } from './html';
 /** Inputs needed to drive the panel. */
 export interface FixProposalRequest {
   rel: string;
+  /** Stable identity for this finding within a review/head/signature. */
+  cacheKey: string;
   fileUri: vscode.Uri;
   finding: { id: string; line: number; title: string; detail: string; suggestion?: string };
   /** Generates a fresh set of proposals against the **current** file content. */
@@ -43,7 +45,7 @@ interface CachedProposal {
   applied: boolean;
 }
 
-/** Cached entry per `${rel}::${findingId}`. Persists across reloads via workspaceState. */
+/** Cached entry per stable finding cache key. Persists across reloads via workspaceState. */
 interface CachedEntry {
   proposals: CachedProposal[];
   lastApplied?: string;
@@ -59,7 +61,7 @@ const CACHE_MAX_ENTRIES = 200;
  */
 export class FixProposalPanel {
   private static instance?: FixProposalPanel;
-  /** Session cache of proposals per `${rel}::${findingId}` — lets users navigate between findings without re-generating. */
+  /** Session cache of proposals per stable finding key — lets users navigate between findings without re-generating. */
   private static cache = new Map<string, CachedEntry>();
   /** Backing store for cross-reload persistence. Wired by {@link FixProposalPanel.init}. */
   private static memento?: vscode.Memento;
@@ -118,8 +120,8 @@ export class FixProposalPanel {
     }
   }
 
-  private static keyOf(rel: string, findingId: string): string {
-    return `${rel}::${findingId}`;
+  private static keyOf(request: FixProposalRequest): string {
+    return request.cacheKey;
   }
 
   private static saveCache(key: string, entry: CachedEntry): void {
@@ -159,7 +161,7 @@ export class FixProposalPanel {
 
   private async run(options?: { force?: boolean }): Promise<void> {
     this.cancelGeneration();
-    const key = FixProposalPanel.keyOf(this.request.rel, this.request.finding.id);
+    const key = FixProposalPanel.keyOf(this.request);
     // Fast path: re-use cached proposals so users can navigate between findings
     // without paying the LLM round-trip every time.
     if (!options?.force) {
@@ -267,7 +269,7 @@ export class FixProposalPanel {
     if (this.state.kind !== 'ready') {
       return;
     }
-    const key = FixProposalPanel.keyOf(this.request.rel, this.request.finding.id);
+    const key = FixProposalPanel.keyOf(this.request);
     const generatedAt = FixProposalPanel.cache.get(key)?.generatedAt ?? Date.now();
     FixProposalPanel.saveCache(key, {
       proposals: this.state.proposals.map(toCached),
@@ -280,7 +282,7 @@ export class FixProposalPanel {
     if (msg.type === 'regenerate') {
       // Explicit regenerate — drop the cache so we actually call the model again.
       FixProposalPanel.cache.delete(
-        FixProposalPanel.keyOf(this.request.rel, this.request.finding.id),
+        FixProposalPanel.keyOf(this.request),
       );
       FixProposalPanel.flush();
       void this.run({ force: true });

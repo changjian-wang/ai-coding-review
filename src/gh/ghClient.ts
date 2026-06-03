@@ -56,7 +56,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
     headRefName: string;
     baseRefName: string;
     headRefOid: string;
-    files?: { path: string; additions?: number; deletions?: number }[];
+    files?: { path: string; additions?: number; deletions?: number; status?: string }[];
   };
   try {
     raw = JSON.parse(json);
@@ -74,8 +74,30 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
       path: f.path,
       additions: f.additions ?? 0,
       deletions: f.deletions ?? 0,
+      status: normaliseFileStatus(f.status),
     })),
   };
+}
+
+function normaliseFileStatus(status: string | undefined): PullRequest['files'][number]['status'] {
+  switch ((status ?? '').toUpperCase()) {
+    case 'ADDED':
+    case 'A':
+      return 'added';
+    case 'REMOVED':
+    case 'DELETED':
+    case 'D':
+      return 'deleted';
+    case 'RENAMED':
+    case 'R':
+      return 'renamed';
+    case 'MODIFIED':
+    case 'CHANGED':
+    case 'M':
+      return 'modified';
+    default:
+      return undefined;
+  }
 }
 
 /** Raw unified diff for the current branch's PR. */
@@ -97,6 +119,11 @@ export async function submitPrReview(
     args.push('--body', body);
   }
   await runGh(args, cwd);
+}
+
+/** Posts a non-line-anchored PR comment. Used when a finding is outside the PR diff. */
+export async function postPrComment(cwd: string, prNumber: number, body: string): Promise<void> {
+  await runGh(['pr', 'comment', String(prNumber), '--body', body], cwd);
 }
 
 /** Posts a single line-anchored review comment to a PR via the GitHub REST API. */
