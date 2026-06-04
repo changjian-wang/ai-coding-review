@@ -207,17 +207,28 @@ export class ReviewSession {
     if (!s) {
       return;
     }
-    s.findings = findings;
-    s.analyzed = true;
-    // Drop dispositions whose finding no longer exists in the latest analysis.
-    const ids = new Set(findings.map((f) => f.id));
-    if (s.dispositions) {
-      for (const id of Object.keys(s.dispositions)) {
-        if (!ids.has(id)) {
-          delete s.dispositions[id];
-        }
+    // Finding ids are positional (`f0`, `f1`, …) and therefore NOT stable across
+    // re-analysis. Re-keying dispositions by id would resurrect already-handled
+    // findings as fresh, unconfirmed ones. Instead, carry each prior disposition
+    // forward by matching the new finding to the old one by content signature.
+    const prev = s.dispositions ?? {};
+    const sigToDisp = new Map<string, FindingDisposition>();
+    for (const old of s.findings) {
+      const d = prev[old.id];
+      if (d) {
+        sigToDisp.set(findingSignature(old), d);
       }
     }
+    const next: Record<string, FindingDisposition> = {};
+    for (const f of findings) {
+      const d = sigToDisp.get(findingSignature(f));
+      if (d) {
+        next[f.id] = d;
+      }
+    }
+    s.findings = findings;
+    s.analyzed = true;
+    s.dispositions = next;
     s.confirmedFindings = [];
     void this.persist();
   }
@@ -370,4 +381,15 @@ export class ReviewSession {
   dispose(): void {
     this._onDidChange.dispose();
   }
+}
+
+/**
+ * Content-based identity for a finding, used to carry dispositions across
+ * re-analysis (where positional ids change). Prefers the verbatim source
+ * `anchor` (stable while the offending code is unchanged); falls back to the
+ * detail text. Combined with severity + title to avoid collisions.
+ */
+function findingSignature(f: Finding): string {
+  const body = (f.anchor ?? f.detail ?? '').trim();
+  return `${f.severity}\u0000${f.title.trim()}\u0000${body}`;
 }

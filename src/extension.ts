@@ -1166,17 +1166,25 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
       setAppliedFix(fixKey(rel, findingId), edit);
       session.setFindingDisposition(rel, findingId, { kind: 'fixed', at: Date.now() });
       WorkbenchPanel.refreshIfOpen();
-      refreshDocPanel(rel);
+      // Reload the changed file, then re-center on THIS finding's fixed code so
+      // collapsing the now-disposed card (which shifts layout) doesn't make the
+      // view jump elsewhere. Keep focus exactly where the reviewer was working.
+      void (async () => {
+        await reloadDocPanel(rel);
+        await locateInFile(rel, finding.line, finding.endLine, findingId);
+      })();
       transientInfo('修复已应用，已标记为「已 Copilot 修复」');
     },
     onUndone: () => {
       deleteAppliedFix(fixKey(rel, findingId));
       session.setFindingDisposition(rel, findingId, null);
       WorkbenchPanel.refreshIfOpen();
-      refreshDocPanel(rel);
-    },
-    onFileChanged: () => {
-      void reloadDocPanel(rel);
+      // Reload the reverted file, then re-center on the finding again so the
+      // undo keeps focus in place instead of jumping.
+      void (async () => {
+        await reloadDocPanel(rel);
+        await locateInFile(rel, finding.line, finding.endLine, findingId);
+      })();
     },
   });
 }
