@@ -1084,6 +1084,8 @@ async function analyzeByPath(rel: string): Promise<void> {
   const fileName = rel.split('/').pop() ?? rel;
   analyzingPaths.add(rel);
   WorkbenchPanel.refreshIfOpen();
+  DocumentPanel.setAnalyzing(rel, true);
+  let ok = false;
   try {
     await runWithProgress(`Code Review：分析 ${rel}`, async (token, report) => {
       try {
@@ -1095,6 +1097,7 @@ async function analyzeByPath(rel: string): Promise<void> {
         report('写入发现…');
         session.setFindings(rel, findings);
         refreshDocPanel(rel);
+        ok = true;
         transientInfo(
           findings.length
             ? `${rel} 发现 ${findings.length} 个问题`
@@ -1107,6 +1110,7 @@ async function analyzeByPath(rel: string): Promise<void> {
   } finally {
     analyzingPaths.delete(rel);
     WorkbenchPanel.refreshIfOpen();
+    DocumentPanel.setAnalyzing(rel, false, ok);
   }
 }
 

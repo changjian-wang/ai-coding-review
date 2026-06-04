@@ -2,7 +2,7 @@
   "name": "codereview",
   "displayName": "Code Review Gate",
   "description": "Distrust-driven code review: per-line coverage gate plus file-level and cross-file AI analysis, powered by the GitHub CLI and VS Code's Copilot models.",
-  "version": "0.0.32",
+  "version": "0.0.34",
   "publisher": "codereview-dev",
   "private": true,
   "license": "MIT",
@@ -84,7 +84,11 @@
       "properties": {
         "codereview.language": {
           "type": "string",
-          "enum": ["auto", "zh-CN", "en"],
+          "enum": [
+            "auto",
+            "zh-CN",
+            "en"
+          ],
           "enumDescriptions": [
             "跟随 VS Code 显示语言 / Follow VS Code display language",
             "始终使用简体中文",

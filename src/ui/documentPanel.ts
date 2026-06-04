@@ -148,6 +148,18 @@ export class DocumentPanel {
     }
   }
 
+  /**
+   * Reflects analysis progress on the topbar "分析此文件" button. Only the panel
+   * currently showing `path` reacts. When `on` is false, `ok` controls whether a
+   * brief "完成" flash is shown.
+   */
+  static setAnalyzing(path: string, on: boolean, ok = true): void {
+    const inst = DocumentPanel.current;
+    if (inst?.ready && inst.model?.path === path) {
+      void inst.panel.webview.postMessage({ type: 'analyzing', on, ok });
+    }
+  }
+
   private post(): void {
     if (this.model) {
       void this.panel.webview.postMessage({ type: 'load', model: this.model });
@@ -242,8 +254,48 @@ export class DocumentPanel {
     font-family:inherit; font-size:12px; padding:4px 10px; cursor:pointer;
     background:var(--vscode-button-secondaryBackground, rgba(127,127,127,.14));
     color:var(--vscode-foreground); border:1px solid var(--line); border-radius:6px;
+    transition:background .12s ease, transform .08s ease, box-shadow .12s ease, border-color .12s ease;
   }
   button:hover { background:var(--vscode-button-secondaryHoverBackground, rgba(127,127,127,.24)); }
+  button:active { transform:translateY(1px); }
+  button:focus-visible { outline:none; border-color:var(--vscode-focusBorder, var(--blue)); box-shadow:0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder, #569cd6) 35%, transparent); }
+
+  /* Topbar action buttons */
+  .topbar #act-jump, .topbar #act-analyze {
+    position:relative; font-weight:600; padding:4px 12px;
+  }
+  .topbar #act-jump:hover, .topbar #act-analyze:hover {
+    transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.18);
+  }
+  .topbar #act-jump:active, .topbar #act-analyze:active {
+    transform:translateY(0); box-shadow:none;
+  }
+  .topbar #act-analyze {
+    background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent;
+  }
+  .topbar #act-analyze:hover {
+    background:var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  }
+  /* analyze button: spinner + state transitions */
+  #act-analyze { display:inline-flex; align-items:center; gap:6px; }
+  #act-analyze .btn-spin {
+    width:0; height:11px; flex:none; border-radius:50%;
+    border:2px solid color-mix(in srgb, var(--vscode-button-foreground, #fff) 35%, transparent);
+    border-top-color:var(--vscode-button-foreground, #fff);
+    opacity:0; transform:scale(.4);
+    transition:width .15s ease, opacity .15s ease, transform .15s ease;
+  }
+  #act-analyze.analyzing { cursor:progress; pointer-events:none; }
+  #act-analyze.analyzing .btn-spin {
+    width:11px; opacity:1; transform:scale(1); animation:cr-spin .7s linear infinite;
+  }
+  #act-analyze.analyzing:hover { transform:none; box-shadow:none; }
+  #act-analyze.done {
+    background:var(--green); color:var(--vscode-editor-background, #1e1e1e);
+    box-shadow:0 0 0 3px color-mix(in srgb, var(--green) 28%, transparent);
+  }
+  #act-analyze.done:hover { transform:none; }
+  @keyframes cr-spin { to { transform:rotate(360deg); } }
   .content { flex:1; overflow:auto; position:relative; }
 
   /* Source view */
@@ -394,7 +446,7 @@ export class DocumentPanel {
       <button id="m-src">源码视图</button>
     </span>
     <button id="act-jump">跳到下一处未看</button>
-    <button id="act-analyze">分析此文件</button>
+    <button id="act-analyze"><span class="btn-spin" aria-hidden="true"></span><span class="btn-label">分析此文件</span></button>
   </div>
   <div class="findbar collapsed" id="findbar" style="display:none">
     <button class="findbar-toggle" id="findbar-toggle"></button>
@@ -784,13 +836,40 @@ $('pop-note').addEventListener('click', () => { if (pendingSel) { vscode.postMes
 // Toolbar -----------------------------------------------------------------
 $('m-read').addEventListener('click', () => setMode('reading'));
 $('m-src').addEventListener('click', () => setMode('source'));
-$('act-analyze').addEventListener('click', () => vscode.postMessage({ type:'analyze' }));
+$('act-analyze').addEventListener('click', () => { setAnalyzing(true); vscode.postMessage({ type:'analyze' }); });
 $('act-jump').addEventListener('click', () => vscode.postMessage({ type:'jumpNext' }));
 $('findbar-toggle').addEventListener('click', () => $('findbar').classList.toggle('collapsed'));
+
+let doneTimer = 0;
+function setAnalyzing(on, ok) {
+  const btn = $('act-analyze');
+  if (!btn) return;
+  const label = btn.querySelector('.btn-label');
+  if (doneTimer) { clearTimeout(doneTimer); doneTimer = 0; }
+  if (on) {
+    btn.classList.add('analyzing');
+    btn.classList.remove('done');
+    if (label) label.textContent = '分析中…';
+  } else {
+    btn.classList.remove('analyzing');
+    if (ok !== false) {
+      btn.classList.add('done');
+      if (label) label.textContent = '✓ 分析完成';
+      doneTimer = setTimeout(() => {
+        btn.classList.remove('done');
+        if (label) label.textContent = '分析此文件';
+        doneTimer = 0;
+      }, 1800);
+    } else if (label) {
+      label.textContent = '分析此文件';
+    }
+  }
+}
 
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
   if (msg.type === 'load') { model = msg.model; render(); }
+  else if (msg.type === 'analyzing') { setAnalyzing(msg.on, msg.ok); }
   else if (msg.type === 'scrollTo') {
     if (mode !== 'source') setMode('source');
     const start = msg.line;

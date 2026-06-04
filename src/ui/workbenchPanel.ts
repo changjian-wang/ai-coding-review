@@ -384,9 +384,6 @@ export class WorkbenchPanel {
 
     const rows = flattenRows(treeRoot);
     const expanded = [...this.expandedFolders];
-    const selectedAnalyzing = !!state.files.find(
-      (f) => f.path === state.selected && f.analyzing,
-    );
 
     const gateReason: string[] = [];
     if (state.coverage.filesReady < state.coverage.filesTotal) {
@@ -527,11 +524,6 @@ export class WorkbenchPanel {
       </div>
       <div class="tree" id="tree"><div class="tree-sizer" id="treeSizer"></div></div>
       <div class="toolbar">
-        <div class="grp-label">当前文件</div>
-        <div class="row">
-          <button class="primary" id="analyze" ${state.selected && !selectedAnalyzing ? '' : 'disabled'}>${selectedAnalyzing ? '分析中…' : '分析此文件'}</button>
-          <button id="jumpNext" ${state.selected ? '' : 'disabled'}>跳到下一处未看</button>
-        </div>
         <div class="grp-label">整体审查</div>
         <div class="row">
           <button id="global">全局逻辑分析</button>
@@ -666,15 +658,6 @@ export class WorkbenchPanel {
     sizer.innerHTML = html;
   }
 
-  function updateButtons() {
-    const r = selectedPath ? rowByPath.get(selectedPath) : null;
-    const analyzing = !!(r && r.kind === 'file' && r.analyzing);
-    const analyze = byId('analyze');
-    if (analyze) { analyze.disabled = !selectedPath || analyzing; analyze.textContent = analyzing ? '分析中…' : '分析此文件'; }
-    const jumpNext = byId('jumpNext');
-    if (jumpNext) jumpNext.disabled = !selectedPath;
-  }
-
   function renderConclusion(c) {
     if (!c) return '';
     const target = c.target === 'pr' && c.prNumber ? ('已写回 PR #' + c.prNumber + ' · ') : '本地记录 · ';
@@ -719,7 +702,6 @@ export class WorkbenchPanel {
     } else {
       for (const r of ROWS) if (r.kind === 'file') r.active = (r.path === path);
       selectedPath = path;
-      updateButtons();
       renderWindow();
       send({ type:'select', path });
     }
@@ -747,8 +729,6 @@ export class WorkbenchPanel {
     renderWindow();
   });
 
-  byId('analyze')?.addEventListener('click', () => { if (selectedPath) send({ type:'analyze', path:selectedPath }); });
-  byId('jumpNext')?.addEventListener('click', () => send({ type:'jumpNext' }));
   byId('global')?.addEventListener('click', () => send({ type:'global' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
@@ -771,7 +751,6 @@ export class WorkbenchPanel {
       r.dotClass = p.dotClass; r.readyCount = p.ready; r.filesTotal = p.filesTotal;
     });
     selectedPath = (typeof msg.selected === 'string') ? msg.selected : null;
-    updateButtons();
     renderWindow();
     updateHud(msg);
   });
@@ -787,7 +766,6 @@ export class WorkbenchPanel {
     treeEl.scrollTop = savedState.treeScroll;
     renderWindow();
   }
-  updateButtons();
 </script>
 </body>
 </html>`;
