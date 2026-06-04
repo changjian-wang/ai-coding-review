@@ -1154,6 +1154,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
           suggestion: finding.suggestion,
           line: finding.line,
           endLine: finding.endLine,
+          anchor: finding.anchor,
         },
         token,
       );
