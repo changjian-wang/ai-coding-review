@@ -68,6 +68,38 @@ export interface WorkbenchActions {
   pickScope(): void;
 }
 
+interface FilePatch {
+  path: string;
+  active: boolean;
+  ready: boolean;
+  dotClass: 'done' | 'analyzing' | 'partial' | 'none';
+  dotTitle: string;
+  unconfirmed: number;
+  analyzed: boolean;
+  findings: number;
+  seen: number;
+  total: number;
+}
+
+interface FolderPatch {
+  path: string;
+  dotClass: 'done' | 'partial' | 'none';
+  ready: number;
+  filesTotal: number;
+}
+
+interface WorkbenchPatchSnapshot {
+  files: Map<string, FilePatch>;
+  folders: Map<string, FolderPatch>;
+  selected?: string;
+  coverage: WorkbenchState['coverage'];
+  gatePassed: boolean;
+  globalDone: boolean;
+  hasGlobalReport: boolean;
+  modelLabel: string;
+  conclusion?: WorkbenchState['conclusion'];
+}
+
 type InboundMessage =
   | { type: 'select'; path: string }
   | { type: 'analyze'; path: string }
@@ -99,6 +131,12 @@ export class WorkbenchPanel {
     return WorkbenchPanel.expandedFolders;
   }
   private refreshTimer?: ReturnType<typeof setTimeout>;
+  /** Whether the full HTML shell has been rendered at least once into the live webview. */
+  private rendered = false;
+  /** Signature of the file set last rendered as full HTML; a change forces a full rebuild. */
+  private lastStructureSig?: string;
+  /** Last dynamic snapshot used to compute incremental tree / HUD patches. */
+  private lastSnapshot?: WorkbenchPatchSnapshot;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -189,7 +227,78 @@ export class WorkbenchPanel {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
-    this.panel.webview.html = this.render(this.getState());
+    const state = this.getState();
+    const sig = state.hasReviewSet ? structureSig(state.files) : '__empty__';
+    // Hot path: while the file set is unchanged (the common case during a
+    // review — only progress / findings / selection change), patch the live
+    // DOM in place via postMessage instead of reassigning `webview.html`, which
+    // would force a full reload + re-parse + relayout of thousands of nodes.
+    if (this.rendered && sig === this.lastStructureSig && state.hasReviewSet) {
+      void this.panel.webview.postMessage({ type: 'patch', ...this.computePatch(state) });
+      return;
+    }
+    this.lastStructureSig = sig;
+    this.rendered = true;
+    this.lastSnapshot = snapshotFor(state);
+    this.panel.webview.html = this.render(state);
+  }
+
+  /**
+   * Computes the minimal dynamic delta while the file-tree structure stays the
+   * same: changed file rows, changed folder rollups, and footer/toolbar state.
+   */
+  private computePatch(state: WorkbenchState): {
+    files: FilePatch[];
+    folders: FolderPatch[];
+    selected?: string;
+    coverage: WorkbenchState['coverage'];
+    gatePassed: boolean;
+    globalDone: boolean;
+    hasGlobalReport: boolean;
+    modelLabel: string;
+    conclusion?: WorkbenchState['conclusion'];
+  } {
+    const next = snapshotFor(state);
+    const prev = this.lastSnapshot;
+    this.lastSnapshot = next;
+    if (!prev) {
+      return {
+        files: [...next.files.values()],
+        folders: [...next.folders.values()],
+        selected: next.selected,
+        coverage: next.coverage,
+        gatePassed: next.gatePassed,
+        globalDone: next.globalDone,
+        hasGlobalReport: next.hasGlobalReport,
+        modelLabel: next.modelLabel,
+        conclusion: next.conclusion,
+      };
+    }
+    const files: FilePatch[] = [];
+    for (const [path, patch] of next.files) {
+      const before = prev.files.get(path);
+      if (!before || !sameFilePatch(before, patch)) {
+        files.push(patch);
+      }
+    }
+    const folders: FolderPatch[] = [];
+    for (const [path, patch] of next.folders) {
+      const before = prev.folders.get(path);
+      if (!before || !sameFolderPatch(before, patch)) {
+        folders.push(patch);
+      }
+    }
+    return {
+      files,
+      folders,
+      selected: next.selected,
+      coverage: next.coverage,
+      gatePassed: next.gatePassed,
+      globalDone: next.globalDone,
+      hasGlobalReport: next.hasGlobalReport,
+      modelLabel: next.modelLabel,
+      conclusion: next.conclusion,
+    };
   }
 
   private handle(msg: InboundMessage): void {
@@ -418,23 +527,23 @@ export class WorkbenchPanel {
           <button id="showGlobal" ${state.hasGlobalReport ? '' : 'disabled'}>查看全局结论</button>
         </div>
         <div class="model-row">
-          <span class="model-label" title="${escAttr(state.modelLabel)}">模型：<b>${esc(state.modelLabel)}</b></span>
+          <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">模型：<b>${esc(state.modelLabel)}</b></span>
           <button id="pickModel">切换</button>
         </div>
       </div>
       <div class="hud">
-        <div class="hud-row"><span class="lbl">行覆盖</span><span class="val">${pct}%</span></div>
-        <div class="cov-track"><div class="cov-fill" style="width:${pct}%"></div></div>
+        <div class="hud-row"><span class="lbl">行覆盖</span><span id="covPct" class="val">${pct}%</span></div>
+        <div class="cov-track"><div id="covFill" class="cov-fill" style="width:${pct}%"></div></div>
         <div class="hud-row" style="margin-top:.55rem; margin-bottom:0;">
-          <span class="lbl">文件就绪</span><span class="val">${state.coverage.filesReady}/${state.coverage.filesTotal}</span>
+          <span class="lbl">文件就绪</span><span id="filesReady" class="val">${state.coverage.filesReady}/${state.coverage.filesTotal}</span>
         </div>
-        <div class="gate-chip ${gateOk ? 'ok' : 'locked'}">
-          <span>${gateOk ? '✓' : '🔒'}</span>
-          <span>${gateOk ? '门禁已通过，可提交结论' : '门禁未通过'}</span>
+        <div id="gateChip" class="gate-chip ${gateOk ? 'ok' : 'locked'}">
+          <span id="gateIcon">${gateOk ? '✓' : '🔒'}</span>
+          <span id="gateText">${gateOk ? '门禁已通过，可提交结论' : '门禁未通过'}</span>
         </div>
-        ${gateOk ? '' : `<div class="gate-reason">${gateReason.map(esc).join('；')}</div>`}
+        <div id="gateReason" class="gate-reason" ${gateOk ? 'style="display:none"' : ''}>${gateOk ? '' : gateReason.map(esc).join('；')}</div>
         <button class="primary" id="submit" style="width:100%; margin-top:.6rem;" ${gateOk ? '' : 'disabled'}>提交审查结论</button>
-        ${conclusionHtml}
+        <div id="conclusionWrap">${conclusionHtml}</div>
       </div>
     </div>
   </div>
@@ -442,6 +551,21 @@ export class WorkbenchPanel {
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const send = (m) => vscode.postMessage(m);
+  const esc = (s) => String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+  const cssEscape = (s) => {
+    if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
+    return String(s).replace(/(["\\.#:[\](){}+~> ])/g, '\\$1');
+  };
+  const formatTime = (ms) => {
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  };
   document.querySelectorAll('.tnode').forEach((n) => {
     n.addEventListener('click', () => {
       // Optimistically move the selection highlight immediately so the click
@@ -463,6 +587,104 @@ export class WorkbenchPanel {
     });
   });
   const filterInput = document.getElementById('filter');
+  function fileDotClass(f) {
+    return f.ready ? 'done' : (f.fullySeen ? 'analyzing' : (f.seen > 0 ? 'partial' : 'none'));
+  }
+  function fileDotTitle(f) {
+    return f.ready
+      ? '已就绪'
+      : (f.fullySeen
+        ? (f.analyzed ? '已读完，发现待确认' : '已读完，待分析')
+        : (f.seen > 0 ? ('已读 ' + f.seen + '/' + f.total + ' 行') : '未开始'));
+  }
+  function renderConclusion(c) {
+    if (!c) return '';
+    const target = c.target === 'pr' && c.prNumber
+      ? ('已写回 PR #' + c.prNumber + ' · ')
+      : '本地记录 · ';
+    return '<div class="conclusion">已提交结论：<b>' + esc(c.label) + '</b>' +
+      '<span class="conc-meta">' + target + esc(formatTime(c.submittedAt)) + '</span></div>';
+  }
+  function updateFileNode(p) {
+    const n = document.querySelector('.tnode[data-path="' + cssEscape(p.path) + '"]');
+    if (!n) return;
+    n.classList.toggle('active', !!p.active);
+    n.classList.toggle('ready', !!p.ready);
+    const dot = n.querySelector('.seen-dot');
+    if (dot) {
+      dot.className = 'seen-dot ' + p.dotClass;
+      dot.title = p.dotTitle;
+    }
+    let fix = n.querySelector('.fix-flag, .ok-flag');
+    const cov = n.querySelector('.tcov');
+    if (cov) cov.textContent = p.total > 0 ? (p.seen + '/' + p.total) : '—';
+    if (p.unconfirmed > 0) {
+      if (!fix || !fix.classList.contains('fix-flag')) {
+        fix?.remove();
+        fix = document.createElement('span');
+        fix.className = 'fix-flag';
+        const covEl = n.querySelector('.tcov');
+        covEl ? n.insertBefore(fix, covEl) : n.appendChild(fix);
+      }
+      fix.textContent = String(p.unconfirmed);
+      fix.title = p.unconfirmed + ' 个未确认发现';
+    } else if (p.analyzed && p.findings === 0) {
+      if (!fix || !fix.classList.contains('ok-flag')) {
+        fix?.remove();
+        fix = document.createElement('span');
+        fix.className = 'ok-flag';
+        fix.textContent = '✓';
+        fix.title = '无发现';
+        const covEl = n.querySelector('.tcov');
+        covEl ? n.insertBefore(fix, covEl) : n.appendChild(fix);
+      }
+    } else {
+      fix?.remove();
+    }
+  }
+  function updateFolderNode(p) {
+    const group = document.querySelector('.folder-group[data-path="' + cssEscape(p.path) + '"]');
+    if (!group) return;
+    const dot = group.querySelector('.tfolder .seen-dot');
+    if (dot) dot.className = 'seen-dot ' + p.dotClass;
+    const count = group.querySelector('.tcount');
+    if (count) count.textContent = p.ready + '/' + p.filesTotal;
+  }
+  function updateHud(msg) {
+    const total = msg.coverage.total || 0;
+    const pct = total > 0 ? Math.round((msg.coverage.seen / total) * 100) : 0;
+    const covPct = byId('covPct');
+    if (covPct) covPct.textContent = pct + '%';
+    const covFill = byId('covFill');
+    if (covFill) covFill.style.width = pct + '%';
+    const filesReady = byId('filesReady');
+    if (filesReady) filesReady.textContent = msg.coverage.filesReady + '/' + msg.coverage.filesTotal;
+    const gateChip = byId('gateChip');
+    if (gateChip) gateChip.className = 'gate-chip ' + (msg.gatePassed ? 'ok' : 'locked');
+    const gateIcon = byId('gateIcon');
+    if (gateIcon) gateIcon.textContent = msg.gatePassed ? '✓' : '🔒';
+    const gateText = byId('gateText');
+    if (gateText) gateText.textContent = msg.gatePassed ? '门禁已通过，可提交结论' : '门禁未通过';
+    const gateReason = byId('gateReason');
+    if (gateReason) {
+      const reasons = [];
+      if (msg.coverage.filesReady < msg.coverage.filesTotal) reasons.push((msg.coverage.filesTotal - msg.coverage.filesReady) + ' 个文件未读完并确认');
+      if (!msg.globalDone) reasons.push('全局结论未确认');
+      gateReason.textContent = reasons.join('；');
+      gateReason.style.display = msg.gatePassed ? 'none' : '';
+    }
+    const submit = byId('submit');
+    if (submit) submit.disabled = !msg.gatePassed;
+    const showGlobal = byId('showGlobal');
+    if (showGlobal) showGlobal.disabled = !msg.hasGlobalReport;
+    const modelLabel = byId('modelLabel');
+    if (modelLabel) {
+      modelLabel.title = msg.modelLabel;
+      modelLabel.innerHTML = '模型：<b>' + esc(msg.modelLabel) + '</b>';
+    }
+    const conclusionWrap = byId('conclusionWrap');
+    if (conclusionWrap) conclusionWrap.innerHTML = renderConclusion(msg.conclusion);
+  }
   function applyFilter() {
     const q = filterInput.value.trim().toLowerCase();
     const ancestors = new Set();
@@ -538,6 +760,27 @@ export class WorkbenchPanel {
       });
     }, { passive: true });
   }
+  window.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (!msg || msg.type !== 'patch') return;
+    (msg.files || []).forEach(updateFileNode);
+    (msg.folders || []).forEach(updateFolderNode);
+    if (typeof msg.selected === 'string') {
+      document.querySelectorAll('.tnode.active').forEach((a) => a.classList.remove('active'));
+      const active = document.querySelector('.tnode[data-path="' + cssEscape(msg.selected) + '"]');
+      active?.classList.add('active');
+      const analyze = byId('analyze');
+      if (analyze) analyze.disabled = false;
+      const jumpNext = byId('jumpNext');
+      if (jumpNext) jumpNext.disabled = false;
+    } else {
+      const analyze = byId('analyze');
+      if (analyze) analyze.disabled = true;
+      const jumpNext = byId('jumpNext');
+      if (jumpNext) jumpNext.disabled = true;
+    }
+    updateHud(msg);
+  });
 </script>
 </body>
 </html>`;
@@ -761,6 +1004,97 @@ function compactTree(node: TreeNode): TreeNode {
     };
   }
   return { ...node, children: compactedChildren };
+}
+
+function structureSig(files: WorkbenchFile[]): string {
+  return files.map((f) => f.path).join('\n');
+}
+
+function snapshotFor(state: WorkbenchState): WorkbenchPatchSnapshot {
+  const files = new Map<string, FilePatch>();
+  for (const file of state.files) {
+    files.set(file.path, filePatchOf(file));
+  }
+  const root = compactTree(buildTree(state.files));
+  const folders = new Map<string, FolderPatch>();
+  collectFolderPatches(root, folders);
+  return {
+    files,
+    folders,
+    selected: state.selected,
+    coverage: state.coverage,
+    gatePassed: state.gatePassed,
+    globalDone: state.globalDone,
+    hasGlobalReport: state.hasGlobalReport,
+    modelLabel: state.modelLabel,
+    conclusion: state.conclusion,
+  };
+}
+
+function filePatchOf(file: WorkbenchFile): FilePatch {
+  return {
+    path: file.path,
+    active: file.active,
+    ready: file.ready,
+    dotClass: file.ready
+      ? 'done'
+      : file.fullySeen
+        ? 'analyzing'
+        : file.seen > 0
+          ? 'partial'
+          : 'none',
+    dotTitle: file.ready
+      ? '已就绪'
+      : file.fullySeen
+        ? file.analyzed ? '已读完，发现待确认' : '已读完，待分析'
+        : file.seen > 0
+          ? `已读 ${file.seen}/${file.total} 行`
+          : '未开始',
+    unconfirmed: file.unconfirmed,
+    analyzed: file.analyzed,
+    findings: file.findings,
+    seen: file.seen,
+    total: file.total,
+  };
+}
+
+function collectFolderPatches(node: TreeNode, out: Map<string, FolderPatch>): void {
+  if (node.kind === 'folder' && node.fullPath) {
+    const stats = node.stats ?? { seen: 0, total: 0, ready: 0, filesTotal: 0, findings: 0, unconfirmed: 0 };
+    out.set(node.fullPath, {
+      path: node.fullPath,
+      dotClass: stats.filesTotal > 0 && stats.ready === stats.filesTotal
+        ? 'done'
+        : stats.ready > 0 || stats.seen > 0
+          ? 'partial'
+          : 'none',
+      ready: stats.ready,
+      filesTotal: stats.filesTotal,
+    });
+  }
+  for (const child of node.children ?? []) {
+    collectFolderPatches(child, out);
+  }
+}
+
+function sameFilePatch(a: FilePatch, b: FilePatch): boolean {
+  return a.path === b.path
+    && a.active === b.active
+    && a.ready === b.ready
+    && a.dotClass === b.dotClass
+    && a.dotTitle === b.dotTitle
+    && a.unconfirmed === b.unconfirmed
+    && a.analyzed === b.analyzed
+    && a.findings === b.findings
+    && a.seen === b.seen
+    && a.total === b.total;
+}
+
+function sameFolderPatch(a: FolderPatch, b: FolderPatch): boolean {
+  return a.path === b.path
+    && a.dotClass === b.dotClass
+    && a.ready === b.ready
+    && a.filesTotal === b.filesTotal;
 }
 
 function formatTime(ms: number): string {
