@@ -17,8 +17,9 @@ export class AnalysisError extends Error {}
 
 const FILE_SYSTEM_PROMPT = `你是一名严格的资深代码审查员。审查给定源码文件的逻辑、正确性、并发与安全问题。
 只输出 JSON，不要任何解释文字或 markdown 代码围栏。
-JSON 结构：{"findings":[{"line":<1基行号>,"endLine":<可选>,"severity":"bug"|"conditional"|"suggestion","title":"简短标题","detail":"问题与证据","suggestion":"可选的修复建议"}]}
+JSON 结构：{"findings":[{"line":<1基行号>,"endLine":<可选>,"anchor":"问题所在的原始代码片段（逐字、不含行号前缀，连续一到数行且在文件中能唯一定位）","severity":"bug"|"conditional"|"suggestion","title":"简短标题","detail":"问题与证据","suggestion":"可选的修复建议"}]}
 severity 含义：bug=确定缺陷；conditional=特定条件下才出问题；suggestion=可选改进。
+anchor 必须逐字摘自源码（去掉「行号<TAB>」前缀），用于按内容定位，请尽量唯一；如确实无法给出就省略。
 没有问题就返回 {"findings":[]}。行号必须对应所给文件的真实行。`;
 
 const GLOBAL_SYSTEM_PROMPT = `你是一名严格的资深代码审查员，负责跨文件的全局逻辑分析。
@@ -209,10 +210,12 @@ export async function analyzeFile(
   return list.map((f, i) => {
     const o = f as Record<string, unknown>;
     const line = clampLine(Number(o.line) || 1, lineCount);
+    const anchor = typeof o.anchor === 'string' && o.anchor.trim() ? o.anchor : undefined;
     return {
       id: `f${i}`,
       line,
       endLine: o.endLine ? clampLine(Number(o.endLine), lineCount) : undefined,
+      anchor,
       severity: normaliseSeverity(o.severity),
       title: String(o.title ?? '未命名问题'),
       detail: String(o.detail ?? ''),
@@ -369,27 +372,38 @@ ${fileContent}
   return t;
 }
 
-/** A single fix proposal: a minimal in-file replacement plus its rationale. */
-export interface FixProposal {
-  title: string;
-  rationale: string;
+/** A single precise replacement inside a file. */
+export interface FixEdit {
   /** Exact substring of the current file content; must appear once. */
   oldText: string;
   /** Replacement text; may be empty (pure deletion). */
   newText: string;
 }
 
+/**
+ * A single fix proposal: one or more coordinated in-file replacements applied
+ * together as one solution, plus its rationale. Multiple proposals are mutually
+ * exclusive alternatives; multiple `edits` inside one proposal are applied and
+ * reverted as a unit.
+ */
+export interface FixProposal {
+  title: string;
+  rationale: string;
+  /** One or more edits applied together. */
+  edits: FixEdit[];
+}
+
 const FIX_PROPOSALS_SYSTEM_PROMPT = `你是一名资深工程师。给你一个源码文件以及一个针对某一行附近的代码审查发现，请提出修复方案。
 - 由你判断给出几个方案（1 到 3 个），优先质量而非数量；如果只有一种合理改法就只给 1 个。
-- **多个方案之间必须是互斥的备选**：用户只会选其中一个应用，任意一个单独应用都要能完整修复该发现。不要把一个修复拆成多个相互依赖、需要一起应用的步骤。
-- **方案之间不得相互引用**：禁止出现「配合上方方案」「在方案 1 基础上」这类措辞；每个方案都要能独立看懂、独立应用。
-- 如果正确的修复确实需要改动多处，请把这些改动合并进**同一个方案**：让 oldText 覆盖更大的连续片段，或选择最能自洽、改动最集中的单一改法。
-- 每个方案必须是「精确字符串替换」：oldText 取自当前文件、是连续若干行且在文件中只出现一次；newText 是替换后的内容（可以为空字符串表示删除）。
+- **多个方案之间是互斥的备选**：用户只会选其中一个应用。不要把「同一个修复的多个步骤」拆成多个方案。
+- **一个方案可以包含多处改动**：如果正确的修复需要同时改动文件里的多个位置，就把它们全部放进同一个方案的 edits 数组里 —— 它们会被一起应用、一起撤销，作为一个完整解决方案。
+- 每处改动都是「精确字符串替换」：oldText 取自当前文件、是连续若干行且在文件中只出现一次；newText 是替换后的内容（可以为空字符串表示删除）。
+- 同一个方案内的多处 edits 不要相互重叠。
 - oldText 不要取得太大；只覆盖真正需要改的最小连续片段，但要留足上下文使其唯一定位。
 - 不要修改与本问题无关的格式或行尾空白。
 - 行号语义：用户给你的源码每行以「行号<TAB>内容」前缀；oldText/newText 只填「内容」部分，**不要带行号前缀**。
 只输出 JSON，不要解释、不要 markdown 围栏：
-{"proposals":[{"title":"一句话方案名","rationale":"为什么这样改、有什么 trade-off","oldText":"...","newText":"..."}]}`;
+{"proposals":[{"title":"一句话方案名","rationale":"为什么这样改、有什么 trade-off","edits":[{"oldText":"...","newText":"..."}]}]}`;
 
 /** Generates 1–N fix proposals for a finding; each is a precise oldText→newText edit. */
 export async function generateFixProposals(
@@ -418,20 +432,41 @@ ${numbered}
   const out: FixProposal[] = [];
   for (const p of list) {
     const o = p as Record<string, unknown>;
-    const oldText = typeof o.oldText === 'string' ? o.oldText : '';
-    const newText = typeof o.newText === 'string' ? o.newText : '';
-    if (!oldText) {
+    const edits = parseFixEdits(o);
+    if (edits.length === 0) {
       continue;
     }
     out.push({
       title: String(o.title ?? '修复方案').trim() || '修复方案',
       rationale: String(o.rationale ?? '').trim(),
-      oldText,
-      newText,
+      edits,
     });
   }
   if (out.length === 0) {
     throw new AnalysisError('模型未返回有效的修复方案。');
   }
   return out;
+}
+
+/**
+ * Extracts the edit list from a raw proposal object. Accepts the new `edits`
+ * array shape and falls back to a single top-level `oldText`/`newText` pair so
+ * older model outputs still parse. Drops edits without an `oldText`.
+ */
+function parseFixEdits(o: Record<string, unknown>): FixEdit[] {
+  const rawEdits = Array.isArray(o.edits)
+    ? o.edits
+    : typeof o.oldText === 'string'
+      ? [{ oldText: o.oldText, newText: o.newText }]
+      : [];
+  const edits: FixEdit[] = [];
+  for (const e of rawEdits) {
+    const eo = e as Record<string, unknown>;
+    const oldText = typeof eo.oldText === 'string' ? eo.oldText : '';
+    const newText = typeof eo.newText === 'string' ? eo.newText : '';
+    if (oldText) {
+      edits.push({ oldText, newText });
+    }
+  }
+  return edits;
 }

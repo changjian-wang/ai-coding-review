@@ -1520,13 +1520,20 @@ async function locateInFile(
   let startLine = Math.max(1, Math.floor(Number.isFinite(line) ? line : 1));
   let stopLine = endLine && endLine > startLine ? Math.floor(endLine) : startLine;
 
-  // If this finding has an applied Copilot fix, the original line numbers are
-  // stale (the edit shifted the file). Re-anchor by locating the fix's current
-  // text in the live document, which survives later edits / earlier fixes too.
+  // Prefer content-based anchoring over the (drift-prone) line numbers:
+  //   1. an applied Copilot fix → locate its current text in the live document;
+  //   2. otherwise the finding's verbatim `anchor` snippet from analysis;
+  //   3. only fall back to the stored line numbers when neither resolves.
   const reanchored = findingId ? await reanchorToAppliedFix(relPath, findingId) : undefined;
   if (reanchored) {
     startLine = reanchored.startLine;
     stopLine = reanchored.endLine;
+  } else if (findingId) {
+    const byContent = await locateByFindingAnchor(relPath, findingId);
+    if (byContent) {
+      startLine = byContent.startLine;
+      stopLine = byContent.endLine;
+    }
   }
 
   if (total > 0) {
@@ -1534,6 +1541,38 @@ async function locateInFile(
     stopLine = Math.min(stopLine, total);
   }
   DocumentPanel.scrollTo(startLine, stopLine);
+}
+
+/**
+ * Locates a finding by its verbatim `anchor` snippet in the live document,
+ * returning 1-based start/end lines. Content-based, so it survives line drift
+ * from edits or earlier fixes. Returns undefined when the finding has no anchor
+ * or the snippet can no longer be found uniquely (caller falls back to lines).
+ */
+async function locateByFindingAnchor(
+  rel: string,
+  findingId: string,
+): Promise<{ startLine: number; endLine: number } | undefined> {
+  const finding = session.findings(rel).find((f) => f.id === findingId);
+  if (!finding?.anchor) {
+    return undefined;
+  }
+  const cwd = activeCwd();
+  if (!cwd) {
+    return undefined;
+  }
+  try {
+    const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+    const doc = await vscode.workspace.openTextDocument(fileUri);
+    const hit = locateSnippetLines(doc.getText().split(/\r?\n/), finding.anchor);
+    if (!hit) {
+      return undefined;
+    }
+    return { startLine: hit.line, endLine: hit.endLine };
+  } catch (err) {
+    console.warn('[codereview] locateByFindingAnchor failed:', err);
+    return undefined;
+  }
 }
 
 /**

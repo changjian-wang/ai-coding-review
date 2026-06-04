@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { FixProposal } from '../ai/analyzer';
+import type { FixEdit, FixProposal } from '../ai/analyzer';
 import { escAttr as escapeHtml, nonce as makeNonce } from './html';
 
 /** Inputs needed to drive the panel. */
@@ -22,12 +22,14 @@ export interface FixProposalRequest {
 interface ProposalView {
   title: string;
   rationale: string;
-  oldText: string;
-  newText: string;
-  matches: number;
+  /** One or more edits applied together as a single solution. */
+  edits: FixEdit[];
+  /** Per-edit occurrence count of the text we'd search for (oldText, or newText once applied). */
+  matches: number[];
+  /** True when every edit can be uniquely located, so the whole proposal is applicable. */
   applicable: boolean;
   applied: boolean;
-  /** Pre-rendered HTML showing a minimal +/- diff for this proposal. */
+  /** Pre-rendered HTML showing a minimal +/- diff for every edit in this proposal. */
   diffHtml: string;
 }
 
@@ -40,8 +42,7 @@ type PanelState =
 interface CachedProposal {
   title: string;
   rationale: string;
-  oldText: string;
-  newText: string;
+  edits: FixEdit[];
   applied: boolean;
 }
 
@@ -184,19 +185,7 @@ export class FixProposalPanel {
         return;
       }
       const content = await this.currentFileText();
-      const views: ProposalView[] = proposals.map((p) => {
-        const matches = countOccurrences(content, p.oldText);
-        return {
-          title: p.title,
-          rationale: p.rationale,
-          oldText: p.oldText,
-          newText: p.newText,
-          matches,
-          applicable: matches === 1,
-          applied: false,
-          diffHtml: renderInlineDiff(p.oldText, p.newText),
-        };
-      });
+      const views: ProposalView[] = proposals.map((p) => buildView(p, content, false));
       this.setState({ kind: 'ready', proposals: views });
       FixProposalPanel.saveCache(key, {
         proposals: views.map(toCached),
@@ -220,45 +209,15 @@ export class FixProposalPanel {
   /** Rebuilds runtime ProposalView state from a cached entry against the current file content. */
   private async restoreFromCache(entry: CachedEntry): Promise<void> {
     const content = await this.currentFileText();
-    const views: ProposalView[] = entry.proposals.map((p) => {
+    const views: ProposalView[] = entry.proposals.map((cached) => {
+      const p = normaliseCached(cached);
       if (p.applied) {
-        const stillThere = countOccurrences(content, p.newText);
-        if (stillThere >= 1) {
-          return {
-            title: p.title,
-            rationale: p.rationale,
-            oldText: p.oldText,
-            newText: p.newText,
-            matches: stillThere,
-            applicable: false,
-            applied: true,
-            diffHtml: renderInlineDiff(p.oldText, p.newText),
-          };
-        }
-        // The applied change appears to have been undone externally; treat as not applied.
-        const m = countOccurrences(content, p.oldText);
-        return {
-          title: p.title,
-          rationale: p.rationale,
-          oldText: p.oldText,
-          newText: p.newText,
-          matches: m,
-          applicable: m === 1,
-          applied: false,
-          diffHtml: renderInlineDiff(p.oldText, p.newText),
-        };
+        // Treat as still applied only when every edit's replacement is present;
+        // otherwise the change was undone externally — show it as re-appliable.
+        const allPresent = p.edits.every((e) => countOccurrences(content, e.newText) >= 1);
+        return buildView(p, content, allPresent);
       }
-      const m = countOccurrences(content, p.oldText);
-      return {
-        title: p.title,
-        rationale: p.rationale,
-        oldText: p.oldText,
-        newText: p.newText,
-        matches: m,
-        applicable: m === 1,
-        applied: false,
-        diffHtml: renderInlineDiff(p.oldText, p.newText),
-      };
+      return buildView(p, content, false);
     });
     const lastApplied = views.find((p) => p.applied)?.title;
     this.setState({ kind: 'ready', proposals: views, lastApplied });
@@ -317,75 +276,70 @@ export class FixProposalPanel {
       return;
     }
     const content = await this.currentFileText();
-    const matches = countOccurrences(content, proposal.oldText);
-    if (matches === 0) {
-      this.markProposalError(idx, '无法定位：原代码片段在当前文件中已不存在（文件可能被修改了）。请「重新生成」。');
-      return;
+    // Every edit in the proposal must locate uniquely, or we apply none of them.
+    for (const e of proposal.edits) {
+      const matches = countOccurrences(content, e.oldText);
+      if (matches === 0) {
+        this.markProposalError(idx, '无法定位：方案中有一处原代码片段在当前文件中已不存在（文件可能被修改了）。请「重新生成」。');
+        return;
+      }
+      if (matches > 1) {
+        this.markProposalError(idx, `方案中有一处原代码出现了 ${matches} 次，无法唯一定位。请「重新生成」以获得更具上下文的方案。`);
+        return;
+      }
     }
-    if (matches > 1) {
-      this.markProposalError(idx, `修改位置出现了 ${matches} 次，无法唯一定位。请「重新生成」以获得更具上下文的方案。`);
-      return;
-    }
-    const ok = await this.applyEdit(proposal.oldText, proposal.newText);
+    const ok = await this.applyEdits(proposal.edits);
     if (!ok) {
       this.markProposalError(idx, '应用失败：文件在写入瞬间发生了变化，请「重新生成」。');
       return;
     }
     // Mutate the proposal view in place so other proposals stay visible.
     if (this.state.kind === 'ready') {
-      const updated = this.state.proposals.map((p, i) =>
-        i === idx ? { ...p, applied: true, applicable: false } : p,
-      );
-      // Re-check remaining proposals against the new file content (positions may have shifted).
       const after = await this.currentFileText();
-      for (let i = 0; i < updated.length; i++) {
-        if (i === idx) {
-          continue;
-        }
-        const m = countOccurrences(after, updated[i].oldText);
-        updated[i] = { ...updated[i], matches: m, applicable: !updated[i].applied && m === 1 };
-      }
+      const updated = this.state.proposals.map((p, i) =>
+        i === idx ? buildView(p, after, true) : (p.applied ? p : buildView(p, after, false)),
+      );
       this.setState({ kind: 'ready', proposals: updated, lastApplied: proposal.title });
     }
     this.snapshotCurrent();
     if (!this.hasNotifiedApplied) {
       this.hasNotifiedApplied = true;
     }
-    this.request.onApplied({ oldText: proposal.oldText, newText: proposal.newText });
+    // Anchor downstream locate/revert to the proposal's first edit.
+    this.request.onApplied({ oldText: proposal.edits[0].oldText, newText: proposal.edits[0].newText });
     this.request.onFileChanged?.();
     vscode.window.setStatusBarMessage(`已应用：${proposal.title}（点击「撤销修改」可还原）`, 8000);
   }
 
-  /** Reverts a previously-applied proposal by swapping newText back to oldText. */
+  /** Reverts a previously-applied proposal by swapping every edit's newText back to oldText. */
   private async undoProposal(idx: number, proposal: ProposalView): Promise<void> {
     if (this.state.kind !== 'ready') {
       return;
     }
     const content = await this.currentFileText();
-    const matches = countOccurrences(content, proposal.newText);
-    if (matches === 0) {
-      void vscode.window.showWarningMessage('无法撤销：文件中已找不到之前应用的片段（文件可能被手动改动过了）。');
-      return;
+    for (const e of proposal.edits) {
+      const matches = countOccurrences(content, e.newText);
+      if (matches === 0) {
+        void vscode.window.showWarningMessage('无法撤销：文件中已找不到之前应用的某处片段（文件可能被手动改动过了）。');
+        return;
+      }
+      if (matches > 1) {
+        void vscode.window.showWarningMessage(`之前应用的某处片段现在出现了 ${matches} 次，无法唯一定位，不敢自动撤销。请手动 Ctrl+Z。`);
+        return;
+      }
     }
-    if (matches > 1) {
-      void vscode.window.showWarningMessage(`之前应用的片段现在出现了 ${matches} 次，无法唯一定位，不敢自动撤销。请手动 Ctrl+Z。`);
-      return;
-    }
-    const ok = await this.applyEdit(proposal.newText, proposal.oldText);
+    // Reverse each edit (newText → oldText) and apply them as one undo step.
+    const reversed = proposal.edits.map((e) => ({ oldText: e.newText, newText: e.oldText }));
+    const ok = await this.applyEdits(reversed);
     if (!ok) {
       void vscode.window.showWarningMessage('撤销失败：文件在写入瞬间发生了变化。');
       return;
     }
     if (this.state.kind === 'ready') {
       const after = await this.currentFileText();
-      const updated = this.state.proposals.map((p, i) => {
-        if (i === idx) {
-          const m = countOccurrences(after, p.oldText);
-          return { ...p, applied: false, matches: m, applicable: m === 1 };
-        }
-        const m = countOccurrences(after, p.oldText);
-        return { ...p, matches: m, applicable: !p.applied && m === 1 };
-      });
+      const updated = this.state.proposals.map((p, i) =>
+        i === idx ? buildView(p, after, false) : (p.applied ? p : buildView(p, after, false)),
+      );
       const stillAppliedTitle = updated.find((p) => p.applied)?.title;
       this.setState({ kind: 'ready', proposals: updated, lastApplied: stillAppliedTitle });
     }
@@ -404,21 +358,27 @@ export class FixProposalPanel {
     void vscode.window.showWarningMessage(message);
   }
 
-  private async applyEdit(oldText: string, newText: string): Promise<boolean> {
+  /**
+   * Applies a set of edits as a single workspace edit (one undo step). Every
+   * `oldText` must locate uniquely in the current file, or nothing is applied.
+   */
+  private async applyEdits(edits: FixEdit[]): Promise<boolean> {
     const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
     const text = doc.getText();
-    const idx = text.indexOf(oldText);
-    if (idx < 0 || text.indexOf(oldText, idx + 1) >= 0) {
-      return false;
-    }
-    const start = doc.positionAt(idx);
-    const end = doc.positionAt(idx + oldText.length);
     const edit = new vscode.WorkspaceEdit();
-    edit.replace(this.request.fileUri, new vscode.Range(start, end), newText);
+    for (const e of edits) {
+      const idx = text.indexOf(e.oldText);
+      if (idx < 0 || text.indexOf(e.oldText, idx + 1) >= 0) {
+        return false;
+      }
+      const start = doc.positionAt(idx);
+      const end = doc.positionAt(idx + e.oldText.length);
+      edit.replace(this.request.fileUri, new vscode.Range(start, end), e.newText);
+    }
     const ok = await vscode.workspace.applyEdit(edit);
     if (ok) {
       // Auto-save so downstream tools (linters, watchers, the next analysis pass)
-      // see the change immediately. Users can still revert via 「撚销修改」 or VCS.
+      // see the change immediately. Users can still revert via 「撤销修改」 or VCS.
       try {
         await doc.save();
       } catch {
@@ -476,13 +436,14 @@ export class FixProposalPanel {
     try {
       const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
       const text = doc.getText();
-      const idx = text.indexOf(applied.newText);
+      const anchor = applied.edits[0]?.newText ?? '';
+      const idx = anchor ? text.indexOf(anchor) : -1;
       if (idx < 0) {
         return fallback;
       }
       // Anchor to the last line of the applied content. positionAt points just
       // past the snippet; if it ends with a newline, step back to the real末行.
-      const end = doc.positionAt(idx + applied.newText.length);
+      const end = doc.positionAt(idx + anchor.length);
       let zeroBased = end.line;
       if (end.character === 0 && zeroBased > 0) {
         zeroBased -= 1;
@@ -603,13 +564,16 @@ export class FixProposalPanel {
           ? '<div class="hint">以下是互斥的备选方案，任选其一应用即可修复，不需要全部应用。</div>'
           : '';
         const cards = state.proposals.map((p, i) => {
+          const editCount = (p.edits && p.edits.length) || 1;
+          const multi = editCount > 1 ? ' · ' + editCount + ' 处改动' : '';
           let badge;
           if (p.applied) {
-            badge = '<span class="badge ok">已应用</span>';
+            badge = '<span class="badge ok">已应用' + multi + '</span>';
           } else if (p.applicable) {
-            badge = '<span class="badge">方案 ' + (i + 1) + '</span>';
+            badge = '<span class="badge">方案 ' + (i + 1) + multi + '</span>';
           } else {
-            badge = '<span class="badge">无法唯一定位（出现 ' + p.matches + ' 次）</span>';
+            const bad = (p.matches || []).filter(function (m) { return m !== 1; }).length;
+            badge = '<span class="badge">无法唯一定位（' + bad + '/' + editCount + ' 处）</span>';
           }
           let btn;
           if (p.applied) {
@@ -678,9 +642,46 @@ function toCached(p: ProposalView): CachedProposal {
   return {
     title: p.title,
     rationale: p.rationale,
-    oldText: p.oldText,
-    newText: p.newText,
+    edits: p.edits,
     applied: p.applied,
+  };
+}
+
+/**
+ * Normalises a cached proposal that may predate multi-edit support: older
+ * entries carried a single top-level `oldText`/`newText` instead of an `edits`
+ * array. Guarantees a non-empty `edits` array for {@link buildView}.
+ */
+function normaliseCached(
+  p: CachedProposal & { oldText?: string; newText?: string },
+): { title: string; rationale: string; edits: FixEdit[]; applied: boolean } {
+  let edits = Array.isArray(p.edits) ? p.edits : [];
+  if (edits.length === 0 && typeof p.oldText === 'string') {
+    edits = [{ oldText: p.oldText, newText: typeof p.newText === 'string' ? p.newText : '' }];
+  }
+  return { title: p.title, rationale: p.rationale, edits, applied: p.applied };
+}
+
+/**
+ * Builds a runtime ProposalView from a proposal's edits against the current file
+ * content. `applied` controls whether we search for each edit's replacement
+ * (newText) or its original (oldText) when computing match counts. A proposal is
+ * applicable only when it is not yet applied and every edit locates uniquely.
+ */
+function buildView(
+  p: { title: string; rationale: string; edits: FixEdit[] },
+  content: string,
+  applied: boolean,
+): ProposalView {
+  const matches = p.edits.map((e) => countOccurrences(content, applied ? e.newText : e.oldText));
+  return {
+    title: p.title,
+    rationale: p.rationale,
+    edits: p.edits,
+    matches,
+    applicable: !applied && matches.length > 0 && matches.every((m) => m === 1),
+    applied,
+    diffHtml: p.edits.map((e) => renderInlineDiff(e.oldText, e.newText)).join(''),
   };
 }
 

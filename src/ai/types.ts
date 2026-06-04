@@ -9,6 +9,12 @@ export interface Finding {
   line: number;
   /** 1-based line where the issue ends (defaults to `line`). */
   endLine?: number;
+  /**
+   * Verbatim source snippet (no line-number prefix) the finding refers to, used
+   * to locate the issue by **content** instead of line number — robust against
+   * line drift from edits/earlier fixes. Optional; callers fall back to `line`.
+   */
+  anchor?: string;
   severity: FindingSeverity;
   /** Short headline. */
   title: string;
