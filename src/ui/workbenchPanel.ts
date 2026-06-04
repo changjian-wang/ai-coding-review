@@ -91,6 +91,8 @@ export class WorkbenchPanel {
   /** Folder expand/collapse state, kept static so it survives panel close/reopen. */
   private static readonly expandedFolders = new Set<string>();
   private static folderInit = false;
+  /** Last selected path whose ancestors were auto-expanded, so we only do it on selection change. */
+  private static lastAutoExpandedSelection?: string;
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
   private get expandedFolders(): Set<string> {
@@ -146,6 +148,7 @@ export class WorkbenchPanel {
   static resetFolders(): void {
     WorkbenchPanel.expandedFolders.clear();
     WorkbenchPanel.folderInit = false;
+    WorkbenchPanel.lastAutoExpandedSelection = undefined;
   }
 
   /**
@@ -203,12 +206,15 @@ export class WorkbenchPanel {
         this.actions.pickScope();
         break;
       case 'toggleFolder':
+        // The webview already toggled the `collapsed` CSS class optimistically,
+        // so the visual change is instant. We only record the state here for
+        // future full re-renders — re-rendering now would replace the entire
+        // webview HTML, reset scroll position, and cause visible jitter/drift.
         if (this.expandedFolders.has(msg.path)) {
           this.expandedFolders.delete(msg.path);
         } else {
           this.expandedFolders.add(msg.path);
         }
-        this.refresh();
         break;
     }
   }
@@ -236,7 +242,8 @@ export class WorkbenchPanel {
       }
     }
 
-    if (state.selected) {
+    if (state.selected && state.selected !== WorkbenchPanel.lastAutoExpandedSelection) {
+      WorkbenchPanel.lastAutoExpandedSelection = state.selected;
       let p = state.selected;
       while (p.includes('/')) {
         p = p.slice(0, p.lastIndexOf('/'));
@@ -417,7 +424,14 @@ export class WorkbenchPanel {
   const vscode = acquireVsCodeApi();
   const send = (m) => vscode.postMessage(m);
   document.querySelectorAll('.tnode').forEach((n) => {
-    n.addEventListener('click', () => send({ type:'select', path:n.dataset.path }));
+    n.addEventListener('click', () => {
+      // Optimistically move the selection highlight immediately so the click
+      // feels instant — the file read/render that follows can be slow for big
+      // files, and we don't want the highlight to wait for it.
+      document.querySelectorAll('.tnode.active').forEach((a) => a.classList.remove('active'));
+      n.classList.add('active');
+      send({ type:'select', path:n.dataset.path });
+    });
   });
   document.querySelectorAll('.tfolder').forEach((f) => {
     f.addEventListener('click', () => {

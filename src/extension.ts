@@ -29,6 +29,8 @@ import { transientInfo, transientWarning } from './ui/toast';
 let session: ReviewSession;
 const models = new ModelProvider();
 let workbenchSelected: string | undefined;
+/** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
+let openFileGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
 const docRenderCache = new Map<string, DocumentRender>();
 /** Most recently applied Copilot fix per finding: enables one-click revert from any UI. */
@@ -72,6 +74,51 @@ function fixKey(rel: string, findingId: string): string {
   return `${rel}::${findingId}`;
 }
 
+/** Memento key for persisted applied-fix snapshots (enables locate-follow + revert across reloads). */
+const APPLIED_FIXES_MEMENTO_KEY = 'codereview.appliedFixes.v1';
+/** Workspace memento bound in activate(); backs the in-memory appliedFixes map. */
+let appliedFixesMemento: vscode.Memento | undefined;
+
+/** Hydrates appliedFixes from workspaceState so revert/locate survive window reloads. */
+function hydrateAppliedFixes(memento: vscode.Memento): void {
+  appliedFixesMemento = memento;
+  const stored = memento.get<Record<string, { oldText: string; newText: string }>>(
+    APPLIED_FIXES_MEMENTO_KEY,
+  );
+  if (stored) {
+    for (const [key, edit] of Object.entries(stored)) {
+      appliedFixes.set(key, edit);
+    }
+  }
+}
+
+/** Persists the current appliedFixes map to workspaceState. */
+function flushAppliedFixes(): void {
+  if (!appliedFixesMemento) {
+    return;
+  }
+  const obj: Record<string, { oldText: string; newText: string }> = {};
+  for (const [key, edit] of appliedFixes) {
+    obj[key] = edit;
+  }
+  void appliedFixesMemento.update(APPLIED_FIXES_MEMENTO_KEY, obj);
+}
+
+function setAppliedFix(key: string, edit: { oldText: string; newText: string }): void {
+  appliedFixes.set(key, edit);
+  flushAppliedFixes();
+}
+
+function deleteAppliedFix(key: string): void {
+  appliedFixes.delete(key);
+  flushAppliedFixes();
+}
+
+function clearAppliedFixes(): void {
+  appliedFixes.clear();
+  flushAppliedFixes();
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
@@ -84,6 +131,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // Restore the per-workspace model choice so the workbench opens on the
   // model the user last picked for this project (instead of always "Auto").
   models.init(context.workspaceState);
+
+  // Restore applied-fix snapshots so 「撤销修复」 and the fix-aware 「定位」
+  // keep working after a window reload (they rely on the saved newText).
+  hydrateAppliedFixes(context.workspaceState);
 
   // Older versions hid the activity bar globally and didn't always restore it.
   // If the global setting is still `hidden`, reset it once so the user gets
@@ -210,22 +261,11 @@ async function openInNewWindow(
   // node_modules / dist / bin / obj / ...). The user can still narrow down later
   // via the 「切换范围…」 button inside the workbench.
   await loadFolderAsReview(chosenCwd);
-  // Create the workbench but DON'T open the first file yet — we want the document
-  // viewer to land beside the workbench *after* it has been moved to its own
-  // window, not in the current one.
-  await openWorkbench({ deferInitialFile: true });
-  // Pop the active editor (our workbench webview) into a separate window so it
-  // behaves like VS Code's "Open in Agents Window" (built-in since 1.85).
-  try {
-    await vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
-  } catch (err) {
-    console.warn('[codereview] moveEditorToNewWindow failed:', err);
-  }
-  // Drop any stale document panel left in the previous window, then open the
-  // first file. With the workbench now the active editor in the new window,
-  // ViewColumn.Beside places the document beside it in that same window.
-  DocumentPanel.closeIfOpen();
-  await openInitialFileAndLayout();
+  // Open the workbench directly in the current window. We deliberately do NOT
+  // pop it into a separate window or touch the parent layout (the side bar /
+  // Explorer stays as the user left it) — opening should feel instantaneous,
+  // not "tab first, then detach".
+  await openWorkbench();
 }
 
 /** Loads the entire folder at `cwd` as the current review set. */
@@ -247,7 +287,7 @@ async function loadFolderAsReview(cwd: string): Promise<void> {
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
-        appliedFixes.clear();
+        clearAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
         void vscode.commands.executeCommand('setContext', 'codereview.active', true);
@@ -289,7 +329,7 @@ async function startReview(): Promise<void> {
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
-        appliedFixes.clear();
+        clearAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
         void vscode.commands.executeCommand('setContext', 'codereview.active', true);
@@ -313,7 +353,7 @@ async function selectModel(): Promise<void> {
 }
 
 /** Opens (or reveals) the Review Workbench webview. */
-async function openWorkbench(opts: { deferInitialFile?: boolean } = {}): Promise<void> {
+async function openWorkbench(): Promise<void> {
   WorkbenchPanel.show(buildWorkbenchState, {
     open: (path) => void openFileInPanel(path),
     analyze: (path) => void analyzeByPath(path),
@@ -326,34 +366,10 @@ async function openWorkbench(opts: { deferInitialFile?: boolean } = {}): Promise
     pickModel: () => void selectModel(),
     pickScope: () => void startReview(),
   });
-  // When the caller is about to relocate the workbench to another window
-  // (openInNewWindow), it opens the first file and applies the layout itself
-  // *after* the move so the document lands beside the relocated workbench.
-  if (opts.deferInitialFile) {
-    return;
-  }
-  if (session.reviewSet && !workbenchSelected) {
-    const first = [...session.reviewSet.files].sort((a, b) => a.path.localeCompare(b.path))[0];
-    if (first) {
-      await openFileInPanel(first.path);
-    }
-  }
+  // Intentionally do NOT open the first review file — leave the document column
+  // blank so the user picks what to review. We still apply the split layout so
+  // the empty editor group is visible beside the workbench.
   if (session.reviewSet && !layoutAppliedForCurrentReview) {
-    layoutAppliedForCurrentReview = true;
-    await applyWorkbenchLayout();
-  }
-}
-
-/** Opens the alphabetically-first review file and applies the split layout. */
-async function openInitialFileAndLayout(): Promise<void> {
-  if (!session.reviewSet) {
-    return;
-  }
-  const first = [...session.reviewSet.files].sort((a, b) => a.path.localeCompare(b.path))[0];
-  if (first) {
-    await openFileInPanel(first.path);
-  }
-  if (!layoutAppliedForCurrentReview) {
     layoutAppliedForCurrentReview = true;
     await applyWorkbenchLayout();
   }
@@ -471,8 +487,18 @@ async function openFileInPanel(relPath: string): Promise<void> {
     FixProposalPanel.closeIfOpen();
   }
   workbenchSelected = relPath;
+  // Race guard: rapid clicks must not pile up heavy renders or let a slow,
+  // already-superseded open overwrite the panel. Each call claims a token; after
+  // every await we bail if a newer click has taken over.
+  const myGeneration = ++openFileGeneration;
   const text = await readReviewFileText(relPath);
+  if (myGeneration !== openFileGeneration) {
+    return; // a newer click superseded us — skip the expensive render + show.
+  }
   const render = renderFor(relPath, text);
+  if (myGeneration !== openFileGeneration) {
+    return; // rendering may have yielded; bail before overwriting the panel.
+  }
   session.setTotalLines(relPath, render.totalLines);
   DocumentPanel.show(buildDocModel(relPath, render), docActions());
   WorkbenchPanel.refreshIfOpen();
@@ -520,6 +546,7 @@ function buildDocModel(relPath: string, render: DocumentRender): DocModel {
       return {
         id: f.id,
         line: f.line,
+        endLine: f.endLine,
         severity: f.severity,
         title: f.title,
         detail: f.detail,
@@ -621,7 +648,7 @@ async function revertAppliedFix(rel: string, findingId: string): Promise<boolean
     we.replace(fileUri, new vscode.Range(start, end), edit.oldText);
     const ok = await vscode.workspace.applyEdit(we);
     if (ok) {
-      appliedFixes.delete(fixKey(rel, findingId));
+      deleteAppliedFix(fixKey(rel, findingId));
       await reloadDocPanel(rel);
     }
     return ok;
@@ -649,7 +676,8 @@ function docActions() {
       void disposeFinding(path, id, kind);
     },
     viewFix: (path: string, id: string) => void viewFixProposal(path, id),
-    locate: (path: string, line: number) => void locateInFile(path, line),
+    locate: (path: string, line: number, endLine?: number, findingId?: string) =>
+      void locateInFile(path, line, endLine, findingId),
     analyze: (path: string) => void analyzeByPath(path),
     jumpNext: (path: string) => jumpToNextUnseen(path),
   };
@@ -869,7 +897,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
     return;
   }
   const findingId = finding.id;
-  await locateInFile(rel, finding.line);
+  await locateInFile(rel, finding.line, finding.endLine, finding.id);
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
@@ -909,14 +937,14 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
       );
     },
     onApplied: (edit) => {
-      appliedFixes.set(fixKey(rel, findingId), edit);
+      setAppliedFix(fixKey(rel, findingId), edit);
       session.setFindingDisposition(rel, findingId, { kind: 'fixed', at: Date.now() });
       WorkbenchPanel.refreshIfOpen();
       refreshDocPanel(rel);
       transientInfo('修复已应用，已标记为「已 Copilot 修复」');
     },
     onUndone: () => {
-      appliedFixes.delete(fixKey(rel, findingId));
+      deleteAppliedFix(fixKey(rel, findingId));
       session.setFindingDisposition(rel, findingId, null);
       WorkbenchPanel.refreshIfOpen();
       refreshDocPanel(rel);
@@ -1254,7 +1282,12 @@ async function generateCandidateDiff(fix: {
   );
 }
 
-async function locateInFile(relPath: string, line: number): Promise<void> {
+async function locateInFile(
+  relPath: string,
+  line: number,
+  endLine?: number,
+  findingId?: string,
+): Promise<void> {
   if (!ensureReviewPath(relPath, '定位')) {
     return;
   }
@@ -1262,9 +1295,59 @@ async function locateInFile(relPath: string, line: number): Promise<void> {
     await openFileInPanel(relPath);
   }
   const total = session.fileState(relPath)?.totalLines ?? 0;
-  const normalizedLine = Math.max(1, Math.floor(Number.isFinite(line) ? line : 1));
-  DocumentPanel.scrollTo(total > 0 ? Math.min(normalizedLine, total) : normalizedLine);
+  let startLine = Math.max(1, Math.floor(Number.isFinite(line) ? line : 1));
+  let stopLine = endLine && endLine > startLine ? Math.floor(endLine) : startLine;
+
+  // If this finding has an applied Copilot fix, the original line numbers are
+  // stale (the edit shifted the file). Re-anchor by locating the fix's current
+  // text in the live document, which survives later edits / earlier fixes too.
+  const reanchored = findingId ? await reanchorToAppliedFix(relPath, findingId) : undefined;
+  if (reanchored) {
+    startLine = reanchored.startLine;
+    stopLine = reanchored.endLine;
+  }
+
+  if (total > 0) {
+    startLine = Math.min(startLine, total);
+    stopLine = Math.min(stopLine, total);
+  }
+  DocumentPanel.scrollTo(startLine, stopLine);
 }
+
+/**
+ * Locates the current line range of an applied fix by searching the live
+ * document for its `newText`. Returns 1-based start/end lines, or undefined when
+ * no applied fix exists or the snippet can no longer be found uniquely.
+ */
+async function reanchorToAppliedFix(
+  rel: string,
+  findingId: string,
+): Promise<{ startLine: number; endLine: number } | undefined> {
+  const edit = appliedFixes.get(fixKey(rel, findingId));
+  if (!edit) {
+    return undefined;
+  }
+  const cwd = activeCwd();
+  if (!cwd) {
+    return undefined;
+  }
+  try {
+    const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+    const doc = await vscode.workspace.openTextDocument(fileUri);
+    const text = doc.getText();
+    const idx = text.indexOf(edit.newText);
+    if (idx < 0) {
+      return undefined;
+    }
+    const start = doc.positionAt(idx);
+    const end = doc.positionAt(idx + edit.newText.length);
+    return { startLine: start.line + 1, endLine: end.line + 1 };
+  } catch (err) {
+    console.warn('[codereview] reanchorToAppliedFix failed:', err);
+    return undefined;
+  }
+}
+
 
 /** Computes the next not-yet-seen line in a file and scrolls the panel to it. */
 function jumpToNextUnseen(relPath: string): void {

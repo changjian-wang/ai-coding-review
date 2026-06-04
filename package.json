@@ -125,7 +125,7 @@
         },
         "codereview.focusedWorkbench": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "打开 Code Review 工作台时自动关闭左侧栏并隐藏活动栏，让工作台占满主编辑区；关闭工作台后自动恢复。 / When opening the Code Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed."
         }
       }

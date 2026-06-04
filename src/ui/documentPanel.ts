@@ -7,6 +7,7 @@ export type DocFindingDisposition = 'fixed' | 'commented' | 'ignored';
 export interface DocFinding {
   id: string;
   line: number;
+  endLine?: number;
   severity: string;
   title: string;
   detail: string;
@@ -50,7 +51,7 @@ export interface DocActions {
   disposeFinding(path: string, id: string, kind: DocFindingDisposition): void;
   /** Opens the fix-proposal panel for a finding to *view* it, without changing its disposition. */
   viewFix(path: string, id: string): void;
-  locate(path: string, line: number): void;
+  locate(path: string, line: number, endLine?: number, findingId?: string): void;
   analyze(path: string): void;
   jumpNext(path: string): void;
 }
@@ -64,7 +65,7 @@ type Inbound =
   | { type: 'removeAnnotation'; id: string }
   | { type: 'dispose'; id: string; kind: DocFindingDisposition }
   | { type: 'viewFix'; id: string }
-  | { type: 'locate'; line: number }
+  | { type: 'locate'; line: number; endLine?: number; id?: string }
   | { type: 'analyze' }
   | { type: 'jumpNext' };
 
@@ -139,11 +140,11 @@ export class DocumentPanel {
     DocumentPanel.current?.panel.dispose();
   }
 
-  /** Switches to source view and scrolls a line into view. */
-  static scrollTo(line: number): void {
+  /** Switches to source view and scrolls a line (or line range) into view. */
+  static scrollTo(line: number, endLine?: number): void {
     const inst = DocumentPanel.current;
     if (inst?.ready) {
-      void inst.panel.webview.postMessage({ type: 'scrollTo', line });
+      void inst.panel.webview.postMessage({ type: 'scrollTo', line, endLine });
     }
   }
 
@@ -185,7 +186,7 @@ export class DocumentPanel {
         this.actions.viewFix(path, m.id);
         break;
       case 'locate':
-        this.actions.locate(path, m.line);
+        this.actions.locate(path, m.line, m.endLine, m.id);
         break;
       case 'analyze':
         this.actions.analyze(path);
@@ -459,7 +460,7 @@ function findingCard(f) {
   actions.className = 'f-actions';
   const locate = document.createElement('button');
   locate.textContent = '定位';
-  locate.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line }));
+  locate.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line, endLine:f.endLine, id:f.id }));
   actions.appendChild(locate);
 
   function disposeBtn(kind, label, primary) {
@@ -508,8 +509,26 @@ function annoCard(a) {
   return div;
 }
 
+let srcCtx = null;
+
+function buildSourceRow(i, findingsByLine, annosByLine, frag) {
+  const lineNo = i + 1;
+  const row = document.createElement('div');
+  row.className = 'ln' + (seen.has(lineNo) ? ' seen' : '');
+  row.dataset.line = String(lineNo);
+  const fs = findingsByLine[lineNo];
+  const fmark = fs ? '<span class="fmark ' + fs[0].severity + '" title="' + fs.map(x=>x.title.replace(/"/g,'')).join(' / ') + '"></span>' : '';
+  row.innerHTML = fmark + '<span class="gutter">' + lineNo + '</span><span class="code">' + (model.sourceLines[i] || '\\u200b') + '</span>';
+  frag.appendChild(row);
+  if (fs) { for (const f of fs) frag.appendChild(findingCard(f)); }
+  if (annosByLine[lineNo]) { for (const a of annosByLine[lineNo]) frag.appendChild(annoCard(a)); }
+  return row;
+}
+
 function renderSource() {
   mode = 'source';
+  // Cancel any in-flight incremental render from a previous file/mode switch.
+  if (srcCtx && srcCtx.raf) cancelAnimationFrame(srcCtx.raf);
   const findingsByLine = {};
   for (const f of model.findings) { (findingsByLine[f.line] = findingsByLine[f.line] || []).push(f); }
   const annosByLine = {};
@@ -521,37 +540,75 @@ function renderSource() {
 
   const wrap = document.createElement('div');
   wrap.className = 'src';
-  for (let i = 0; i < model.sourceLines.length; i++) {
-    const lineNo = i + 1;
-    const row = document.createElement('div');
-    row.className = 'ln' + (seen.has(lineNo) ? ' seen' : '');
-    row.dataset.line = String(lineNo);
-    const fs = findingsByLine[lineNo];
-    const fmark = fs ? '<span class="fmark ' + fs[0].severity + '" title="' + fs.map(x=>x.title.replace(/"/g,'')).join(' / ') + '"></span>' : '';
-    row.innerHTML = fmark + '<span class="gutter">' + lineNo + '</span><span class="code">' + (model.sourceLines[i] || '\\u200b') + '</span>';
-    wrap.appendChild(row);
-    if (findingsByLine[lineNo]) { for (const f of findingsByLine[lineNo]) wrap.appendChild(findingCard(f)); }
-    if (annosByLine[lineNo]) { for (const a of annosByLine[lineNo]) wrap.appendChild(annoCard(a)); }
-  }
-  // Findings whose line falls outside the rendered range.
-  const oob = model.findings.filter((f) => f.line < 1 || f.line > model.sourceLines.length);
-  if (footAnnos.length || oob.length) {
-    const foot = document.createElement('div');
-    foot.className = 'notes-foot';
-    if (oob.length) {
-      foot.innerHTML = '<h4>其他发现</h4>';
-      for (const f of oob) foot.appendChild(findingCard(f));
-    }
-    if (footAnnos.length) {
-      const h = document.createElement('h4'); h.textContent = '未定位批注'; foot.appendChild(h);
-      for (const a of footAnnos) foot.appendChild(annoCard(a));
-    }
-    wrap.appendChild(foot);
-  }
   contentEl.innerHTML = '';
   contentEl.appendChild(wrap);
-  observeLines();
+
+  const total = model.sourceLines.length;
+
+  // One shared observer; rows are observed as they are appended per chunk.
+  if (io) io.disconnect();
+  visible.clear();
+  io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const ln = Number(e.target.dataset.line);
+      if (e.isIntersecting) visible.add(ln); else visible.delete(ln);
+    }
+    clearTimeout(seenTimer);
+    seenTimer = setTimeout(flushSeen, 300);
+  }, { root: contentEl, threshold: 0.5 });
+
+  const ctx = { i: 0, total, wrap, footDone: false, raf: 0, renderChunk: null };
+  srcCtx = ctx;
+
+  function appendFoot() {
+    if (ctx.footDone) return;
+    ctx.footDone = true;
+    const oob = model.findings.filter((f) => f.line < 1 || f.line > total);
+    if (footAnnos.length || oob.length) {
+      const foot = document.createElement('div');
+      foot.className = 'notes-foot';
+      if (oob.length) {
+        foot.innerHTML = '<h4>其他发现</h4>';
+        for (const f of oob) foot.appendChild(findingCard(f));
+      }
+      if (footAnnos.length) {
+        const h = document.createElement('h4'); h.textContent = '未定位批注'; foot.appendChild(h);
+        for (const a of footAnnos) foot.appendChild(annoCard(a));
+      }
+      wrap.appendChild(foot);
+    }
+  }
+
+  ctx.renderChunk = function(limit) {
+    const frag = document.createDocumentFragment();
+    const rows = [];
+    const stop = Math.min(ctx.i + limit, total);
+    for (; ctx.i < stop; ctx.i++) {
+      rows.push(buildSourceRow(ctx.i, findingsByLine, annosByLine, frag));
+    }
+    wrap.appendChild(frag);
+    for (const r of rows) io.observe(r);
+    if (ctx.i >= total) appendFoot();
+  };
+
+  // Render the first chunk synchronously (instant paint; small files finish
+  // here), then stream the remainder across animation frames so the webview
+  // never freezes on large files.
+  const CHUNK = 600;
+  ctx.renderChunk(CHUNK);
+  function step() {
+    ctx.raf = 0;
+    if (ctx.i < total) { ctx.renderChunk(CHUNK); ctx.raf = requestAnimationFrame(step); }
+  }
+  if (ctx.i < total) ctx.raf = requestAnimationFrame(step);
 }
+
+/** Forces synchronous rendering up to (and including) a 1-based line, for locate/scrollTo. */
+function ensureSrcRenderedThrough(line) {
+  if (!srcCtx || srcCtx.i >= srcCtx.total) return;
+  while (srcCtx.i < line && srcCtx.i < srcCtx.total) srcCtx.renderChunk(1000);
+}
+
 
 function renderReading() {
   mode = 'reading';
@@ -585,20 +642,29 @@ function renderReading() {
     }
     wrap.appendChild(foot);
   }
-}
 
-function observeLines() {
-  if (io) io.disconnect();
-  visible.clear();
-  io = new IntersectionObserver((entries) => {
-    for (const e of entries) {
-      const ln = Number(e.target.dataset.line);
-      if (e.isIntersecting) visible.add(ln); else visible.delete(ln);
-    }
-    clearTimeout(seenTimer);
-    seenTimer = setTimeout(flushSeen, 300);
-  }, { root: contentEl, threshold: 0.5 });
-  for (const el of contentEl.querySelectorAll('.ln')) io.observe(el);
+  // Coverage in reading mode: rendered markdown blocks have no per-line rows,
+  // so map source lines proportionally onto the top-level blocks and mark a
+  // block's slice seen once it scrolls into view. Reaching the bottom marks the
+  // whole file read, matching how a reviewer reads the rendered doc top-down.
+  const total = model.sourceLines.length;
+  const N = blocks.length;
+  if (N && total) {
+    const ranges = new Map();
+    blocks.forEach((b, k) => {
+      ranges.set(b, [Math.floor(k * total / N) + 1, Math.floor((k + 1) * total / N)]);
+    });
+    io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const r = ranges.get(e.target);
+        if (r) for (let l = r[0]; l <= r[1]; l++) visible.add(l);
+      }
+      clearTimeout(seenTimer);
+      seenTimer = setTimeout(flushSeen, 300);
+    }, { root: contentEl, threshold: 0.3 });
+    for (const b of blocks) io.observe(b);
+  }
 }
 
 function flushSeen() {
@@ -642,7 +708,7 @@ function renderFindbar() {
       '<span class="fi-line">第 ' + f.line + ' 行</span>' +
       (f.disposition ? '<span class="fi-ok">✓</span>' : '');
     item.querySelector('.fi-title').textContent = f.title;
-    item.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line }));
+    item.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line, endLine:f.endLine, id:f.id }));
     list.appendChild(item);
   }
 }
@@ -703,8 +769,19 @@ window.addEventListener('message', (ev) => {
   if (msg.type === 'load') { model = msg.model; render(); }
   else if (msg.type === 'scrollTo') {
     if (mode !== 'source') setMode('source');
-    const row = contentEl.querySelector('.ln[data-line="' + msg.line + '"]');
-    if (row) { row.scrollIntoView({ block:'center' }); row.style.transition='background .6s'; row.style.background='rgba(197,134,192,.3)'; setTimeout(()=>row.style.background='', 700); }
+    const start = msg.line;
+    const end = (msg.endLine && msg.endLine > start) ? msg.endLine : start;
+    // The target line may not be rendered yet on a large file — flush up to it.
+    ensureSrcRenderedThrough(end);
+    const first = contentEl.querySelector('.ln[data-line="' + start + '"]');
+    if (first) first.scrollIntoView({ block:'center' });
+    for (let l = start; l <= end; l++) {
+      const row = contentEl.querySelector('.ln[data-line="' + l + '"]');
+      if (!row) continue;
+      row.style.transition='background .6s';
+      row.style.background='rgba(197,134,192,.3)';
+      setTimeout((function(r){ return function(){ r.style.background=''; }; })(row), 1100);
+    }
   }
 });
 
