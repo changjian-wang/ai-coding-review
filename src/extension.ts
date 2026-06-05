@@ -17,6 +17,8 @@ import {
 } from './ai/analyzer';
 import type { Finding } from './ai/types';
 import { pickScope, buildFolderScope } from './scope/scopePicker';
+import { FileSystemScope } from './scope/scopes';
+import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { runWithProgress } from './ui/progressSteps';
@@ -83,6 +85,17 @@ let appliedFixesMemento: vscode.Memento | undefined;
 
 /** Memento key for the last folder loaded as a review (enables auto-restore after a window reload). */
 const LAST_REVIEW_FOLDER_KEY = 'codereview.lastReviewFolder.v1';
+/**
+ * Memento key for the last *scope* the user actually reviewed. Unlike
+ * LAST_REVIEW_FOLDER_KEY (which only remembers the project folder), this records
+ * a narrowed file-system selection so auto-restore can rebuild the exact subset
+ * — and thus hit the same persisted snapshot — after an extension/host restart.
+ */
+const LAST_SCOPE_KEY = 'codereview.lastScope.v1';
+/** Persisted descriptor of the last reviewed scope. */
+type PersistedScope =
+  | { kind: 'folder'; cwd: string }
+  | { kind: 'files'; cwd: string; relPaths: string[] };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
 
@@ -361,6 +374,7 @@ async function loadFolderAsReview(cwd: string): Promise<void> {
         layoutAppliedForCurrentReview = false;
         // Remember this folder so a window reload can auto-restore the review.
         void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, rootCwd);
+        void workspaceMemento?.update(LAST_SCOPE_KEY, { kind: 'folder', cwd: rootCwd } satisfies PersistedScope);
         void vscode.commands.executeCommand('setContext', 'codereview.active', true);
         transientInfo(`已加载 ${reviewSet.label} · ${reviewSet.files.length} 个文件`);
       } catch (err) {
@@ -403,6 +417,9 @@ async function startReview(): Promise<void> {
         rehydrateAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
+        // Persist the exact scope so an extension/host restart can rebuild this
+        // same selection (and hit its saved snapshot), not just the whole folder.
+        persistScope(source, reviewSet, cwd);
         void vscode.commands.executeCommand('setContext', 'codereview.active', true);
         await openWorkbench();
         transientInfo(`已加载 ${reviewSet.label} · ${reviewSet.files.length} 个文件`);
@@ -412,6 +429,22 @@ async function startReview(): Promise<void> {
       }
     },
   );
+}
+
+/**
+ * Records the scope the user just started reviewing so a later extension/host
+ * restart can rebuild the *same* selection (and therefore reuse its persisted
+ * snapshot). File-system selections store their resolved relative paths; other
+ * scope kinds (e.g. PR) fall back to remembering the folder, since they are
+ * reconstructed dynamically and their snapshot key follows the live head.
+ */
+function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): void {
+  void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, cwd);
+  const descriptor: PersistedScope =
+    source instanceof FileSystemScope
+      ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
+      : { kind: 'folder', cwd };
+  void workspaceMemento?.update(LAST_SCOPE_KEY, descriptor);
 }
 
 async function selectModel(): Promise<void> {
@@ -478,7 +511,7 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
   setStatusBarBusy(true);
   try {
     if (!session.reviewSet) {
-      await loadFolderAsReview(cwd);
+      await restoreLastScope(cwd);
     }
     if (!session.reviewSet) {
       panel.dispose();
@@ -489,6 +522,32 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
   } finally {
     setStatusBarBusy(false);
   }
+}
+
+/**
+ * Rebuilds the last reviewed scope after an extension/host restart. Prefers the
+ * exact persisted selection (so a narrowed file-system scope reuses its saved
+ * snapshot); falls back to loading the whole folder when no detailed scope was
+ * recorded or rebuilding it fails.
+ */
+async function restoreLastScope(cwd: string): Promise<void> {
+  const descriptor = workspaceMemento?.get<PersistedScope>(LAST_SCOPE_KEY);
+  if (descriptor?.kind === 'files' && descriptor.relPaths.length > 0) {
+    try {
+      const source = new FileSystemScope(descriptor.relPaths);
+      const reviewSet = await source.load(descriptor.cwd);
+      await session.start(reviewSet, descriptor.cwd);
+      workbenchSelected = undefined;
+      docRenderCache.clear();
+      rehydrateAppliedFixes();
+      WorkbenchPanel.resetFolders();
+      layoutAppliedForCurrentReview = false;
+      return;
+    } catch (err) {
+      console.warn('[codereview] restoreLastScope (files) failed, falling back to folder:', err);
+    }
+  }
+  await loadFolderAsReview(cwd);
 }
 
 /**
