@@ -1,32 +1,13 @@
 import * as vscode from 'vscode';
 import type {
-  GlobalRecommendation,
   GlobalReport,
   FindingSeverity,
-  VerdictKind,
 } from '../ai/types';
 import { transientInfo } from './toast';
 import { esc, escAttr, nonce as makeNonce } from './html';
-
-const SEVERITY_LABEL: Record<FindingSeverity, string> = {
-  bug: '真 Bug',
-  conditional: '条件性',
-  suggestion: '建议',
-};
+import { m, resolveLanguage } from '../i18n';
 
 const SEVERITY_ORDER: FindingSeverity[] = ['bug', 'conditional', 'suggestion'];
-
-const VERDICT_LABEL: Record<VerdictKind, string> = {
-  flip: '翻转',
-  found: '新发现',
-  confirmed: '确证',
-};
-
-const RECOMMENDATION_LABEL: Record<GlobalRecommendation, string> = {
-  approve: '建议批准',
-  request_changes: '建议请求修改',
-  comment: '建议仅评论',
-};
 
 /** Message from the webview to the extension. */
 type InboundMessage =
@@ -59,6 +40,8 @@ export class GlobalReportPanel {
   private onGenDiff?: (fix: { file: string; line: number; title: string; detail: string; suggestion?: string }) => void;
   private onGotoFiles?: () => void;
   private stats?: GlobalReportStats;
+  private lastReport?: GlobalReport;
+  private lastConfirmed = false;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -83,7 +66,7 @@ export class GlobalReportPanel {
           });
         } else if (msg.type === 'confirm') {
           this.onConfirm();
-          transientInfo('已确认阅读全局结论');
+          transientInfo(m().globalPanel.confirmedRead);
         } else if (msg.type === 'gotoFiles') {
           this.onGotoFiles?.();
         }
@@ -117,7 +100,7 @@ export class GlobalReportPanel {
     }
     const panel = vscode.window.createWebviewPanel(
       'codereview.globalReport',
-      'Code Review · 全局结论',
+      m().globalPanel.title,
       column,
       { enableScripts: true, retainContextWhenHidden: true },
     );
@@ -134,13 +117,28 @@ export class GlobalReportPanel {
     GlobalReportPanel.current?.panel.dispose();
   }
 
+  /** Re-renders the open report in the current language (after a language switch). */
+  static refreshIfOpen(): void {
+    const c = GlobalReportPanel.current;
+    if (c && c.lastReport) {
+      c.update(c.lastReport, c.lastConfirmed);
+    }
+  }
+
   private update(report: GlobalReport, confirmed: boolean): void {
+    this.lastReport = report;
+    this.lastConfirmed = confirmed;
     this.panel.webview.html = this.render(report, confirmed);
   }
 
   private render(report: GlobalReport, confirmed: boolean): string {
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    const t = m().globalPanel;
+    const sevLabel = m().severity;
+    const verdictLabel = m().verdict;
+    const recLabel = m().recommendation;
+    const lang = resolveLanguage();
     const evidence = report.evidence.length
       ? `<div class="evidence-steps">${report.evidence
           .map(
@@ -148,7 +146,7 @@ export class GlobalReportPanel {
               `<div class="estep"><span class="enum">${i + 1}</span><span class="etext">${esc(e)}</span></div>`,
           )
           .join('')}</div>`
-      : '<p class="muted">（无证据链）</p>';
+      : `<p class="muted">${esc(t.noEvidence)}</p>`;
 
     // Decision panel counts derived from verdicts + fix spots.
     const realBugs =
@@ -167,32 +165,32 @@ export class GlobalReportPanel {
     const pct = s && s.total > 0 ? Math.round((s.seen / s.total) * 100) : 0;
     const heroStats = s
       ? `<div class="hero-stats">
-          <span class="hstat"><b>${pct}%</b> 行覆盖</span>
-          <span class="hstat"><b>${s.filesReady}/${s.filesTotal}</b> 文件就绪</span>
-          <span class="hstat"><b>${s.findings}</b> 文件级发现</span>
+          <span class="hstat"><b>${pct}%</b> ${esc(t.lineCoverage)}</span>
+          <span class="hstat"><b>${s.filesReady}/${s.filesTotal}</b> ${esc(t.filesReady)}</span>
+          <span class="hstat"><b>${s.findings}</b> ${esc(t.fileFindings)}</span>
         </div>`
       : '';
     const hero = `
     <div class="hero">
       <div class="tabs">
-        <button class="tab" id="tab-files">① 文件级审查</button>
-        <span class="tab active">② 全局逻辑分析</span>
+        <button class="tab" id="tab-files">${esc(t.tabFiles)}</button>
+        <span class="tab active">${esc(t.tabGlobal)}</span>
       </div>
-      <div class="hero-title">跨文件全局结论</div>
+      <div class="hero-title">${esc(t.heroTitle)}</div>
       ${heroStats}
     </div>`;
 
     const decisionPanel = `
     <div class="decision ${recClass}">
       <div class="decision-main">
-        <div class="kicker">全局结论</div>
-        <div class="decision-title">${esc(RECOMMENDATION_LABEL[report.recommendation])}</div>
+        <div class="kicker">${esc(t.kicker)}</div>
+        <div class="decision-title">${esc(recLabel[report.recommendation])}</div>
         <div class="decision-copy">${esc(report.conclusion)}</div>
       </div>
       <div class="metrics">
-        <div class="metric"><div class="n red">${realBugs}</div><div class="l">确证真 bug</div></div>
-        <div class="metric"><div class="n purple">${flips}</div><div class="l">推翻误报</div></div>
-        <div class="metric"><div class="n green">${fixPaths}</div><div class="l">修复落点</div></div>
+        <div class="metric"><div class="n red">${realBugs}</div><div class="l">${esc(t.metricRealBugs)}</div></div>
+        <div class="metric"><div class="n purple">${flips}</div><div class="l">${esc(t.metricFlips)}</div></div>
+        <div class="metric"><div class="n green">${fixPaths}</div><div class="l">${esc(t.metricFixPaths)}</div></div>
       </div>
     </div>`;
 
@@ -202,32 +200,32 @@ export class GlobalReportPanel {
             (v) => `
         <div class="verdict-card vk-${v.kind}">
           <div class="vc-head">
-            <span class="vk-tag vk-${v.kind}">${VERDICT_LABEL[v.kind]}</span>
+            <span class="vk-tag vk-${v.kind}">${verdictLabel[v.kind]}</span>
             <span class="title">${esc(v.title)}</span>
           </div>
           <div class="vc-body">
             <div class="vc-grid">
               <div class="vc-col before">
-                <div class="lab">文件级说（片面）</div>
+                <div class="lab">${esc(t.fileLevelSays)}</div>
                 <p>${esc(v.before)}</p>
               </div>
               <div class="vc-arrow">→</div>
               <div class="vc-col after">
-                <div class="lab">全局求解</div>
+                <div class="lab">${esc(t.globalResolves)}</div>
                 <p>${esc(v.after)}</p>
               </div>
             </div>
             ${v.evidence ? `<div class="vc-evidence">${esc(v.evidence)}</div>` : ''}
             ${
               v.file
-                ? `<div class="card-actions"><button class="locate" data-file="${escAttr(v.file)}" data-line="${v.line ?? 1}">定位</button></div>`
+                ? `<div class="card-actions"><button class="locate" data-file="${escAttr(v.file)}" data-line="${v.line ?? 1}">${esc(t.locate)}</button></div>`
                 : ''
             }
           </div>
         </div>`,
           )
           .join('')
-      : '<p class="muted">（无翻转 / 新发现，文件级判断均成立）</p>';
+      : `<p class="muted">${esc(t.noFlips)}</p>`;
 
     const spotsBySeverity = SEVERITY_ORDER.map((sev) => {
       const spots = report.fixSpots.filter((s) => s.severity === sev);
@@ -240,27 +238,27 @@ export class GlobalReportPanel {
         <div class="fixitem sev-${s.severity}">
           <div class="fixitem-h">
             <span class="sev-dot"></span>
-            <span class="tag">${SEVERITY_LABEL[s.severity]}</span>
+            <span class="tag">${sevLabel[s.severity]}</span>
             <span class="title">${esc(s.title)}</span>
             <span class="where">${esc(s.file)}:${s.line}</span>
           </div>
           <div class="fixitem-b">
             <p class="why">${esc(s.detail)}</p>
-            ${s.suggestion ? `<p class="suggest">建议：${esc(s.suggestion)}</p>` : ''}
+            ${s.suggestion ? `<p class="suggest">${esc(t.suggestionPrefix)}${esc(s.suggestion)}</p>` : ''}
             <div class="card-actions">
-              <button class="locate" data-file="${escAttr(s.file)}" data-line="${s.line}">定位</button>
-              <button class="gendiff" data-file="${escAttr(s.file)}" data-line="${s.line}" data-title="${escAttr(s.title)}" data-detail="${escAttr(s.detail)}" data-suggestion="${escAttr(s.suggestion ?? '')}">让 AI 生成候选 diff</button>
+              <button class="locate" data-file="${escAttr(s.file)}" data-line="${s.line}">${esc(t.locate)}</button>
+              <button class="gendiff" data-file="${escAttr(s.file)}" data-line="${s.line}" data-title="${escAttr(s.title)}" data-detail="${escAttr(s.detail)}" data-suggestion="${escAttr(s.suggestion ?? '')}">${esc(t.genDiffBtn)}</button>
             </div>
           </div>
         </div>`,
         )
         .join('');
-      return `<h3>${SEVERITY_LABEL[sev]}</h3>${cards}`;
+      return `<h3>${sevLabel[sev]}</h3>${cards}`;
     }).join('');
 
     const fixSection = report.fixSpots.length
       ? spotsBySeverity
-      : '<p class="muted">未发现需要修复的跨文件问题。</p>';
+      : `<p class="muted">${esc(t.noFixSpots)}</p>`;
 
     // Call graph: caller → callee chain.
     const callGraphSection = report.callGraph.length
@@ -270,7 +268,7 @@ export class GlobalReportPanel {
               `${i > 0 ? '<span class="cg-arrow">→</span>' : ''}<span class="cg-node${n.changed ? ' changed' : ''}"><b>${esc(n.name)}</b>${n.role ? `<span class="cg-role">${esc(n.role)}</span>` : ''}${n.lifetime ? `<span class="cg-life">${esc(n.lifetime)}</span>` : ''}</span>`,
           )
           .join('')}</div>`
-      : '<p class="muted">（无调用图信息）</p>';
+      : `<p class="muted">${esc(t.noCallGraph)}</p>`;
 
     // Architecture / intent conformance checks.
     const archSection = report.architectureChecks.length
@@ -280,10 +278,10 @@ export class GlobalReportPanel {
               `<li class="arch-${c.status}"><span class="gi gi-${c.status}">${c.status === 'ok' ? '✓' : c.status === 'warn' ? '▲' : 'ⓘ'}</span><span><b>${esc(c.label)}</b>：${esc(c.detail)}</span></li>`,
           )
           .join('')}</ul>`
-      : '<p class="muted">（无架构 / 意图核对）</p>';
+      : `<p class="muted">${esc(t.noArchChecks)}</p>`;
 
     return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
@@ -406,29 +404,30 @@ export class GlobalReportPanel {
   ${hero}
   ${decisionPanel}
 
-  <h2>证据链：文件级判断为何被全局事实修正</h2>
+  <h2>${esc(t.sectionEvidence)}</h2>
   ${evidence}
   ${verdictSection}
 
-  <h2>修复落点</h2>
+  <h2>${esc(t.sectionFixSpots)}</h2>
   ${fixSection}
 
-  <h2>调用图</h2>
+  <h2>${esc(t.sectionCallGraph)}</h2>
   ${callGraphSection}
 
-  <h2>架构层 & PR 意图核对</h2>
+  <h2>${esc(t.sectionArch)}</h2>
   ${archSection}
 
   <div class="confirm-bar">
     ${
       confirmed
-        ? '<span class="done">✓ 已确认阅读全局结论</span>'
-        : '<button id="confirm">确认读过全局结论</button>'
+        ? `<span class="done">${esc(t.confirmedReadBadge)}</span>`
+        : `<button id="confirm">${esc(t.confirmReadBtn)}</button>`
     }
   </div>
 
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
+  const T = ${JSON.stringify(t)};
   const tabFiles = document.getElementById('tab-files');
   if (tabFiles) {
     tabFiles.addEventListener('click', () => vscode.postMessage({ type: 'gotoFiles' }));
@@ -441,7 +440,7 @@ export class GlobalReportPanel {
   document.querySelectorAll('.gendiff').forEach((btn) => {
     btn.addEventListener('click', () => {
       btn.disabled = true;
-      btn.textContent = '生成中…';
+      btn.textContent = T.generating;
       vscode.postMessage({
         type: 'gendiff',
         file: btn.dataset.file,
@@ -450,7 +449,7 @@ export class GlobalReportPanel {
         detail: btn.dataset.detail,
         suggestion: btn.dataset.suggestion || undefined,
       });
-      setTimeout(() => { btn.disabled = false; btn.textContent = '让 AI 生成候选 diff'; }, 4000);
+      setTimeout(() => { btn.disabled = false; btn.textContent = T.genDiffBtn; }, 4000);
     });
   });
   const confirm = document.getElementById('confirm');

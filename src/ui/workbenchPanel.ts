@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { FindingSeverity } from '../ai/types';
 import { esc, escAttr, nonce as makeNonce } from './html';
+import { m, fmt, resolveLanguage } from '../i18n';
 
 export type FindingDispositionKind = 'fixed' | 'commented' | 'ignored';
 
@@ -163,7 +164,7 @@ export class WorkbenchPanel {
     }
     const panel = vscode.window.createWebviewPanel(
       'codereview.workbench',
-      'Code Review · 工作台',
+      m().workbench.title,
       vscode.ViewColumn.One,
       { enableScripts: true, retainContextWhenHidden: true },
     );
@@ -362,6 +363,8 @@ export class WorkbenchPanel {
   private render(state: WorkbenchState): string {
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    const t = m().workbench;
+    const lang = resolveLanguage();
 
     if (!state.hasReviewSet) {
       return this.renderEmpty(nonce, csp);
@@ -396,24 +399,24 @@ export class WorkbenchPanel {
 
     const gateReason: string[] = [];
     if (state.coverage.filesReady < state.coverage.filesTotal) {
-      gateReason.push(`${state.coverage.filesTotal - state.coverage.filesReady} 个文件未读完并确认`);
+      gateReason.push(fmt(t.gateReasonFiles, state.coverage.filesTotal - state.coverage.filesReady));
     }
     if (!state.globalDone) {
-      gateReason.push('全局结论未确认');
+      gateReason.push(t.gateReasonGlobal);
     }
     const gateOk = state.gatePassed;
 
     const conclusionHtml = state.conclusion
-      ? `<div class="conclusion">已提交结论：<b>${esc(state.conclusion.label)}</b>` +
+      ? `<div class="conclusion">${esc(t.submittedConclusionPrefix)}<b>${esc(state.conclusion.label)}</b>` +
         `<span class="conc-meta">${
           state.conclusion.target === 'pr' && state.conclusion.prNumber
-            ? `已写回 PR #${state.conclusion.prNumber} · `
-            : '本地记录 · '
+            ? fmt(t.writtenBackPr, state.conclusion.prNumber)
+            : t.localRecord
         }${esc(formatTime(state.conclusion.submittedAt))}</span></div>`
       : '';
 
     return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
@@ -535,46 +538,46 @@ export class WorkbenchPanel {
   <div class="workbench">
     <div class="sidebar">
       <div class="sb-head">
-        <div class="sb-title">审查范围</div>
+        <div class="sb-title">${esc(t.scopeTitle)}</div>
         <div class="sb-row">
           <div class="sb-label" title="${escAttr(state.label)}">${esc(state.label)}</div>
-          <button id="pickScope" class="sb-switch" title="选择其他代码范围进行审查">切换范围…</button>
+          <button id="pickScope" class="sb-switch" title="${escAttr(t.switchScopeTitle)}">${esc(t.switchScope)}</button>
         </div>
       </div>
       <div class="filter-row">
-        <input id="filter" type="search" placeholder="过滤文件路径…" autocomplete="off" />
+        <input id="filter" type="search" placeholder="${escAttr(t.filterPlaceholder)}" autocomplete="off" />
       </div>
       <div class="tree" id="tree"><div class="tree-sizer" id="treeSizer"></div></div>
       <div class="toolbar">
-        <div class="grp-label">整体审查</div>
+        <div class="grp-label">${esc(t.overallReview)}</div>
         <div class="row">
-          <button id="global">全局逻辑分析</button>
-          <button id="showGlobal" ${state.hasGlobalReport ? '' : 'disabled'}>查看全局结论</button>
+          <button id="global">${esc(t.globalAnalysis)}</button>
+          <button id="showGlobal" ${state.hasGlobalReport ? '' : 'disabled'}>${esc(t.viewGlobal)}</button>
         </div>
         <div class="global-prog" id="globalProg" hidden>
           <div class="gp-bar"><div class="gp-fill"></div></div>
           <div class="gp-foot">
             <span class="gp-msg" id="globalProgMsg"></span>
-            <button class="gp-cancel" id="globalCancel">取消</button>
+            <button class="gp-cancel" id="globalCancel">${esc(t.cancel)}</button>
           </div>
         </div>
         <div class="model-row">
-          <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">模型：<b>${esc(state.modelLabel)}</b></span>
-          <button id="pickModel">切换</button>
+          <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">${esc(t.modelPrefix)}<b>${esc(state.modelLabel)}</b></span>
+          <button id="pickModel">${esc(t.switch)}</button>
         </div>
       </div>
       <div class="hud">
-        <div class="hud-row"><span class="lbl">行覆盖</span><span id="covPct" class="val">${pct}%</span></div>
+        <div class="hud-row"><span class="lbl">${esc(t.lineCoverage)}</span><span id="covPct" class="val">${pct}%</span></div>
         <div class="cov-track"><div id="covFill" class="cov-fill" style="width:${pct}%"></div></div>
         <div class="hud-row" style="margin-top:.55rem; margin-bottom:0;">
-          <span class="lbl">文件就绪</span><span id="filesReady" class="val">${state.coverage.filesReady}/${state.coverage.filesTotal}</span>
+          <span class="lbl">${esc(t.filesReady)}</span><span id="filesReady" class="val">${state.coverage.filesReady}/${state.coverage.filesTotal}</span>
         </div>
         <div id="gateChip" class="gate-chip ${gateOk ? 'ok' : 'locked'}">
           <span id="gateIcon">${gateOk ? '✓' : '🔒'}</span>
-          <span id="gateText">${gateOk ? '门禁已通过，可提交结论' : '门禁未通过'}</span>
+          <span id="gateText">${gateOk ? esc(t.gatePass) : esc(t.gateFail)}</span>
         </div>
-        <div id="gateReason" class="gate-reason" ${gateOk ? 'style="display:none"' : ''}>${gateOk ? '' : gateReason.map(esc).join('；')}</div>
-        <button class="primary" id="submit" style="width:100%; margin-top:.6rem;" ${gateOk ? '' : 'disabled'}>提交审查结论</button>
+        <div id="gateReason" class="gate-reason" ${gateOk ? 'style="display:none"' : ''}>${gateOk ? '' : gateReason.map(esc).join(m().common.listSep)}</div>
+        <button class="primary" id="submit" style="width:100%; margin-top:.6rem;" ${gateOk ? '' : 'disabled'}>${esc(t.submitConclusion)}</button>
         <div id="conclusionWrap">${conclusionHtml}</div>
       </div>
     </div>
@@ -582,6 +585,8 @@ export class WorkbenchPanel {
 
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
+  const T = ${JSON.stringify(t)};
+  const fmt = (s, ...a) => String(s).replace(/\{(\d+)\}/g, (_, i) => a[Number(i)] ?? '');
   const send = (m) => vscode.postMessage(m);
   const byId = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '')
@@ -657,10 +662,10 @@ export class WorkbenchPanel {
       ? '<span class="chg ' + row.change + '">' + (row.change === 'add' ? '+' : row.change === 'del' ? '\u2212' : '~') + '</span>'
       : '';
     const dotClass = row.analyzing ? 'working' : row.dotClass;
-    const dotTitle = row.analyzing ? '正在分析…' : row.dotTitle;
+    const dotTitle = row.analyzing ? T.analyzing : row.dotTitle;
     const fix = row.unconfirmed > 0
-      ? '<span class="fix-flag" title="' + row.unconfirmed + ' 个未确认发现">' + row.unconfirmed + '</span>'
-      : (row.analyzed && row.findings === 0 ? '<span class="ok-flag" title="无发现">\u2713</span>' : '');
+      ? '<span class="fix-flag" title="' + esc(fmt(T.unconfirmedTitle, row.unconfirmed)) + '">' + row.unconfirmed + '</span>'
+      : (row.analyzed && row.findings === 0 ? '<span class="ok-flag" title="' + esc(T.noFindings) + '">\u2713</span>' : '');
     const cov = row.total > 0 ? (row.seen + '/' + row.total) : '\u2014';
     return '<div class="trow tnode' + (row.active ? ' active' : '') + (row.ready ? ' ready' : '') + '" data-kind="file" data-path="' + esc(row.path) + '" style="top:' + top + 'px; padding-left:' + indent + 'px">'
       + '<span class="seen-dot ' + dotClass + '" title="' + esc(dotTitle) + '"></span>'
@@ -674,7 +679,7 @@ export class WorkbenchPanel {
     const total = visible.length;
     if (total === 0) {
       sizer.style.height = 'auto';
-      sizer.innerHTML = '<div class="empty">' + (filterInput.value.trim() ? '无匹配文件' : '无文件') + '</div>';
+      sizer.innerHTML = '<div class="empty">' + (filterInput.value.trim() ? T.noMatch : T.noFiles) + '</div>';
       return;
     }
     sizer.style.height = (total * ROW_H) + 'px';
@@ -689,8 +694,8 @@ export class WorkbenchPanel {
 
   function renderConclusion(c) {
     if (!c) return '';
-    const target = c.target === 'pr' && c.prNumber ? ('已写回 PR #' + c.prNumber + ' · ') : '本地记录 · ';
-    return '<div class="conclusion">已提交结论：<b>' + esc(c.label) + '</b>' +
+    const target = c.target === 'pr' && c.prNumber ? fmt(T.writtenBackPr, c.prNumber) : T.localRecord;
+    return '<div class="conclusion">' + T.submittedConclusionPrefix + '<b>' + esc(c.label) + '</b>' +
       '<span class="conc-meta">' + target + esc(formatTime(c.submittedAt)) + '</span></div>';
   }
 
@@ -702,19 +707,19 @@ export class WorkbenchPanel {
     const filesReady = byId('filesReady'); if (filesReady) filesReady.textContent = msg.coverage.filesReady + '/' + msg.coverage.filesTotal;
     const gateChip = byId('gateChip'); if (gateChip) gateChip.className = 'gate-chip ' + (msg.gatePassed ? 'ok' : 'locked');
     const gateIcon = byId('gateIcon'); if (gateIcon) gateIcon.textContent = msg.gatePassed ? '✓' : '🔒';
-    const gateText = byId('gateText'); if (gateText) gateText.textContent = msg.gatePassed ? '门禁已通过，可提交结论' : '门禁未通过';
+    const gateText = byId('gateText'); if (gateText) gateText.textContent = msg.gatePassed ? T.gatePass : T.gateFail;
     const gateReason = byId('gateReason');
     if (gateReason) {
       const reasons = [];
-      if (msg.coverage.filesReady < msg.coverage.filesTotal) reasons.push((msg.coverage.filesTotal - msg.coverage.filesReady) + ' 个文件未读完并确认');
-      if (!msg.globalDone) reasons.push('全局结论未确认');
-      gateReason.textContent = reasons.join('；');
+      if (msg.coverage.filesReady < msg.coverage.filesTotal) reasons.push(fmt(T.gateReasonFiles, msg.coverage.filesTotal - msg.coverage.filesReady));
+      if (!msg.globalDone) reasons.push(T.gateReasonGlobal);
+      gateReason.textContent = reasons.join(T.listSep);
       gateReason.style.display = msg.gatePassed ? 'none' : '';
     }
     const submit = byId('submit'); if (submit) submit.disabled = !msg.gatePassed;
     const showGlobal = byId('showGlobal'); if (showGlobal) showGlobal.disabled = !msg.hasGlobalReport;
     const modelLabel = byId('modelLabel');
-    if (modelLabel) { modelLabel.title = msg.modelLabel; modelLabel.innerHTML = '模型：<b>' + esc(msg.modelLabel) + '</b>'; }
+    if (modelLabel) { modelLabel.title = msg.modelLabel; modelLabel.innerHTML = T.modelPrefix + '<b>' + esc(msg.modelLabel) + '</b>'; }
     const conclusionWrap = byId('conclusionWrap'); if (conclusionWrap) conclusionWrap.innerHTML = renderConclusion(msg.conclusion);
   }
 
@@ -781,8 +786,8 @@ export class WorkbenchPanel {
       btn.disabled = !!active;
       btn.classList.toggle('busy', !!active);
       btn.innerHTML = active
-        ? '<span class="btn-spin" aria-hidden="true"></span><span>分析中…</span>'
-        : '全局逻辑分析';
+        ? '<span class="btn-spin" aria-hidden="true"></span><span>' + T.analyzing + '</span>'
+        : T.globalAnalysis;
     }
     if (cancel) cancel.disabled = false;
     if (wrap) wrap.hidden = !active;
@@ -828,8 +833,10 @@ export class WorkbenchPanel {
 
   /** Empty hero shown when the workbench is open but no review has been started yet. */
   private renderEmpty(nonce: string, csp: string): string {
+    const t = m().workbench;
+    const lang = resolveLanguage();
     return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
@@ -850,10 +857,10 @@ export class WorkbenchPanel {
 </head>
 <body>
   <div class="hero">
-    <h1>Code Review · 工作台</h1>
-    <p>选择要审查的范围（本地文件 / 文件夹，或当前分支的 PR），开始一次审查。</p>
-    <button id="pickScope" autofocus>选择审查范围…</button>
-    <div class="hint">范围确定后即可在此窗口逐文件审查与全局分析。</div>
+    <h1>${esc(t.emptyTitle)}</h1>
+    <p>${esc(t.emptyDesc)}</p>
+    <button id="pickScope" autofocus>${esc(t.emptyButton)}</button>
+    <div class="hint">${esc(t.emptyHint)}</div>
   </div>
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
@@ -1096,12 +1103,12 @@ function filePatchOf(file: WorkbenchFile): FilePatch {
           ? 'partial'
           : 'none',
     dotTitle: file.ready
-      ? '已就绪'
+      ? m().workbench.dotReady
       : file.fullySeen
-        ? file.analyzed ? '已读完，发现待确认' : '已读完，待分析'
+        ? file.analyzed ? m().workbench.dotReadConfirm : m().workbench.dotReadAnalyze
         : file.seen > 0
-          ? `已读 ${file.seen}/${file.total} 行`
-          : '未开始',
+          ? fmt(m().workbench.dotReadProgress, file.seen, file.total)
+          : m().workbench.dotNotStarted,
     unconfirmed: file.unconfirmed,
     analyzed: file.analyzed,
     findings: file.findings,

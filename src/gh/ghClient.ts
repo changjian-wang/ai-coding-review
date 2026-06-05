@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { m } from '../i18n';
 import type { PullRequest } from './types';
 
 const pexec = promisify(execFile);
@@ -18,7 +19,7 @@ async function runGh(args: string[], cwd: string): Promise<string> {
   } catch (err) {
     const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string };
     if (e.killed || e.signal === 'SIGTERM') {
-      throw new GhError(`gh ${args[0]} 执行超时（${GH_TIMEOUT_MS / 1000}s）。`);
+      throw new GhError(m().gh.timeout(args[0], GH_TIMEOUT_MS / 1000));
     }
     const msg = (e.stderr || e.message || String(err)).trim();
     throw new GhError(msg);
@@ -30,7 +31,7 @@ export async function ensureGhAvailable(cwd: string): Promise<void> {
   try {
     await pexec('gh', ['--version'], { cwd });
   } catch {
-    throw new GhError('未找到 GitHub CLI（gh）。请先安装 gh 并执行 `gh auth login`。');
+    throw new GhError(m().gh.notFound);
   }
 }
 
@@ -39,7 +40,7 @@ export async function ensureAuth(cwd: string): Promise<void> {
   try {
     await pexec('gh', ['auth', 'status'], { cwd });
   } catch {
-    throw new GhError('GitHub CLI 未登录。请先执行 `gh auth login`。');
+    throw new GhError(m().gh.notAuthed);
   }
 }
 
@@ -61,7 +62,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
   try {
     raw = JSON.parse(json);
   } catch {
-    throw new GhError('无法解析 gh 返回的 PR 数据。');
+    throw new GhError(m().gh.prParseFailed);
   }
   return {
     number: raw.number,
@@ -141,7 +142,7 @@ export async function postPrLineComment(
   try {
     repo = JSON.parse(repoJson);
   } catch {
-    throw new GhError('无法解析 gh repo view 返回。');
+    throw new GhError(m().gh.repoViewParseFailed);
   }
   const slug = `${repo.owner.login}/${repo.name}`;
   const out = await runGh(
@@ -161,6 +162,6 @@ export async function postPrLineComment(
     const parsed = JSON.parse(out);
     return { id: parsed.id, url: parsed.html_url };
   } catch {
-    throw new GhError('PR 评论已发送但响应解析失败。');
+    throw new GhError(m().gh.commentParseFailed);
   }
 }

@@ -11,6 +11,7 @@ import type {
   VerdictKind,
 } from './types';
 import { languageDirective } from './lang';
+import { m } from '../i18n';
 
 /** Raised when analysis cannot complete; message is user-facing. */
 export class AnalysisError extends Error {}
@@ -78,20 +79,23 @@ async function ask(
     }
   } catch (err) {
     if (err instanceof vscode.LanguageModelError) {
-      throw new AnalysisError(`模型调用失败：${err.message}`);
+      throw new AnalysisError(m().analyzer.modelCallFailed(err.message));
     }
     throw err;
   }
   return out;
 }
 
-/** Translates arbitrary text to Simplified Chinese, returning the plain result. */
-export async function translateToChinese(
+/** Translates arbitrary text to the active UI language, returning the plain result. */
+export async function translateSelection(
   model: vscode.LanguageModelChat,
   text: string,
   token: vscode.CancellationToken,
 ): Promise<string> {
-  const system = '你是专业的技术翻译。把用户给出的内容翻译成简洁、准确的简体中文，保留代码标识符与术语。只输出译文，不要任何解释、引号或 markdown 围栏。';
+  const system =
+    `${languageDirective()}\n\n` +
+    "You are a professional technical translator. Translate the user's content into the target language stated above, " +
+    'keeping code identifiers and domain terms verbatim. Output only the translation — no explanation, quotes, or markdown fences.';
   const out = await ask(model, system, text, token, { skipLanguageDirective: true });
   return out.trim();
 }
@@ -169,7 +173,7 @@ function parseJson<T>(text: string): T {
     }
   }
   const preview = t.replace(/\s+/g, ' ').slice(0, 500);
-  throw new AnalysisError(`无法解析模型返回的 JSON。返回预览：${preview}${t.length > 500 ? '…' : ''}`);
+  throw new AnalysisError(m().analyzer.jsonParseFailed(preview, t.length > 500));
 }
 
 function normaliseSeverity(value: unknown): FindingSeverity {
@@ -217,7 +221,7 @@ export async function analyzeFile(
       endLine: o.endLine ? clampLine(Number(o.endLine), lineCount) : undefined,
       anchor,
       severity: normaliseSeverity(o.severity),
-      title: String(o.title ?? '未命名问题'),
+      title: String(o.title ?? m().analyzer.untitledFinding),
       detail: String(o.detail ?? ''),
       suggestion: o.suggestion ? String(o.suggestion) : undefined,
     } satisfies Finding;
@@ -283,7 +287,7 @@ export async function analyzeGlobal(
         file: String(o.file ?? ''),
         line: Math.max(1, Number(o.line) || 1),
         severity: normaliseSeverity(o.severity),
-        title: String(o.title ?? '未命名问题'),
+        title: String(o.title ?? m().analyzer.untitledFinding),
         detail: String(o.detail ?? ''),
         suggestion: o.suggestion ? String(o.suggestion) : undefined,
       } satisfies GlobalFixSpot;
@@ -294,7 +298,7 @@ export async function analyzeGlobal(
       const o = v as Record<string, unknown>;
       return {
         kind: normaliseVerdictKind(o.kind),
-        title: String(o.title ?? '未命名判断'),
+        title: String(o.title ?? m().analyzer.untitledVerdict),
         before: String(o.before ?? ''),
         after: String(o.after ?? ''),
         evidence: o.evidence ? String(o.evidence) : undefined,
@@ -304,7 +308,7 @@ export async function analyzeGlobal(
     },
   );
   return {
-    conclusion: String(parsed.conclusion ?? '无重大跨文件问题。'),
+    conclusion: String(parsed.conclusion ?? m().analyzer.noCrossFileIssues),
     recommendation: normaliseRecommendation(parsed.recommendation),
     evidence: (Array.isArray(parsed.evidence) ? parsed.evidence : []).map((e) => String(e)),
     verdicts,
@@ -328,7 +332,7 @@ export async function analyzeGlobal(
         : 'info';
       return {
         status,
-        label: String(o.label ?? '检查'),
+        label: String(o.label ?? m().analyzer.checkLabel),
         detail: String(o.detail ?? ''),
       } satisfies ArchitectureCheck;
     }),
@@ -441,13 +445,13 @@ ${numbered}
       continue;
     }
     out.push({
-      title: String(o.title ?? '修复方案').trim() || '修复方案',
+      title: String(o.title ?? m().analyzer.fixProposalTitle).trim() || m().analyzer.fixProposalTitle,
       rationale: String(o.rationale ?? '').trim(),
       edits,
     });
   }
   if (out.length === 0) {
-    throw new AnalysisError('模型未返回有效的修复方案。');
+    throw new AnalysisError(m().analyzer.noFixProposals);
   }
   return out;
 }

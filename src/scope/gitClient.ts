@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { m } from '../i18n';
 import type { ReviewFile } from './types';
 
 const pexec = promisify(execFile);
@@ -17,7 +18,7 @@ async function git(args: string[], cwd: string): Promise<string> {
   } catch (err) {
     const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string };
     if (e.killed || e.signal === 'SIGTERM') {
-      throw new GitError(`git ${args[0]} 执行超时（${GIT_TIMEOUT_MS / 1000}s）。`);
+      throw new GitError(m().git.timeout(args[0], GIT_TIMEOUT_MS / 1000));
     }
     throw new GitError((e.stderr || e.message || String(err)).trim());
   }
@@ -28,7 +29,7 @@ export async function ensureGitRepo(cwd: string): Promise<void> {
   try {
     await pexec('git', ['rev-parse', '--is-inside-work-tree'], { cwd });
   } catch {
-    throw new GitError('当前工作区不是 Git 仓库。');
+    throw new GitError(m().git.notRepo);
   }
 }
 
@@ -67,7 +68,7 @@ export async function detectBaseBranch(cwd: string): Promise<string> {
       // try next
     }
   }
-  throw new GitError('无法确定默认分支（未找到 origin/HEAD、main 或 master）。');
+  throw new GitError(m().git.noDefaultBranch);
 }
 
 /** Parses `git diff --numstat` output into ReviewFile[]. */

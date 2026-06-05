@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { nonce as makeNonce } from './html';
+import { m, resolveLanguage } from '../i18n';
 
 export type DocFindingDisposition = 'fixed' | 'commented' | 'ignored';
 
@@ -95,7 +96,7 @@ export class DocumentPanel {
     if (!DocumentPanel.current) {
       const panel = vscode.window.createWebviewPanel(
         'codereview.document',
-        '文件查看',
+        m().documentPanel.title,
         // Open beside the active group (the workbench), so it lands in the same
         // window the workbench currently lives in — including a popped-out window.
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
@@ -140,6 +141,15 @@ export class DocumentPanel {
    */
   static closeIfOpen(): void {
     DocumentPanel.current?.panel.dispose();
+  }
+
+  /** Re-renders the open document panel in the current language (after a language switch). */
+  static refreshIfOpen(): void {
+    const inst = DocumentPanel.current;
+    if (inst) {
+      inst.ready = false;
+      inst.panel.webview.html = inst.shell();
+    }
   }
 
   /** Switches to source view and scrolls a line (or line range) into view. */
@@ -221,8 +231,10 @@ export class DocumentPanel {
   private shell(): string {
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    const t = m().documentPanel;
+    const lang = resolveLanguage();
     return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
@@ -445,11 +457,11 @@ export class DocumentPanel {
     <span class="fname" id="fname"></span>
     <span class="spacer"></span>
     <span class="seg" id="seg" style="display:none">
-      <button id="m-read" class="on">阅读视图</button>
-      <button id="m-src">源码视图</button>
+      <button id="m-read" class="on">${t.readView}</button>
+      <button id="m-src">${t.sourceView}</button>
     </span>
-    <button id="act-jump">跳到下一处未看</button>
-    <button id="act-analyze"><span class="btn-spin" aria-hidden="true"></span><span class="btn-label">分析此文件</span></button>
+    <button id="act-jump">${t.jumpNextUnseen}</button>
+    <button id="act-analyze"><span class="btn-spin" aria-hidden="true"></span><span class="btn-label">${t.analyzeFile}</span></button>
   </div>
   <div class="findbar collapsed" id="findbar" style="display:none">
     <button class="findbar-toggle" id="findbar-toggle"></button>
@@ -457,12 +469,16 @@ export class DocumentPanel {
   </div>
   <div class="content" id="content"></div>
   <div class="pop" id="pop">
-    <button id="pop-tr">译成中文</button>
-    <button id="pop-explain">解释</button>
-    <button id="pop-note">批注</button>
+    <button id="pop-tr">${t.translate}</button>
+    <button id="pop-explain">${t.explain}</button>
+    <button id="pop-note">${t.note}</button>
   </div>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
+const T = ${JSON.stringify(t)};
+const SEV = ${JSON.stringify(m().severity)};
+const DISP = ${JSON.stringify(m().disposition)};
+const fmt = (s, ...a) => String(s).replace(/\{(\d+)\}/g, (_, i) => a[Number(i)] ?? '');
 let model = null;
 let loadedPath = null;
 let mode = 'source';
@@ -480,8 +496,8 @@ function decodeEntities(s) {
   return s.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'");
 }
 
-const SEV_LABEL = { bug:'真 Bug', conditional:'条件性', suggestion:'建议' };
-const DISP_LABEL = { fixed:'已 Copilot 修复', commented:'已写为评论', ignored:'已忽略' };
+const SEV_LABEL = SEV;
+const DISP_LABEL = DISP;
 
 function findingCard(f) {
   const div = document.createElement('div');
@@ -491,14 +507,14 @@ function findingCard(f) {
   if (f.disposition) div.classList.add('collapsed');
   const head = document.createElement('div');
   head.className = 'f-head';
-  head.title = '点击展开 / 收起';
+  head.title = T.toggleTitle;
   head.innerHTML =
     '<span class="f-caret">▸</span>' +
     '<span class="f-tag">' + (SEV_LABEL[f.severity] || f.severity) + '</span>' +
     '<span class="f-title"></span>' +
     '<span class="f-status"></span>' +
     '<span class="f-spacer"></span>' +
-    '<span class="f-line">第 ' + f.line + ' 行</span>';
+    '<span class="f-line">' + fmt(T.line, f.line) + '</span>';
   head.querySelector('.f-title').textContent = f.title;
   if (f.disposition) {
     head.querySelector('.f-status').textContent = '✓ ' + (DISP_LABEL[f.disposition] || f.disposition);
@@ -513,7 +529,7 @@ function findingCard(f) {
   if (f.suggestion) {
     const sug = document.createElement('p');
     sug.className = 'f-suggest';
-    sug.textContent = '建议：' + f.suggestion;
+    sug.textContent = T.suggestionPrefix + f.suggestion;
     body.appendChild(sug);
   }
   if (f.disposition) {
@@ -526,13 +542,13 @@ function findingCard(f) {
   const actions = document.createElement('div');
   actions.className = 'f-actions';
   const locate = document.createElement('button');
-  locate.textContent = '定位';
+  locate.textContent = T.locate;
   locate.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line, endLine:f.endLine, id:f.id }));
   actions.appendChild(locate);
 
   function disposeBtn(kind, label, primary) {
     const b = document.createElement('button');
-    b.textContent = (f.disposition === kind ? '撤销 ' : '') + label;
+    b.textContent = (f.disposition === kind ? T.revertPrefix : '') + label;
     if (primary && f.disposition !== kind) b.className = 'primary';
     b.addEventListener('click', () => vscode.postMessage({ type:'dispose', id:f.id, kind:kind }));
     return b;
@@ -542,12 +558,12 @@ function findingCard(f) {
   // opens the panel for viewing / applying. The undo lives inside the panel.
   const fixBtn = document.createElement('button');
   const isFixed = f.disposition === 'fixed';
-  fixBtn.textContent = isFixed ? '🪄 已修复（查看）' : '🪄 Copilot 修复';
+  fixBtn.textContent = isFixed ? T.fixedView : T.fixWithCopilot;
   if (!f.disposition) fixBtn.className = 'primary';
   fixBtn.addEventListener('click', () => vscode.postMessage({ type:'viewFix', id:f.id }));
   actions.appendChild(fixBtn);
-  actions.appendChild(disposeBtn('commented', '💬 写为评论', false));
-  actions.appendChild(disposeBtn('ignored', '🚫 忽略', false));
+  actions.appendChild(disposeBtn('commented', T.commentBtn, false));
+  actions.appendChild(disposeBtn('ignored', T.ignoreBtn, false));
 
   body.appendChild(actions);
   div.appendChild(head);
@@ -556,14 +572,14 @@ function findingCard(f) {
 }
 
 function annoCard(a) {
-  const where = a.startLine > 0 ? ('第 ' + a.startLine + (a.endLine > a.startLine ? ('–' + a.endLine) : '') + ' 行') : '选区';
-  const kind = a.kind === 'translate' ? '译文' : a.kind === 'explain' ? '解释' : '批注';
+  const where = a.startLine > 0 ? (a.endLine > a.startLine ? fmt(T.annoLineRange, a.startLine, a.endLine) : fmt(T.annoLine, a.startLine)) : T.annoSelection;
+  const kind = a.kind === 'translate' ? T.annoTranslate : a.kind === 'explain' ? T.annoExplain : T.annoNote;
   const div = document.createElement('div');
   div.className = 'anno anno-' + a.kind;
   div.innerHTML =
     '<div class="anno-head"><span class="anno-kind">' + kind + '</span>' +
     '<span class="anno-where">' + where + '</span>' +
-    '<span class="anno-x" title="删除">✕</span></div>' +
+    '<span class="anno-x" title="' + T.delete + '">✕</span></div>' +
     '<div class="anno-body"></div>';
   div.querySelector('.anno-body').textContent = a.content;
   div.querySelector('.anno-head').addEventListener('click', (e) => {
@@ -648,11 +664,11 @@ function renderSource() {
       const foot = document.createElement('div');
       foot.className = 'notes-foot';
       if (oob.length) {
-        foot.innerHTML = '<h4>其他发现</h4>';
+        foot.innerHTML = '<h4>' + T.otherFindings + '</h4>';
         for (const f of oob) foot.appendChild(findingCard(f));
       }
       if (footAnnos.length) {
-        const h = document.createElement('h4'); h.textContent = '未定位批注'; foot.appendChild(h);
+        const h = document.createElement('h4'); h.textContent = T.unlocatedAnnotations; foot.appendChild(h);
         for (const a of footAnnos) foot.appendChild(annoCard(a));
       }
       wrap.appendChild(foot);
@@ -713,11 +729,11 @@ function renderReading() {
     const foot = document.createElement('div');
     foot.className = 'notes-foot';
     if (model.findings.length) {
-      const h = document.createElement('h4'); h.textContent = '文件级发现（' + model.findings.length + '）'; foot.appendChild(h);
+      const h = document.createElement('h4'); h.textContent = fmt(T.fileFindings, model.findings.length); foot.appendChild(h);
       for (const f of model.findings) foot.appendChild(findingCard(f));
     }
     if (rest.length) {
-      const h = document.createElement('h4'); h.textContent = '批注 / 译文'; foot.appendChild(h);
+      const h = document.createElement('h4'); h.textContent = T.annotationsTranslations; foot.appendChild(h);
       for (const a of rest) foot.appendChild(annoCard(a));
     }
     wrap.appendChild(foot);
@@ -783,8 +799,8 @@ function renderFindbar() {
   fb.style.display = 'block';
   const unconfirmed = fs.filter((f) => !f.disposition).length;
   $('findbar-toggle').innerHTML =
-    '<span class="fb-count">发现 ' + fs.length + '</span>' +
-    (unconfirmed ? '<span class="fb-warn">' + unconfirmed + ' 未确认</span>' : '<span class="fb-ok">全部已确认</span>') +
+    '<span class="fb-count">' + fmt(T.findingCount, fs.length) + '</span>' +
+    (unconfirmed ? '<span class="fb-warn">' + fmt(T.unconfirmedCount, unconfirmed) + '</span>' : '<span class="fb-ok">' + T.allConfirmed + '</span>') +
     '<span class="fb-caret">▾</span>';
   const list = $('findlist');
   list.innerHTML = '';
@@ -793,7 +809,7 @@ function renderFindbar() {
     item.className = 'finditem ' + f.severity + (f.disposition ? ' confirmed' : '');
     item.innerHTML =
       '<span class="fi-dot"></span><span class="fi-title"></span>' +
-      '<span class="fi-line">第 ' + f.line + ' 行</span>' +
+      '<span class="fi-line">' + fmt(T.line, f.line) + '</span>' +
       (f.disposition ? '<span class="fi-ok">✓</span>' : '');
     item.querySelector('.fi-title').textContent = f.title;
     item.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line, endLine:f.endLine, id:f.id }));
@@ -863,24 +879,24 @@ function setAnalyzing(on, ok, silent) {
   if (on) {
     btn.classList.add('analyzing');
     btn.classList.remove('done');
-    if (label) label.textContent = '分析中…';
+    if (label) label.textContent = T.analyzing;
   } else if (silent) {
     // Silent reset (e.g. switching files): straight back to idle, no 完成 flash.
     btn.classList.remove('analyzing');
     btn.classList.remove('done');
-    if (label) label.textContent = '分析此文件';
+    if (label) label.textContent = T.analyzeFile;
   } else {
     btn.classList.remove('analyzing');
     if (ok !== false) {
       btn.classList.add('done');
-      if (label) label.textContent = '✓ 分析完成';
+      if (label) label.textContent = T.analyzeDone;
       doneTimer = setTimeout(() => {
         btn.classList.remove('done');
-        if (label) label.textContent = '分析此文件';
+        if (label) label.textContent = T.analyzeFile;
         doneTimer = 0;
       }, 1800);
     } else if (label) {
-      label.textContent = '分析此文件';
+      label.textContent = T.analyzeFile;
     }
   }
 }

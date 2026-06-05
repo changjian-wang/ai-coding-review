@@ -1,43 +1,133 @@
 # Code Review Gate
 
-> 不信任驱动的代码审查：**每一行都必须被看过**。把 "Review = 不信任" 做成硬门禁——逐行覆盖 + 文件级 AI 分析 + 跨文件全局分析，四个维度都完成才允许给出结论。
+> Distrust-driven code review: **every line must be looked at**. "Review = distrust" turned into a hard gate — read line-by-line + file-level AI analysis + dispose of every finding + cross-file global analysis. Only when all of that is done are you allowed to submit a conclusion.
 
-## 设计原则
+`v0.0.46` · VS Code extension · powered by the GitHub CLI and Copilot models
 
-- **逐行覆盖是真实的**：用 VS Code 真实编辑器 + 可见区域追踪（`visibleRanges`）判断 "眼睛真的扫过"，不是假滚动。
-- **原生优先**：左侧改动文件树用原生 `TreeView`，行覆盖/AI 提醒用 `TextEditorDecorationType` 与诊断，状态用 `StatusBar`。仅"全局逻辑分析报告"这一块富文本用 Webview。
-- **模型可选**：通过 VS Code Language Model API 列出当前 Copilot 授权的模型，支持 `Auto`。
-- **数据来自真实 PR**：通过 GitHub CLI（`gh`）拉取当前分支 PR 的元数据与 diff，复用用户已有的 `gh auth`。
+English | [简体中文](README.zh-CN.md)
 
-## 架构分层
+## Core ideas
 
+- **Review is distrust**: assume the author makes mistakes; no conclusion is allowed until the gate passes.
+- **Per-line coverage is real**: based on a real VS Code editor + viewport tracking (`visibleRanges`) to judge that "the eyes actually scanned it", not a fake scroll; progress is bound to `headSha` — the moment the author pushes a new commit, old coverage is invalidated.
+- **AI is a copilot, not a judge**: the model produces findings and fix proposals; whether to accept them is decided by a human, one finding at a time (fix / comment / ignore-with-reason).
+- **Native first**: status bar, decorations, diagnostics use native VS Code APIs; the review workbench, document viewer, fix proposals, and global report use webviews for rich interaction.
+
+## Features
+
+### Review scope (workspace-first)
+
+- The whole project folder (auto-skips `node_modules / .git / dist / out / bin / obj / .vs`)
+- A self-built webview tree picker, locked to the project root, to pick any file subset
+- The current branch's PR (via `gh`)
+- Current branch vs base branch (pure git diff)
+- Uncommitted working-tree changes (pure git)
+
+### Review workbench
+
+- File tree + per-file / overall coverage progress + findings summary + action buttons, all in one webview
+- Can be popped out into a separate window (like "Open in Agents Window")
+- Auto-restores the review and workbench after a window reload — no need to re-pick the scope
+
+### Per-file review
+
+- Per-line coverage tracking and "jump to next unseen line"
+- File-level AI analysis → findings with severity levels
+- Every finding must be disposed: **fixed / commented / ignored (reason required)**
+- Fix proposals: Copilot generates mutually-exclusive "multi-edit = one complete solution" candidates, one-click apply + one-click undo, with applied snapshots persisted
+- Selection translation / code explanation annotations
+
+### Global analysis
+
+- Cross-file logic analysis, optionally scoped to selected directories
+- A dedicated global-report webview
+
+### Gate and conclusion
+
+- Gate: **every file is analyzed and all findings are disposed** + **the global conclusion is confirmed**
+- Conclusion: Approve / Request Changes / Comment
+- When the scope is a PR, one click writes the conclusion back to the GitHub PR (`gh`); otherwise it is recorded locally
+
+## Gate model
+
+```text
+gatePassed = all files ready && global analysis confirmed
+file ready  = file-level analysis done && every finding in the file disposed
 ```
+
+Per-line coverage is shown as a live progress signal (per-file / overall `seen/total`) to push "actually read it", displayed alongside the gate verdict.
+
+## Language (bilingual)
+
+Code Review Gate is fully bilingual (English / 简体中文), **English by default**.
+
+- `codereview.language` drives the **whole experience** — both the extension UI (status bar, prompts, webview panels) and all LLM output (findings, fix proposals, explanations, global conclusions).
+  - `en` (default): everything in English
+  - `zh-CN`: everything in Simplified Chinese
+  - `auto`: follow the VS Code display language
+- Switching the setting takes effect **live** — the status bar and any open webview panels re-render immediately, no reload needed.
+- Command titles in the Command Palette follow the **VS Code display language** (a platform limitation for static contribution points), localized via `package.nls`.
+
+## Commands and settings
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `codereview.openOrStart` | Open or start a review (status-bar entry) |
+| `codereview.openInNewWindow` | Open the review workbench in a separate window |
+| `codereview.startReview` | Pick a scope and start a review |
+| `codereview.openWorkbench` | Open the review workbench |
+| `codereview.analyzeFile` | Analyze the current file |
+| `codereview.globalAnalysis` | Run global analysis |
+| `codereview.showGlobalReport` | Show the global report |
+| `codereview.submitConclusion` | Submit the review conclusion |
+| `codereview.jumpToNextUnseen` | Jump to the next unseen line |
+| `codereview.pickModel` | Select the analysis model |
+
+### Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `codereview.language` | `en` | Language for the whole experience (UI + LLM output): `en` / `zh-CN` / `auto` |
+| `codereview.focusedWorkbench` | `false` | When opening the workbench, hide the side bar / activity bar so it takes over the main editor area; restored on close |
+
+## Architecture
+
+```text
 src/
-  extension.ts          激活入口、命令注册
-  gh/                   GitHub CLI 封装（auth / pr view / pr diff）
-  review/               审查会话模型 + 持久化（ReviewStore 抽象）
-  ai/                   模型选择 + 文件级/全局 LLM 分析（后续切片）
-  ui/                   原生 UI：TreeView / 装饰 / 状态栏 / 全局报告 Webview
+  extension.ts          activation entry, command registration, orchestration, gate
+  i18n/                 language resolver + English/Chinese message catalogs
+  gh/                   GitHub CLI wrapper (auth / pr view / pr diff / write back review)
+  scope/                review scopes: PR / branch diff / working tree / file selection + tree-picker webview
+  review/               review session model + persistence (ReviewStore abstraction)
+  ai/                   model selection + file-level / global analysis + fix proposals + language directive
+  ui/                   workbench / document / fix-proposal / global-report webviews + status bar / toast / progress
 ```
 
-## 持久化
+## Persistence
 
-- 当前：`workspaceState`（本机，按 `repo + PR# + headSha` 存）。
-- 注意：`workspaceState` **不跟随 GitHub 账号、不跨设备**。
-- 跨设备能力通过 `ReviewStore` 接口预留，将来由远端实现（服务端或 PR 隐藏 comment）提供。
-- 进度绑定 `headSha`：作者一旦 push 新 commit，旧覆盖率应失效。
+- `workspaceState` (local), keyed by `repo + scopeId + headSha`.
+- Applied-fix snapshots are persisted, so "undo fix" and "locate" still work after a reload.
+- Progress is bound to `headSha`: old coverage is invalidated after the author pushes a new commit.
+- Note: `workspaceState` **does not follow your GitHub account and is not cross-device**; cross-device capability is reserved via the `ReviewStore` interface for a future remote implementation.
 
-## 开发
+## Model and language
+
+- Lists the models currently authorized for Copilot via the VS Code Language Model API, supports `Auto`, and remembers the choice per workspace.
+- `codereview.language` controls the language of the whole experience (UI + all LLM output); see [Language](#language-bilingual) above.
+
+## Development and packaging
 
 ```bash
 npm install
-npm run compile      # 或 npm run watch
-# 按 F5 启动扩展开发宿主
+npm run compile            # or npm run watch; press F5 to launch the Extension Development Host
+npm run package            # production build (esbuild --production)
+npx @vscode/vsce package   # produce a .vsix
 ```
 
-需要本机已安装并登录 GitHub CLI：`gh auth login`。
+PR scope and writing back to a PR require the GitHub CLI installed and logged in: `gh auth login`.
 
-## 状态
+## Roadmap
 
-切片 1（当前）：激活 + gh 拉取 PR 改动文件 + 原生 TreeView + 模型选择。
-后续：逐行覆盖装饰、文件级 AI 分析、全局分析报告、门禁与结论提交。
+- [ ] Cross-device / account-following review progress (a remote `ReviewStore` implementation).

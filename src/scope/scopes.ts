@@ -1,5 +1,6 @@
 import * as git from './gitClient';
 import { ensureAuth, ensureGhAvailable, getCurrentPr } from '../gh/ghClient';
+import { m } from '../i18n';
 import type { ReviewFile, ReviewScope, ReviewSet } from './types';
 
 /** Stable, order-independent short hash of a set of paths (FNV-1a, base36). */
@@ -45,7 +46,7 @@ export class BranchVsBaseScope implements ReviewScope {
     const files = await git.diffFiles(cwd, `${base}...HEAD`);
     return {
       scopeId: `branch-vs-${base}`,
-      label: `当前分支 vs ${base}`,
+      label: m().scope.branchVsBase(base),
       headSha,
       files,
     };
@@ -60,7 +61,7 @@ export class WorkingTreeScope implements ReviewScope {
     const files = await git.workingTreeFiles(cwd);
     return {
       scopeId: 'working-tree',
-      label: '未提交的改动',
+      label: m().scope.workingTree,
       headSha,
       files,
     };
@@ -79,7 +80,7 @@ export class FileSystemScope implements ReviewScope {
     const files: ReviewFile[] = this.relPaths.map((path) => ({ path }));
     return {
       scopeId: `files-${files.length}-${hashPaths(this.relPaths)}`,
-      label: `选定的源码（${files.length}）`,
+      label: m().scope.selectedSources(files.length),
       headSha,
       files,
     };

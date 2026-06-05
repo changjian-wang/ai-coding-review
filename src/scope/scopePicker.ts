@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import { FileSystemScope, PrScope } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
 import type { ReviewScope } from './types';
+import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
 
 /** Result of {@link pickScope}: the chosen scope plus the workspace-folder cwd it should run against. */
@@ -22,22 +23,22 @@ export async function pickScope(defaultCwd: string): Promise<PickedScope | undef
   type Item = vscode.QuickPickItem & { build: () => Promise<PickedScope | undefined> };
   const items: Item[] = [
     {
-      label: '$(files) 选择源码文件/文件夹',
-      description: '纯源码审查',
-      detail: '直接挑选要审查的源文件或目录，不依赖任何 diff',
+      label: m().scope.pickFilesLabel,
+      description: m().scope.pickFilesDescription,
+      detail: m().scope.pickFilesDetail,
       build: buildFileSystemScope,
     },
     {
-      label: '$(git-pull-request) 当前分支的 PR',
+      label: m().scope.pickPrLabel,
       description: 'gh pr view',
-      detail: '把 PR 涉及的源文件纳入审查（需要 gh 已登录）',
+      detail: m().scope.pickPrDetail,
       build: async () => ({ scope: new PrScope(), cwd: defaultCwd }),
     },
   ];
 
   const choice = await vscode.window.showQuickPick(items, {
-    title: 'Code Review · 选择审查范围',
-    placeHolder: '挑选要纳入审查的源码（本地文件/文件夹 或 当前分支的 PR）',
+    title: m().scope.pickTitle,
+    placeHolder: m().scope.pickPlaceholder,
   });
   return choice?.build();
 
@@ -48,13 +49,11 @@ export async function pickScope(defaultCwd: string): Promise<PickedScope | undef
     // unlike the native open dialog, which can wander out of the root and then
     // fail with an error that is invisible when the workbench is full-screen.
     const relPaths = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Code Review：正在扫描项目文件…' },
+      { location: vscode.ProgressLocation.Notification, title: m().scope.scanning },
       () => expandToRelPaths([vscode.Uri.file(defaultCwd)], defaultCwd),
     );
     if (relPaths.length === 0) {
-      transientWarning(
-        '当前项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
-      );
+      transientWarning(m().scope.noFiles);
       return undefined;
     }
     const picked = await pickScopeTree({

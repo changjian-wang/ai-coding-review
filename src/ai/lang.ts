@@ -1,16 +1,11 @@
-import * as vscode from 'vscode';
+import { resolveLanguage, type Language } from '../i18n';
 
-export type OutputLanguage = 'zh-CN' | 'en';
+/** Backwards-compatible alias; language now resolves via the shared i18n resolver. */
+export type OutputLanguage = Language;
 
-/** Reads the configured language, resolving `auto` against VS Code's UI language. */
+/** Reads the active language from the shared `codereview.language` resolver (default English). */
 export function getOutputLanguage(): OutputLanguage {
-  const choice = vscode.workspace
-    .getConfiguration('codereview')
-    .get<string>('language', 'auto');
-  if (choice === 'zh-CN' || choice === 'en') {
-    return choice;
-  }
-  return vscode.env.language?.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en';
+  return resolveLanguage();
 }
 
 /**

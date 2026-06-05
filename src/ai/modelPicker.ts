@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { m } from '../i18n';
 
 /**
  * The model chosen for analysis. `model` is undefined when the user picks
@@ -24,7 +25,7 @@ export async function pickModel(): Promise<PickedModel | undefined> {
   const items: Item[] = [
     {
       label: 'Auto',
-      description: '让 Copilot 自动选择最合适的模型',
+      description: m().model.autoDescription,
       value: { id: 'auto', label: 'Auto' },
     },
     ...models.map((m): Item => ({
@@ -36,8 +37,8 @@ export async function pickModel(): Promise<PickedModel | undefined> {
   ];
 
   const choice = await vscode.window.showQuickPick(items, {
-    title: 'Code Review · 选择分析模型',
-    placeHolder: models.length ? '选择用于代码审查分析的模型' : '未检测到 Copilot 模型，可先选 Auto',
+    title: m().model.pickTitle,
+    placeHolder: models.length ? m().model.pickPlaceholder : m().model.pickPlaceholderEmpty,
   });
   return choice?.value;
 }

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { FixEdit, FixProposal } from '../ai/analyzer';
 import { escAttr as escapeHtml, nonce as makeNonce } from './html';
+import { m, fmt, resolveLanguage } from '../i18n';
 
 /** Inputs needed to drive the panel. */
 export interface FixProposalRequest {
@@ -66,7 +67,7 @@ export class FixProposalPanel {
   private static cache = new Map<string, CachedEntry>();
   /** Backing store for cross-reload persistence. Wired by {@link FixProposalPanel.init}. */
   private static memento?: vscode.Memento;
-  private state: PanelState = { kind: 'loading', message: '正在生成修复方案…' };
+  private state: PanelState = { kind: 'loading', message: m().fixPanel.generating };
   private generating?: vscode.CancellationTokenSource;
   private hasNotifiedApplied = false;
   private readonly disposables: vscode.Disposable[] = [];
@@ -83,7 +84,7 @@ export class FixProposalPanel {
   }
 
   static show(request: FixProposalRequest): void {
-    const title = `修复方案：${request.finding.title}`.slice(0, 60);
+    const title = `${m().fixPanel.titlePrefix}${request.finding.title}`.slice(0, 60);
     if (FixProposalPanel.instance) {
       FixProposalPanel.instance.replace(request, title);
       return;
@@ -105,6 +106,14 @@ export class FixProposalPanel {
    */
   static closeIfOpen(): void {
     FixProposalPanel.instance?.panel.dispose();
+  }
+
+  /** Re-renders the open panel in the current language (after a language switch). */
+  static refreshIfOpen(): void {
+    const inst = FixProposalPanel.instance;
+    if (inst) {
+      inst.panel.webview.html = inst.renderHtml();
+    }
   }
 
   /**
@@ -178,7 +187,7 @@ export class FixProposalPanel {
     }
     const cts = new vscode.CancellationTokenSource();
     this.generating = cts;
-    this.setState({ kind: 'loading', message: '正在生成修复方案…' });
+    this.setState({ kind: 'loading', message: m().fixPanel.generating });
     try {
       const proposals = await this.request.generate(cts.token);
       if (cts.token.isCancellationRequested) {
@@ -280,9 +289,7 @@ export class FixProposalPanel {
     // to undo it first (rather than silently stacking two alternatives).
     const other = this.state.proposals.find((p, i) => i !== idx && p.applied);
     if (other) {
-      void vscode.window.showWarningMessage(
-        `已应用「${other.title}」。这些是互斥的备选方案，如需改用此方案，请先撤销已应用的方案。`,
-      );
+      void vscode.window.showWarningMessage(fmt(m().fixPanel.mutexApplied, other.title));
       return;
     }
     const content = await this.currentFileText();
@@ -290,17 +297,17 @@ export class FixProposalPanel {
     for (const e of proposal.edits) {
       const matches = countOccurrences(content, e.oldText);
       if (matches === 0) {
-        this.markProposalError(idx, '无法定位：方案中有一处原代码片段在当前文件中已不存在（文件可能被修改了）。请「重新生成」。');
+        this.markProposalError(idx, m().fixPanel.locateGone);
         return;
       }
       if (matches > 1) {
-        this.markProposalError(idx, `方案中有一处原代码出现了 ${matches} 次，无法唯一定位。请「重新生成」以获得更具上下文的方案。`);
+        this.markProposalError(idx, fmt(m().fixPanel.locateAmbiguous, matches));
         return;
       }
     }
     const ok = await this.applyEdits(proposal.edits);
     if (!ok) {
-      this.markProposalError(idx, '应用失败：文件在写入瞬间发生了变化，请「重新生成」。');
+      this.markProposalError(idx, m().fixPanel.applyRace);
       return;
     }
     // Mutate the proposal view in place so other proposals stay visible.
@@ -322,7 +329,7 @@ export class FixProposalPanel {
     const anchorEdit = this.anchorEditFor(proposal.edits, content);
     this.request.onApplied({ oldText: anchorEdit.oldText, newText: anchorEdit.newText });
     this.request.onFileChanged?.();
-    vscode.window.setStatusBarMessage(`已应用：${proposal.title}（点击「撤销修改」可还原）`, 8000);
+    vscode.window.setStatusBarMessage(fmt(m().fixPanel.appliedStatus, proposal.title), 8000);
   }
 
   /**
@@ -363,11 +370,11 @@ export class FixProposalPanel {
     for (const e of proposal.edits) {
       const matches = countOccurrences(content, e.newText);
       if (matches === 0) {
-        void vscode.window.showWarningMessage('无法撤销：文件中已找不到之前应用的某处片段（文件可能被手动改动过了）。');
+        void vscode.window.showWarningMessage(m().fixPanel.undoGone);
         return;
       }
       if (matches > 1) {
-        void vscode.window.showWarningMessage(`之前应用的某处片段现在出现了 ${matches} 次，无法唯一定位，不敢自动撤销。请手动 Ctrl+Z。`);
+        void vscode.window.showWarningMessage(fmt(m().fixPanel.undoAmbiguous, matches));
         return;
       }
     }
@@ -375,7 +382,7 @@ export class FixProposalPanel {
     const reversed = proposal.edits.map((e) => ({ oldText: e.newText, newText: e.oldText }));
     const ok = await this.applyEdits(reversed);
     if (!ok) {
-      void vscode.window.showWarningMessage('撤销失败：文件在写入瞬间发生了变化。');
+      void vscode.window.showWarningMessage(m().fixPanel.undoRace);
       return;
     }
     if (this.state.kind === 'ready') {
@@ -389,7 +396,7 @@ export class FixProposalPanel {
     this.snapshotCurrent();
     this.request.onFileChanged?.();
     this.request.onUndone?.();
-    vscode.window.setStatusBarMessage(`已撤销：${proposal.title}`, 6000);
+    vscode.window.setStatusBarMessage(fmt(m().fixPanel.undoneStatus, proposal.title), 6000);
   }
 
   private markProposalError(_idx: number, message: string): void {
@@ -520,8 +527,11 @@ export class FixProposalPanel {
     const initial = JSON.stringify(this.state);
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
+    const t = m().fixPanel;
+    const T = JSON.stringify(t);
+    const lang = resolveLanguage();
     return /* html */ `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="${lang}">
 <head><meta charset="UTF-8"/>
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
 <style>
@@ -565,21 +575,23 @@ export class FixProposalPanel {
 </head>
 <body>
   <header>
-    <h2>修复方案</h2>
-    <span class="sub" id="subline">${escapeHtml(this.request.rel)} · 第 ${this.request.finding.line} 行</span>
+    <h2>${escapeHtml(t.heading)}</h2>
+    <span class="sub" id="subline">${escapeHtml(this.request.rel)} · ${escapeHtml(fmt(t.line, this.request.finding.line))}</span>
   </header>
   <div class="finding">
     <div class="title" id="f-title">${escapeHtml(this.request.finding.title)}</div>
     <div id="f-detail">${escapeHtml(this.request.finding.detail)}</div>
-    <div class="meta" id="f-suggest"${this.request.finding.suggestion ? '' : ' style="display:none"'}>${this.request.finding.suggestion ? '建议：' + escapeHtml(this.request.finding.suggestion) : ''}</div>
+    <div class="meta" id="f-suggest"${this.request.finding.suggestion ? '' : ' style="display:none"'}>${this.request.finding.suggestion ? escapeHtml(t.suggestionPrefix) + escapeHtml(this.request.finding.suggestion) : ''}</div>
   </div>
   <div class="toolbar">
-    <button id="regenerate" class="primary">重新生成</button>
-    <button id="cancel">关闭</button>
+    <button id="regenerate" class="primary">${escapeHtml(t.regenerate)}</button>
+    <button id="cancel">${escapeHtml(t.close)}</button>
   </div>
   <div id="body"></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    const T = ${T};
+    const fmt = (s, ...a) => String(s).replace(/\{(\d+)\}/g, (_, i) => a[Number(i)] ?? '');
     const body = document.getElementById('body');
     document.getElementById('regenerate').addEventListener('click', () => vscode.postMessage({ type: 'regenerate' }));
     document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
@@ -599,43 +611,43 @@ export class FixProposalPanel {
       }
       if (state.kind === 'ready') {
         if (!state.proposals.length) {
-          body.innerHTML = '<div class="status error">模型没有返回任何方案。请「重新生成」。</div>';
+          body.innerHTML = '<div class="status error">' + esc(T.noProposals) + '</div>';
           return;
         }
         const banner = state.lastApplied
-          ? '<div class="status applied">已应用：<strong>' + esc(state.lastApplied) + '</strong>。改动已同步到左侧文件查看器；点击「撤销修改」可还原。</div>'
+          ? '<div class="status applied">' + esc(T.appliedBannerPrefix) + '<strong>' + esc(state.lastApplied) + '</strong>' + esc(T.appliedBannerSuffix) + '</div>'
           : '';
         const anyApplied = state.proposals.some(function (p) { return p.applied; });
         const altNote = (state.proposals.length > 1 && !state.lastApplied)
-          ? '<div class="hint">以下是互斥的备选方案，任选其一应用即可修复，不需要全部应用。</div>'
+          ? '<div class="hint">' + esc(T.mutexHint) + '</div>'
           : '';
         const cards = state.proposals.map((p, i) => {
           const editCount = (p.edits && p.edits.length) || 1;
-          const multi = editCount > 1 ? ' · ' + editCount + ' 处改动' : '';
+          const multi = editCount > 1 ? fmt(T.editCount, editCount) : '';
           const lockedByOther = anyApplied && !p.applied;
           let badge;
           if (p.applied) {
-            badge = '<span class="badge ok">已应用' + multi + '</span>';
+            badge = '<span class="badge ok">' + esc(T.badgeApplied) + multi + '</span>';
           } else if (lockedByOther) {
-            badge = '<span class="badge muted">备选方案 ' + (i + 1) + multi + '</span>';
+            badge = '<span class="badge muted">' + esc(fmt(T.badgeAlternative, i + 1)) + multi + '</span>';
           } else if (p.applicable) {
-            badge = '<span class="badge">方案 ' + (i + 1) + multi + '</span>';
+            badge = '<span class="badge">' + esc(fmt(T.badgeProposal, i + 1)) + multi + '</span>';
           } else {
             const bad = (p.matches || []).filter(function (m) { return m !== 1; }).length;
-            badge = '<span class="badge">无法唯一定位（' + bad + '/' + editCount + ' 处）</span>';
+            badge = '<span class="badge">' + esc(fmt(T.badgeUnlocatable, bad, editCount)) + '</span>';
           }
           let btn;
           if (p.applied) {
-            btn = '<button data-undo="' + i + '">撤销修改</button>';
+            btn = '<button data-undo="' + i + '">' + esc(T.undoBtn) + '</button>';
           } else if (lockedByOther) {
-            btn = '<button disabled title="已应用其他方案，撤销后可改用此方案">已选其他方案</button>';
+            btn = '<button disabled title="' + esc(T.otherSelectedTitle) + '">' + esc(T.otherSelected) + '</button>';
           } else if (p.applicable) {
-            btn = '<button class="primary" data-apply="' + i + '">应用此方案</button>';
+            btn = '<button class="primary" data-apply="' + i + '">' + esc(T.applyBtn) + '</button>';
           } else {
-            btn = '<button disabled>无法应用</button>';
+            btn = '<button disabled>' + esc(T.cannotApply) + '</button>';
           }
           const hint = (!p.applied && !lockedByOther && p.applicable)
-            ? '<div class="hint">应用后会直接写入文件（未保存），左侧文件查看器会立即刷新。</div>'
+            ? '<div class="hint">' + esc(T.applyHint) + '</div>'
             : '';
           const cls = p.applied ? ' done' : (lockedByOther ? ' locked' : (p.applicable ? '' : ' bad'));
           return [
@@ -668,14 +680,14 @@ export class FixProposalPanel {
         render(msg.state);
       } else if (msg && msg.type === 'header') {
         const el = document.getElementById('subline');
-        if (el) el.textContent = msg.rel + ' · 第 ' + msg.line + ' 行';
+        if (el) el.textContent = msg.rel + ' · ' + fmt(T.line, msg.line);
         const t = document.getElementById('f-title');
         if (t) t.textContent = msg.title;
         const d = document.getElementById('f-detail');
         if (d) d.textContent = msg.detail;
         const s = document.getElementById('f-suggest');
         if (s) {
-          if (msg.suggestion) { s.textContent = '建议：' + msg.suggestion; s.style.display = ''; }
+          if (msg.suggestion) { s.textContent = T.suggestionPrefix + msg.suggestion; s.style.display = ''; }
           else { s.textContent = ''; s.style.display = 'none'; }
         }
       }
@@ -759,7 +771,7 @@ function renderInlineDiff(oldText: string, newText: string): string {
     rows.push(diffRow('add', '+', line));
   }
   if (rows.length === 0) {
-    rows.push(diffRow('ctx', ' ', '（空差异）'));
+    rows.push(diffRow('ctx', ' ', m().fixPanel.emptyDiff));
   }
   return `<pre class="diff">${rows.join('')}</pre>`;
 }

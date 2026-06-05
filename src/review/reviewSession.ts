@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { m } from '../i18n';
 import type { ReviewSet } from '../scope/types';
 import type { Finding, GlobalReport } from '../ai/types';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition } from './reviewStore';
@@ -371,7 +372,7 @@ export class ReviewSession {
         await this.store.save(this.snapshot);
       } catch (err) {
         const message = String((err as Error)?.message ?? err);
-        void vscode.window.showWarningMessage(`Code Review：审查进度保存失败：${message}`);
+        void vscode.window.showWarningMessage(m().review.saveFailed(message));
         return;
       }
       this._onDidChange.fire();

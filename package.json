@@ -2,10 +2,14 @@
   "name": "codereview",
   "displayName": "Code Review Gate",
   "description": "Distrust-driven code review: per-line coverage gate plus file-level and cross-file AI analysis, powered by the GitHub CLI and VS Code's Copilot models.",
-  "version": "0.0.45",
+  "version": "0.0.46",
   "publisher": "codereview-dev",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/changjian-wang/codereview.git"
+  },
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.96.0"
@@ -22,60 +26,60 @@
     "commands": [
       {
         "command": "codereview.startReview",
-        "title": "Code Review: Start Review",
+        "title": "%cmd.startReview%",
         "icon": "$(play)"
       },
       {
         "command": "codereview.openOrStart",
-        "title": "Code Review: Open or Start Review",
+        "title": "%cmd.openOrStart%",
         "icon": "$(checklist)"
       },
       {
         "command": "codereview.openInNewWindow",
-        "title": "Code Review: Open in New Window",
+        "title": "%cmd.openInNewWindow%",
         "icon": "$(window)"
       },
       {
         "command": "codereview.pickModel",
-        "title": "Code Review: Select Analysis Model",
+        "title": "%cmd.pickModel%",
         "icon": "$(sparkle)"
       },
       {
         "command": "codereview.openWorkbench",
-        "title": "Code Review: Open Workbench",
+        "title": "%cmd.openWorkbench%",
         "icon": "$(layout)"
       },
       {
         "command": "codereview.openFile",
-        "title": "Code Review: Open Changed File"
+        "title": "%cmd.openFile%"
       },
       {
         "command": "codereview.analyzeFile",
-        "title": "Code Review: Analyze Current File",
+        "title": "%cmd.analyzeFile%",
         "icon": "$(search-fuzzy)"
       },
       {
         "command": "codereview.globalAnalysis",
-        "title": "Code Review: Run Global Analysis",
+        "title": "%cmd.globalAnalysis%",
         "icon": "$(graph)"
       },
       {
         "command": "codereview.showGlobalReport",
-        "title": "Code Review: Show Global Report",
+        "title": "%cmd.showGlobalReport%",
         "icon": "$(output)"
       },
       {
         "command": "codereview.submitConclusion",
-        "title": "Code Review: Submit Conclusion",
+        "title": "%cmd.submitConclusion%",
         "icon": "$(check-all)"
       },
       {
         "command": "codereview.locateFinding",
-        "title": "Code Review: Locate Finding"
+        "title": "%cmd.locateFinding%"
       },
       {
         "command": "codereview.jumpToNextUnseen",
-        "title": "Code Review: Jump to Next Unseen Line",
+        "title": "%cmd.jumpToNextUnseen%",
         "icon": "$(arrow-down)"
       }
     ],
@@ -90,17 +94,17 @@
             "en"
           ],
           "enumDescriptions": [
-            "跟随 VS Code 显示语言 / Follow VS Code display language",
-            "始终使用简体中文",
-            "Always use English"
+            "%config.language.auto%",
+            "%config.language.zh%",
+            "%config.language.en%"
           ],
-          "default": "auto",
-          "description": "Code Review 中所有 LLM 输出（findings、修复方案、解释、跨文件结论等）使用的语言。 / Language used by all LLM outputs (findings, fix proposals, explanations, global conclusions)."
+          "default": "en",
+          "description": "%config.language.description%"
         },
         "codereview.focusedWorkbench": {
           "type": "boolean",
           "default": false,
-          "description": "打开 Code Review 工作台时自动关闭左侧栏并隐藏活动栏，让工作台占满主编辑区；关闭工作台后自动恢复。 / When opening the Code Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed."
+          "description": "%config.focusedWorkbench.description%"
         }
       }
     }

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { esc, nonce as makeNonce } from '../ui/html';
+import { m } from '../i18n';
 
 /** Options for {@link pickScopeTree}. */
 export interface ScopeTreeOptions {
@@ -20,7 +21,7 @@ export function pickScopeTree(opts: ScopeTreeOptions): Promise<string[] | undefi
   return new Promise((resolve) => {
     const panel = vscode.window.createWebviewPanel(
       'codereview.scopePicker',
-      'Code Review · 选择审查范围',
+      m().scopePanel.title,
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
@@ -59,6 +60,8 @@ function renderHtml(opts: ScopeTreeOptions): string {
   const nonce = makeNonce();
   const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
   const data = JSON.stringify(opts.relPaths);
+  const t = m().scopePanel;
+  const T = JSON.stringify(t);
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -123,26 +126,27 @@ function renderHtml(opts: ScopeTreeOptions): string {
 </head>
 <body>
   <div class="head">
-    <h2>选择审查范围</h2>
-    <div class="root-line">项目根目录：<b>${esc(opts.rootLabel)}</b></div>
-    <div class="root-note">勾选要纳入审查的目录或文件。范围已锁定在该项目内，无法选择项目之外的内容。</div>
+    <h2>${esc(t.heading)}</h2>
+    <div class="root-line">${esc(t.rootLabel)}<b>${esc(opts.rootLabel)}</b></div>
+    <div class="root-note">${esc(t.note)}</div>
   </div>
   <div class="toolbar">
-    <input id="filter" type="search" placeholder="输入路径关键字筛选…" autocomplete="off" />
-    <button class="tbtn" id="btnSelAll">全选</button>
-    <button class="tbtn" id="btnClear">清空</button>
-    <button class="tbtn" id="btnCollapse">折叠全部</button>
+    <input id="filter" type="search" placeholder="${esc(t.filterPlaceholder)}" autocomplete="off" />
+    <button class="tbtn" id="btnSelAll">${esc(t.selectAll)}</button>
+    <button class="tbtn" id="btnClear">${esc(t.clear)}</button>
+    <button class="tbtn" id="btnCollapse">${esc(t.collapseAll)}</button>
   </div>
   <div class="tree" id="tree"></div>
   <div class="foot">
-    <div class="count-line">已选 <b id="selCount">0</b> 个文件</div>
-    <button class="act" id="btnCancel">取消</button>
-    <button class="act primary" id="btnConfirm" disabled>纳入审查</button>
+    <div class="count-line">${esc(t.selectedPrefix)}<b id="selCount">0</b>${esc(t.selectedSuffix)}</div>
+    <button class="act" id="btnCancel">${esc(t.cancel)}</button>
+    <button class="act primary" id="btnConfirm" disabled>${esc(t.confirm)}</button>
   </div>
 <script nonce="${nonce}">
 (function () {
   const vscode = acquireVsCodeApi();
   const DATA = ${data};
+  const T = ${T};
   const $ = (id) => document.getElementById(id);
   const treeEl = $('tree');
 
@@ -266,7 +270,7 @@ function renderHtml(opts: ScopeTreeOptions): string {
   function render() {
     const rows = computeVisible();
     if (rows.length === 0) {
-      treeEl.innerHTML = '<div class="empty">没有匹配的文件</div>';
+      treeEl.innerHTML = '<div class="empty">' + T.noMatch + '</div>';
     } else {
       treeEl.innerHTML = rows.map(rowHtml).join('');
       // apply checkbox states (checked / indeterminate)
