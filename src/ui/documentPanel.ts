@@ -462,6 +462,7 @@ export class DocumentPanel {
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 let model = null;
+let loadedPath = null;
 let mode = 'source';
 const seen = new Set();
 let io = null;
@@ -757,12 +758,16 @@ function flushSeen() {
 
 function render() {
   $('fname').textContent = model.name;
+  // Switching to a different file should start at the top; refreshing the same
+  // file (e.g. after re-analysis) should keep the reader where they were.
+  const isNewFile = model.path !== loadedPath;
+  loadedPath = model.path;
   $('seg').style.display = model.isMarkdown ? 'flex' : 'none';
   seen.clear();
   for (const l of model.seen) seen.add(l);
   renderFindbar();
-  if (model.isMarkdown && mode !== 'source') { setMode('reading'); }
-  else { setMode('source'); }
+  if (model.isMarkdown && mode !== 'source') { setMode('reading', isNewFile); }
+  else { setMode('source', isNewFile); }
 }
 
 function renderFindbar() {
@@ -790,10 +795,12 @@ function renderFindbar() {
   }
 }
 
-function setMode(m) {
+function setMode(m, resetScroll) {
   $('m-read').classList.toggle('on', m === 'reading');
   $('m-src').classList.toggle('on', m === 'source');
-  const top = contentEl.scrollTop;
+  // Preserve scroll position when merely toggling the view mode; jump to the
+  // top when loading a different file (resetScroll).
+  const top = resetScroll ? 0 : contentEl.scrollTop;
   if (m === 'reading' && model.isMarkdown) renderReading(); else renderSource();
   contentEl.scrollTop = top;
 }
