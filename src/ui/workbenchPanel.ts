@@ -58,10 +58,8 @@ export interface WorkbenchState {
 /** Actions the workbench can trigger in the extension host. */
 export interface WorkbenchActions {
   open(path: string): void;
-  analyze(path: string): void;
   disposeFinding(path: string, id: string, kind: FindingDispositionKind): void;
   locate(path: string, line: number): void;
-  jumpNext(): void;
   globalAnalysis(): void;
   showGlobal(): void;
   submit(): void;
@@ -105,10 +103,8 @@ interface WorkbenchPatchSnapshot {
 
 type InboundMessage =
   | { type: 'select'; path: string }
-  | { type: 'analyze'; path: string }
   | { type: 'dispose'; path: string; id: string; kind: FindingDispositionKind }
   | { type: 'locate'; path: string; line: number }
-  | { type: 'jumpNext' }
   | { type: 'global' }
   | { type: 'showGlobal' }
   | { type: 'submit' }
@@ -309,17 +305,11 @@ export class WorkbenchPanel {
       case 'select':
         this.actions.open(msg.path);
         break;
-      case 'analyze':
-        this.actions.analyze(msg.path);
-        break;
       case 'dispose':
         this.actions.disposeFinding(msg.path, msg.id, msg.kind);
         break;
       case 'locate':
         this.actions.locate(msg.path, msg.line);
-        break;
-      case 'jumpNext':
-        this.actions.jumpNext();
         break;
       case 'global':
         this.actions.globalAnalysis();
