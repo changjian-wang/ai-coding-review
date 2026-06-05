@@ -1488,12 +1488,18 @@ async function pickGlobalScope(reviewSet: ReviewSet): Promise<ReviewFile[] | und
     return reviewSet.files;
   }
   const picked = await vscode.window.showQuickPick(
-    folders.map((f) => ({ label: `$(folder) ${f.dir}`, description: `${f.count} 个文件`, dir: f.dir })),
+    folders.map((f) => ({
+      label: `${f.indent}$(folder) ${f.name}`,
+      description: `${f.count} 个文件`,
+      detail: f.dir,
+      dir: f.dir,
+    })),
     {
       title: 'Code Review · 选择要分析的目录',
-      placeHolder: '输入目录名筛选，勾选一个或多个目录（可跨不同父目录）',
+      placeHolder: '输入目录名筛选，勾选一个或多个目录（勾选父目录含其全部子目录）',
       canPickMany: true,
       matchOnDescription: true,
+      matchOnDetail: true,
     },
   );
   if (!picked || picked.length === 0) {
@@ -1513,10 +1519,15 @@ async function pickGlobalScope(reviewSet: ReviewSet): Promise<ReviewFile[] | und
 
 /**
  * Collects every directory that contains at least one review file, with the
- * count of files under it (recursively). Sorted by path so sibling folders
- * group together; the reviewer narrows the list with the QuickPick search box.
+ * count of files under it (recursively). Sorted by path so the list reads as a
+ * hierarchy (parents immediately precede their children, siblings group
+ * together); each entry carries its leaf `name` and a depth-based `indent` so
+ * the flat QuickPick renders as an indented tree. The reviewer narrows the list
+ * with the QuickPick search box.
  */
-function collectReviewFolders(files: ReviewFile[]): { dir: string; count: number }[] {
+function collectReviewFolders(
+  files: ReviewFile[],
+): { dir: string; name: string; indent: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const f of files) {
     const parts = f.path.split('/');
@@ -1526,7 +1537,17 @@ function collectReviewFolders(files: ReviewFile[]): { dir: string; count: number
     }
   }
   return [...counts.entries()]
-    .map(([dir, count]) => ({ dir, count }))
+    .map(([dir, count]) => {
+      const parts = dir.split('/');
+      return {
+        dir,
+        count,
+        name: parts[parts.length - 1],
+        // Two spaces per depth level. QuickPick collapses leading whitespace in
+        // the rendered label only minimally, so this reliably reads as a tree.
+        indent: '\u2003'.repeat(parts.length - 1),
+      };
+    })
     .sort((a, b) => a.dir.localeCompare(b.dir));
 }
 
