@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { FileSystemScope, PrScope } from './scopes';
+import { pickScopeTree } from './scopePickerPanel';
 import type { ReviewScope } from './types';
 import { transientWarning } from '../ui/toast';
 
@@ -41,83 +42,30 @@ export async function pickScope(defaultCwd: string): Promise<PickedScope | undef
   return choice?.build();
 
   async function buildFileSystemScope(): Promise<PickedScope | undefined> {
-    const picked = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectFolders: true,
-      canSelectMany: true,
-      defaultUri: vscode.Uri.file(defaultCwd),
-      openLabel: '纳入审查',
-      title: 'Code Review · 选择源码文件或文件夹',
+    // Scan the whole project root once, then let the reviewer narrow down via a
+    // webview tree that is *locked* to this root. Because the tree is built only
+    // from paths under `defaultCwd`, nothing outside the project can be picked —
+    // unlike the native open dialog, which can wander out of the root and then
+    // fail with an error that is invisible when the workbench is full-screen.
+    const relPaths = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Code Review：正在扫描项目文件…' },
+      () => expandToRelPaths([vscode.Uri.file(defaultCwd)], defaultCwd),
+    );
+    if (relPaths.length === 0) {
+      transientWarning(
+        '当前项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
+      );
+      return undefined;
+    }
+    const picked = await pickScopeTree({
+      rootLabel: path.basename(defaultCwd) || defaultCwd,
+      relPaths,
     });
     if (!picked || picked.length === 0) {
       return undefined;
     }
-    // Map every picked URI to the workspace folder that contains it. Multi-root
-    // workspaces (.code-workspace files) may have several independent roots, so
-    // the "containing folder" depends on what the user picked.
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    const assignments: { uri: vscode.Uri; root: string }[] = [];
-    const outside: vscode.Uri[] = [];
-    for (const u of picked) {
-      const root = containingWorkspaceFolder(u.fsPath, folders);
-      if (root) {
-        assignments.push({ uri: u, root });
-      } else {
-        outside.push(u);
-      }
-    }
-    if (outside.length) {
-      const target = outside[0];
-      const action = await vscode.window.showErrorMessage(
-        `Code Review：所选路径不在当前工作区任何文件夹内，无法审查。请先把它加入工作区，或以工作区方式打开。`,
-        '在新窗口打开该目录…',
-      );
-      if (action) {
-        await vscode.commands.executeCommand('vscode.openFolder', target, { forceNewWindow: true });
-      }
-      return undefined;
-    }
-    // If the user picked items spanning multiple workspace folders, force a single
-    // root: review sessions key off one cwd (for git / gh operations).
-    const roots = new Set(assignments.map((a) => a.root));
-    if (roots.size > 1) {
-      void vscode.window.showWarningMessage(
-        'Code Review：所选范围跨越了多个工作区文件夹。一次审查只能针对一个仓库，请只选择同一个文件夹下的内容后重试。',
-      );
-      return undefined;
-    }
-    const chosenRoot = assignments[0].root;
-    const relPaths = await expandToRelPaths(
-      assignments.map((a) => a.uri),
-      chosenRoot,
-    );
-    if (relPaths.length === 0) {
-      transientWarning(
-        '所选范围内没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
-      );
-      return undefined;
-    }
-    return { scope: new FileSystemScope(relPaths), cwd: chosenRoot };
+    return { scope: new FileSystemScope(picked), cwd: defaultCwd };
   }
-}
-
-/** Returns the workspace folder fsPath that contains `target`, or undefined. */
-function containingWorkspaceFolder(
-  target: string,
-  folders: readonly vscode.WorkspaceFolder[],
-): string | undefined {
-  // Prefer the longest matching folder (handles nested workspace roots).
-  let best: string | undefined;
-  for (const f of folders) {
-    const root = f.uri.fsPath;
-    const rel = path.relative(root, target);
-    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-      if (!best || root.length > best.length) {
-        best = root;
-      }
-    }
-  }
-  return best;
 }
 
 /** Expands selected files/folders into a de-duplicated, sorted list of relative file paths. */
