@@ -17,7 +17,6 @@ import {
 } from './ai/analyzer';
 import type { Finding } from './ai/types';
 import { pickScope, buildFolderScope } from './scope/scopePicker';
-import type { ReviewFile, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { runWithProgress } from './ui/progressSteps';
@@ -44,6 +43,8 @@ let layoutAppliedForCurrentReview = false;
 const analyzingPaths = new Set<string>();
 /** Prevents duplicate global analysis calls for the same active review. */
 let globalAnalysisInFlight = false;
+/** Cancellation source for the in-flight global analysis, if any. */
+let globalAnalysisCts: vscode.CancellationTokenSource | undefined;
 
 function isReviewPath(relPath: string): boolean {
   return !!session.reviewSet?.files.some((f) => f.path === relPath);
@@ -454,6 +455,7 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     disposeFinding: (path, id, kind) => void disposeFinding(path, id, kind),
     locate: (path, line) => void locateInFile(path, line),
     globalAnalysis: () => void runGlobalAnalysis(),
+    cancelGlobalAnalysis: () => cancelGlobalAnalysis(),
     showGlobal: showGlobalReport,
     submit: () => void submitConclusion(),
     pickModel: () => void selectModel(),
@@ -1400,11 +1402,7 @@ async function runGlobalAnalysis(): Promise<void> {
     transientInfo('全局分析正在进行中，请稍候');
     return;
   }
-  const files = await pickGlobalScope(reviewSet);
-  if (!files) {
-    return;
-  }
-  const unready = files.filter((f) => !session.fileFullySeen(f.path));
+  const unready = reviewSet.files.filter((f) => !session.fileFullySeen(f.path));
   if (unready.length) {
     const pick = await vscode.window.showWarningMessage(
       `还有 ${unready.length} 个文件未读完，仍要进行全局分析吗？`,
@@ -1421,134 +1419,52 @@ async function runGlobalAnalysis(): Promise<void> {
     return;
   }
 
+  // Drive progress inline inside the workbench (where the reviewer is looking)
+  // instead of a parent-window notification, which is easy to miss when the
+  // workbench is in its own auxiliary window.
   globalAnalysisInFlight = true;
+  globalAnalysisCts = new vscode.CancellationTokenSource();
+  const token = globalAnalysisCts.token;
+  WorkbenchPanel.setGlobalProgress(true, '准备分析…');
   try {
-    await runWithProgress('Code Review：全局逻辑分析', async (token, report) => {
-      try {
-        const context: GlobalContextFile[] = [];
-        for (const f of files) {
-          report(`读取 ${f.path}…`);
-          context.push({
-            path: f.path,
-            findings: session.findings(f.path),
-            content: await readReviewFileText(f.path),
-          });
-        }
-        report('调用模型进行跨文件分析…');
-        const globalReport = await analyzeGlobal(model, context, token);
-        if (session.reviewSet !== reviewSet) {
-          return;
-        }
-        session.setGlobalReport(globalReport);
-        showGlobalReport();
-      } catch (err) {
-        reportError(err);
+    const context: GlobalContextFile[] = [];
+    for (const f of reviewSet.files) {
+      if (token.isCancellationRequested) {
+        return;
       }
-    });
+      WorkbenchPanel.setGlobalProgress(true, `读取 ${f.path}…`);
+      context.push({
+        path: f.path,
+        findings: session.findings(f.path),
+        content: await readReviewFileText(f.path),
+      });
+    }
+    WorkbenchPanel.setGlobalProgress(true, '调用模型进行跨文件分析…');
+    const globalReport = await analyzeGlobal(model, context, token);
+    if (session.reviewSet !== reviewSet || token.isCancellationRequested) {
+      return;
+    }
+    session.setGlobalReport(globalReport);
+    showGlobalReport();
+  } catch (err) {
+    if (!token.isCancellationRequested) {
+      reportError(err);
+    }
   } finally {
     globalAnalysisInFlight = false;
+    globalAnalysisCts?.dispose();
+    globalAnalysisCts = undefined;
+    WorkbenchPanel.setGlobalProgress(false);
   }
 }
 
-/**
- * Lets the reviewer scope a global (cross-file) analysis. The whole project is
- * loaded as the review set, but cross-file analysis is often only meaningful
- * for one feature area — so before running, offer to narrow the analysis to a
- * chosen set of directories. Returns the files to analyze, or `undefined` when
- * the reviewer cancels.
- */
-async function pickGlobalScope(reviewSet: ReviewSet): Promise<ReviewFile[] | undefined> {
-  const mode = await vscode.window.showQuickPick(
-    [
-      {
-        label: '$(check-all) 分析全部文件',
-        description: `${reviewSet.files.length} 个文件`,
-        all: true,
-      },
-      {
-        label: '$(list-selection) 仅分析选定的目录…',
-        description: '从项目中挑选要纳入跨文件分析的目录（可跨不同父目录）',
-        all: false,
-      },
-    ],
-    {
-      title: 'Code Review · 全局分析范围',
-      placeHolder: '选择要纳入跨文件分析的范围',
-    },
-  );
-  if (!mode) {
-    return undefined;
+/** Cancels the in-flight global analysis, if any. */
+function cancelGlobalAnalysis(): void {
+  if (globalAnalysisCts) {
+    globalAnalysisCts.cancel();
+    WorkbenchPanel.setGlobalProgress(false);
+    transientInfo('已取消全局分析');
   }
-  if (mode.all) {
-    return reviewSet.files;
-  }
-
-  const folders = collectReviewFolders(reviewSet.files);
-  if (folders.length === 0) {
-    return reviewSet.files;
-  }
-  const picked = await vscode.window.showQuickPick(
-    folders.map((f) => ({
-      label: `${f.indent}$(folder) ${f.name}`,
-      description: `${f.count} 个文件`,
-      detail: f.dir,
-      dir: f.dir,
-    })),
-    {
-      title: 'Code Review · 选择要分析的目录',
-      placeHolder: '输入目录名筛选，勾选一个或多个目录（勾选父目录含其全部子目录）',
-      canPickMany: true,
-      matchOnDescription: true,
-      matchOnDetail: true,
-    },
-  );
-  if (!picked || picked.length === 0) {
-    return undefined;
-  }
-  const dirs = picked.map((p) => p.dir);
-  const subset = reviewSet.files.filter((f) =>
-    dirs.some((d) => f.path === d || f.path.startsWith(d + '/')),
-  );
-  if (subset.length === 0) {
-    transientWarning('选定的目录下没有可分析的文件');
-    return undefined;
-  }
-  transientInfo(`全局分析范围：${dirs.length} 个目录 · ${subset.length} 个文件`);
-  return subset;
-}
-
-/**
- * Collects every directory that contains at least one review file, with the
- * count of files under it (recursively). Sorted by path so the list reads as a
- * hierarchy (parents immediately precede their children, siblings group
- * together); each entry carries its leaf `name` and a depth-based `indent` so
- * the flat QuickPick renders as an indented tree. The reviewer narrows the list
- * with the QuickPick search box.
- */
-function collectReviewFolders(
-  files: ReviewFile[],
-): { dir: string; name: string; indent: string; count: number }[] {
-  const counts = new Map<string, number>();
-  for (const f of files) {
-    const parts = f.path.split('/');
-    for (let i = 1; i < parts.length; i++) {
-      const dir = parts.slice(0, i).join('/');
-      counts.set(dir, (counts.get(dir) ?? 0) + 1);
-    }
-  }
-  return [...counts.entries()]
-    .map(([dir, count]) => {
-      const parts = dir.split('/');
-      return {
-        dir,
-        count,
-        name: parts[parts.length - 1],
-        // Two spaces per depth level. QuickPick collapses leading whitespace in
-        // the rendered label only minimally, so this reliably reads as a tree.
-        indent: '\u2003'.repeat(parts.length - 1),
-      };
-    })
-    .sort((a, b) => a.dir.localeCompare(b.dir));
 }
 
 function showGlobalReport(): void {

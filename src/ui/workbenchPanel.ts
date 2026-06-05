@@ -61,6 +61,7 @@ export interface WorkbenchActions {
   disposeFinding(path: string, id: string, kind: FindingDispositionKind): void;
   locate(path: string, line: number): void;
   globalAnalysis(): void;
+  cancelGlobalAnalysis(): void;
   showGlobal(): void;
   submit(): void;
   pickModel(): void;
@@ -106,6 +107,7 @@ type InboundMessage =
   | { type: 'dispose'; path: string; id: string; kind: FindingDispositionKind }
   | { type: 'locate'; path: string; line: number }
   | { type: 'global' }
+  | { type: 'cancelGlobal' }
   | { type: 'showGlobal' }
   | { type: 'submit' }
   | { type: 'pickModel' }
@@ -198,6 +200,20 @@ export class WorkbenchPanel {
   /** Re-renders the panel from current session state, if open. */
   static refreshIfOpen(): void {
     WorkbenchPanel.current?.scheduleRefresh();
+  }
+
+  /**
+   * Drives the inline global-analysis progress strip in the workbench (instead
+   * of a parent-window notification, which is easy to miss when the workbench
+   * lives in its own auxiliary window). `active` toggles the busy state; the
+   * optional `message` is the current step shown beneath the progress bar.
+   */
+  static setGlobalProgress(active: boolean, message?: string): void {
+    void WorkbenchPanel.current?.panel.webview.postMessage({
+      type: 'globalProgress',
+      active,
+      message: message ?? '',
+    });
   }
 
   /** Clears persisted folder expand/collapse state so a new review re-initialises it. */
@@ -313,6 +329,9 @@ export class WorkbenchPanel {
         break;
       case 'global':
         this.actions.globalAnalysis();
+        break;
+      case 'cancelGlobal':
+        this.actions.cancelGlobalAnalysis();
         break;
       case 'showGlobal':
         this.actions.showGlobal();
@@ -487,6 +506,15 @@ export class WorkbenchPanel {
   .toolbar .grp-label { font-size:.64rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:.2rem 0 -.05rem; }
   .toolbar .row { display:flex; gap:.4rem; }
   .toolbar .row button { flex:1; }
+  /* inline global-analysis progress */
+  .global-prog { display:flex; flex-direction:column; gap:.32rem; margin:.1rem 0 .15rem; }
+  .global-prog[hidden] { display:none; }
+  .gp-bar { position:relative; height:3px; border-radius:3px; overflow:hidden; background:var(--line); }
+  .gp-fill { position:absolute; top:0; left:0; height:100%; width:36%; border-radius:3px; background:var(--blue); animation:gpSlide 1.1s ease-in-out infinite; }
+  @keyframes gpSlide { 0% { left:-40%; } 100% { left:100%; } }
+  .gp-foot { display:flex; align-items:center; gap:.5rem; }
+  .gp-msg { flex:1; font-size:.7rem; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .gp-cancel { flex:none; font-size:.68rem; padding:.18rem .45rem; }
   .model-row { display:flex; align-items:center; gap:.4rem; margin-top:.3rem; padding-top:.5rem; border-top:1px dashed var(--line); }
   .model-label { flex:1; font-size:.74rem; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .model-label b { color:var(--blue); font-weight:600; }
@@ -518,6 +546,13 @@ export class WorkbenchPanel {
         <div class="row">
           <button id="global">全局逻辑分析</button>
           <button id="showGlobal" ${state.hasGlobalReport ? '' : 'disabled'}>查看全局结论</button>
+        </div>
+        <div class="global-prog" id="globalProg" hidden>
+          <div class="gp-bar"><div class="gp-fill"></div></div>
+          <div class="gp-foot">
+            <span class="gp-msg" id="globalProgMsg"></span>
+            <button class="gp-cancel" id="globalCancel">取消</button>
+          </div>
         </div>
         <div class="model-row">
           <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">模型：<b>${esc(state.modelLabel)}</b></span>
@@ -720,13 +755,25 @@ export class WorkbenchPanel {
   });
 
   byId('global')?.addEventListener('click', () => send({ type:'global' }));
+  byId('globalCancel')?.addEventListener('click', () => send({ type:'cancelGlobal' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
   byId('pickScope')?.addEventListener('click', () => send({ type:'pickScope' }));
   byId('submit')?.addEventListener('click', () => send({ type:'submit' }));
 
+  function setGlobalProgress(active, message) {
+    const wrap = byId('globalProg');
+    const btn = byId('global');
+    const cancel = byId('globalCancel');
+    if (btn) { btn.disabled = !!active; btn.textContent = active ? '分析中…' : '全局逻辑分析'; }
+    if (cancel) cancel.disabled = false;
+    if (wrap) wrap.hidden = !active;
+    if (active) { const m = byId('globalProgMsg'); if (m) m.textContent = message || ''; }
+  }
+
   window.addEventListener('message', (e) => {
     const msg = e.data;
+    if (msg && msg.type === 'globalProgress') { setGlobalProgress(msg.active, msg.message); return; }
     if (!msg || msg.type !== 'patch') return;
     (msg.files || []).forEach((p) => {
       const r = rowByPath.get(p.path);
