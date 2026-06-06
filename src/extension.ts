@@ -513,11 +513,16 @@ async function selectLanguage(): Promise<void> {
 
 /** Opens (or reveals) the Review Workbench webview. */
 async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<void> {
+  // Snapshot BEFORE show(): only a freshly created panel may be relocated to a
+  // new window. If the workbench already exists it may already live in its own
+  // auxiliary window — moving it again spawns a second empty window and leaves
+  // the previous one behind as an empty husk (the blank watermark frames).
+  const alreadyOpen = WorkbenchPanel.isOpen;
   WorkbenchPanel.show(buildWorkbenchState, workbenchActions());
-  // Relocate to a dedicated window immediately — before any file open or layout
-  // work — so the panel appears to open directly in its own window rather than
-  // flashing as a tab in the current one first.
-  if (opts.moveToNewWindow) {
+  if (opts.moveToNewWindow && !alreadyOpen) {
+    // Relocate to a dedicated window immediately — before any file open or layout
+    // work — so the panel appears to open directly in its own window rather than
+    // flashing as a tab in the current one first.
     try {
       await vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
     } catch (err) {
@@ -527,13 +532,11 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
     // Beside column; drop it so the next file opens beside the relocated panel.
     DocumentPanel.closeIfOpen();
   }
-  // Intentionally do NOT open the first review file — leave the document column
-  // blank so the user picks what to review. We still apply the split layout so
-  // the empty editor group is visible beside the workbench.
-  if (session.reviewSet && !layoutAppliedForCurrentReview) {
-    layoutAppliedForCurrentReview = true;
-    await applyWorkbenchLayout();
-  }
+  // Intentionally do NOT open the first review file and do NOT pre-create an
+  // empty editor group beside the workbench: an empty group shows only the VS
+  // Code watermark and, in an auxiliary window, keeps that window alive as a
+  // blank husk. The split ratio is applied lazily the first time a file is
+  // actually opened (see openFileInPanel).
 }
 
 /** Builds the action callbacks the workbench webview dispatches to. */
@@ -609,14 +612,15 @@ async function restoreLastScope(cwd: string): Promise<void> {
 /**
  * Sets the editor group split ratio so the workbench sidebar (column 1) is
  * narrow enough to act as a tool window while the document viewer (column 2)
- * gets the bulk of the width. Only invoked when the workbench is first opened
- * — subsequent file switches keep whatever ratio the user dragged to.
+ * gets the bulk of the width. Invoked the first time a file is opened in a
+ * review (once the document group exists); later file switches keep whatever
+ * ratio the user dragged to.
  */
 async function applyWorkbenchLayout(): Promise<void> {
   try {
     await vscode.commands.executeCommand('vscode.setEditorLayout', {
       orientation: 0,
-      groups: [{ size: 0.3 }, { size: 0.7 }],
+      groups: [{ size: 0.2 }, { size: 0.8 }],
     });
   } catch {
     // Older VS Code versions or missing second group — ignore.
@@ -745,6 +749,14 @@ async function openFileInPanel(relPath: string): Promise<void> {
     return; // anchoring may have yielded; bail before overwriting the panel.
   }
   DocumentPanel.show(buildDocModel(relPath, render, anchors), docActions());
+  // Showing the document beside the workbench just created the second editor
+  // group. Apply the narrow-workbench / wide-document split once per review now
+  // that there is real content to size — rather than pre-creating an empty group
+  // when the workbench opens (which would linger as a blank watermark frame).
+  if (!layoutAppliedForCurrentReview) {
+    layoutAppliedForCurrentReview = true;
+    await applyWorkbenchLayout();
+  }
   WorkbenchPanel.refreshIfOpen();
 }
 

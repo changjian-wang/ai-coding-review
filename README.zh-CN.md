@@ -2,9 +2,11 @@
 
 > 不信任驱动的代码审查：**每一行都必须被看过**。把 “Review = 不信任” 做成硬门禁——逐行通读 + 文件级 AI 分析 + 逐条处置每个问题 + 跨文件全局分析，全部完成才允许给出审查结论。
 
-`v0.0.47` · VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
+`v0.0.50` · VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 
 [English](README.md) | 简体中文
+
+<img src="docs/images/workbench-zh.png" width="820" alt="代码审查工作台" />
 
 ## 核心理念
 
@@ -27,7 +29,9 @@
 
 - 文件树 + 每文件 / 整体覆盖进度 + findings 汇总 + 动作按钮，集中在一个 Webview
 - 可弹出到独立窗口（类似 “Open in Agents Window”）
-- 窗口重载后自动恢复审查与工作台，无需重新选范围- **Token 统计（估算）**：HUD 一行展示估算的 LLM token（↑输入 ↓输出），hover 看按操作分桁明细，随审查累计并持久化；由 `countTokens` 本地估算，非服务商计费 token
+- 窗口重载后自动恢复审查与工作台，无需重新选范围
+- **Token 统计（估算）**：HUD 一行展示估算的 LLM token（↑输入 ↓输出），hover 看按操作分桶明细，随审查累计并持久化；由 `countTokens` 本地估算，非服务商计费 token
+
 ### 逐文件审查
 
 - 逐行覆盖追踪与「跳到下一处未读行」
