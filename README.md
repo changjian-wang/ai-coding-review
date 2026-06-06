@@ -2,7 +2,7 @@
 
 > Distrust-driven code review: **every line must be looked at**. "Review = distrust" turned into a hard gate — read line-by-line + file-level AI analysis + dispose of every finding + cross-file global analysis. Only when all of that is done are you allowed to submit a conclusion.
 
-`v0.0.46` · VS Code extension · powered by the GitHub CLI and Copilot models
+`v0.0.47` · VS Code extension · powered by the GitHub CLI and Copilot models
 
 English | [简体中文](README.zh-CN.md)
 
@@ -28,6 +28,7 @@ English | [简体中文](README.zh-CN.md)
 - File tree + per-file / overall coverage progress + findings summary + action buttons, all in one webview
 - Can be popped out into a separate window (like "Open in Agents Window")
 - Auto-restores the review and workbench after a window reload — no need to re-pick the scope
+- **Token accounting (estimated)**: a HUD row shows estimated LLM tokens (↑input ↓output) with a per-operation breakdown on hover, accumulated over the review and persisted; estimated locally via `countTokens`, not the provider's billed counts
 
 ### Per-file review
 
@@ -35,6 +36,7 @@ English | [简体中文](README.zh-CN.md)
 - File-level AI analysis → findings with severity levels
 - Every finding must be disposed: **fixed / commented / ignored (reason required)**
 - Fix proposals: Copilot generates mutually-exclusive "multi-edit = one complete solution" candidates, one-click apply + one-click undo, with applied snapshots persisted
+- **Reviewer context before a fix**: when the model's read of a finding is off, add a supplementary note in the fix panel; it overrides the finding when generating proposals and is persisted per finding
 - Selection translation / code explanation annotations
 
 ### Global analysis
