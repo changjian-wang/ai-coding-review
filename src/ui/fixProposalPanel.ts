@@ -183,7 +183,12 @@ export class FixProposalPanel {
       if (cached) {
         // Restore the reviewer's prior supplement so it stays in the textarea.
         this.currentSupplement = cached.supplement ?? '';
+      } else {
+        // New finding with no cached context: do not leak the previous finding's
+        // supplement into this textarea.
+        this.currentSupplement = '';
       }
+      this.syncSupplementInput();
       if (cached && cached.proposals.length > 0) {
         try {
           await this.restoreFromCache(cached);
@@ -197,6 +202,7 @@ export class FixProposalPanel {
     // regenerate action, else whatever the reviewer last entered.
     const supplement = options?.supplement ?? this.currentSupplement;
     this.currentSupplement = supplement;
+    this.syncSupplementInput();
     const cts = new vscode.CancellationTokenSource();
     this.generating = cts;
     this.setState({ kind: 'loading', message: m().fixPanel.generating });
@@ -473,6 +479,14 @@ export class FixProposalPanel {
     void this.refreshHeader();
   }
 
+  /** Pushes the current supplement into the webview textarea when context switches. */
+  private syncSupplementInput(): void {
+    this.panel.webview.postMessage({
+      type: 'supplement',
+      value: this.currentSupplement,
+    });
+  }
+
   /**
    * Updates the header's `rel · 第 N 行` label. When a proposal has been applied,
    * N follows the live content by anchoring to the **last line** of the applied
@@ -710,6 +724,11 @@ export class FixProposalPanel {
       const msg = e.data;
       if (msg && msg.type === 'state') {
         render(msg.state);
+      } else if (msg && msg.type === 'supplement') {
+        if (suppEl) {
+          suppEl.value = String(msg.value ?? '');
+          syncRegenLabel();
+        }
       } else if (msg && msg.type === 'header') {
         const el = document.getElementById('subline');
         if (el) el.textContent = msg.rel + ' · ' + fmt(T.line, msg.line);
