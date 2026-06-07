@@ -2,9 +2,9 @@
 
 > 不信任驱动的代码审查：**每一行都必须被看过**。把 “Review = 不信任” 做成硬门禁——逐行通读 + 文件级 AI 分析 + 逐条处置每个问题 + 跨文件全局分析，全部完成才允许给出审查结论。
 
-[![VS Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/codereview-dev.codereview?label=Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.codereview)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/codereview-dev.codereview)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.codereview)
-[![Rating](https://img.shields.io/visual-studio-marketplace/r/codereview-dev.codereview)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.codereview)
+[![VS Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/codereview-dev.code-review-gate?label=Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.code-review-gate)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/codereview-dev.code-review-gate)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.code-review-gate)
+[![Rating](https://img.shields.io/visual-studio-marketplace/r/codereview-dev.code-review-gate)](https://marketplace.visualstudio.com/items?itemName=codereview-dev.code-review-gate)
 
 VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 

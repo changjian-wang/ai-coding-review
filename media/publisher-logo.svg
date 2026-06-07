@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b2540"/>
+      <stop offset="1" stop-color="#15101f"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c8a6e8"/>
+      <stop offset="1" stop-color="#8a63c4"/>
+    </linearGradient>
+    <radialGradient id="glass" cx="0.35" cy="0.3" r="0.9">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="0.55" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.12"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="128" height="128" rx="28" ry="28" fill="url(#bg)"/>
+
+  <!-- magnifier, centered -->
+  <g transform="translate(52 52)">
+    <!-- handle -->
+    <line x1="22" y1="22" x2="44" y2="44" stroke="#15101f" stroke-width="17" stroke-linecap="round"/>
+    <line x1="22" y1="22" x2="44" y2="44" stroke="url(#lens)" stroke-width="12" stroke-linecap="round"/>
+    <!-- lens -->
+    <circle cx="0" cy="0" r="34" fill="#15101f"/>
+    <circle cx="0" cy="0" r="34" fill="url(#glass)"/>
+    <circle cx="0" cy="0" r="34" fill="none" stroke="url(#lens)" stroke-width="10"/>
+    <!-- checkmark -->
+    <path d="M -15 1 L -3 13 L 17 -12" fill="none" stroke="#4ec9b0" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

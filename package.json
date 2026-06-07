@@ -1,5 +1,5 @@
 {
-  "name": "codereview",
+  "name": "code-review-gate",
   "displayName": "Code Review Gate",
   "description": "Distrust-driven code review: per-line coverage gate plus file-level and cross-file AI analysis, powered by the GitHub CLI and VS Code's Copilot models.",
   "version": "0.0.50",
