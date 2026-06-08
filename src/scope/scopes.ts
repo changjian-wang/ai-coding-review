@@ -75,13 +75,17 @@ export class WorkingTreeScope implements ReviewScope {
 export class FileSystemScope implements ReviewScope {
   constructor(private readonly relPaths: string[]) {}
 
-  async load(cwd: string): Promise<ReviewSet> {
-    const headSha = await git.headShaOrLive(cwd);
+  async load(_cwd: string): Promise<ReviewSet> {
     const files: ReviewFile[] = this.relPaths.map((path) => ({ path }));
     return {
       scopeId: `files-${files.length}-${hashPaths(this.relPaths)}`,
       label: m().scope.selectedSources(files.length),
-      headSha,
+      // Pure source review is about the working-tree source, not a specific
+      // commit — so the snapshot is NOT bound to a git SHA. Using a fixed
+      // 'live' head keeps review progress (findings / seen / dispositions /
+      // annotations) intact across pulls, commits and branch switches. Diff
+      // scopes (PR / branch-vs-base) still pin to a real SHA on purpose.
+      headSha: 'live',
       files,
     };
   }

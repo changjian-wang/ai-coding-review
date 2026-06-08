@@ -111,6 +111,13 @@ export interface ReviewStore {
   load(key: ReviewKey): Promise<ReviewSnapshot | undefined>;
   save(snapshot: ReviewSnapshot): Promise<void>;
   clear(key: ReviewKey): Promise<void>;
+  /**
+   * Finds the most recently-updated snapshot for the same repo + scopeId
+   * regardless of headSha. Used to migrate a pure-source review whose key
+   * stopped being bound to a git SHA, so prior progress isn't orphaned.
+   * Returns undefined when the store can't enumerate keys.
+   */
+  findLatestForScope?(repo: string, scopeId: string): Promise<ReviewSnapshot | undefined>;
 }
 
 /** Local, single-machine store backed by VS Code workspaceState. */
@@ -130,5 +137,20 @@ export class WorkspaceStateReviewStore implements ReviewStore {
 
   async clear(key: ReviewKey): Promise<void> {
     await this.memento.update(storageKey(key), undefined);
+  }
+
+  async findLatestForScope(repo: string, scopeId: string): Promise<ReviewSnapshot | undefined> {
+    const prefix = `codereview:review:${repo}#${scopeId}@`;
+    let best: ReviewSnapshot | undefined;
+    for (const key of this.memento.keys()) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const snap = this.memento.get<ReviewSnapshot>(key);
+      if (snap && (!best || (snap.updatedAt ?? 0) > (best.updatedAt ?? 0))) {
+        best = snap;
+      }
+    }
+    return best;
   }
 }

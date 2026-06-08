@@ -33,15 +33,6 @@ export async function ensureGitRepo(cwd: string): Promise<void> {
   }
 }
 
-/** Current HEAD commit SHA, or "live" when not in a git repo. */
-export async function headShaOrLive(cwd: string): Promise<string> {
-  try {
-    return (await git(['rev-parse', 'HEAD'], cwd)).trim();
-  } catch {
-    return 'live';
-  }
-}
-
 /** Current HEAD commit SHA. */
 export async function headSha(cwd: string): Promise<string> {
   return (await git(['rev-parse', 'HEAD'], cwd)).trim();

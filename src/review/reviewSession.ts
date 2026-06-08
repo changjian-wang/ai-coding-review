@@ -51,6 +51,19 @@ export class ReviewSession {
     };
     let snapshot = await this.store.load(key);
 
+    // Migration: a pure-source review's key used to embed the git HEAD SHA, but
+    // now uses a fixed 'live' head so progress survives commits/pulls. If the
+    // new key misses, adopt the most recent legacy snapshot for the same
+    // repo+scopeId and re-save it under the new key so prior progress carries
+    // over once.
+    if (!snapshot && reviewSet.headSha === 'live' && this.store.findLatestForScope) {
+      const legacy = await this.store.findLatestForScope(this.repoName, reviewSet.scopeId);
+      if (legacy) {
+        snapshot = { ...legacy, headSha: 'live' };
+        await this.store.save(snapshot);
+      }
+    }
+
     if (!snapshot) {
       const perFile: Record<string, PerFileState> = {};
       for (const f of reviewSet.files) {
