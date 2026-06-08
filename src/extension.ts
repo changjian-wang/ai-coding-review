@@ -1055,6 +1055,17 @@ async function annotateWithTranslation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  // Reuse an existing translation for the same selection (see explanation note).
+  const existing = findAnnotation(path, 'translate', text, startLine);
+  if (existing) {
+    DocumentPanel.setAiBusy(path, false);
+    await refreshDocPanel(path);
+    if (existing.endLine > 0) {
+      DocumentPanel.scrollTo(existing.startLine, existing.endLine);
+    }
+    transientInfo(m().analysis.reuseTranslation);
+    return;
+  }
   const model = await models.resolve();
   if (!model) {
     DocumentPanel.setAiBusy(path, false);
@@ -1086,6 +1097,33 @@ async function annotateWithTranslation(
   );
 }
 
+/**
+ * Finds an existing annotation of `kind` for the same selection, so repeated
+ * explain/translate clicks reuse the saved result instead of appending a new
+ * (differently-worded) one. Matches on the verbatim selection text; when a line
+ * is known, also requires the start line to match so identical text at two
+ * different places stays distinct.
+ */
+function findAnnotation(
+  path: string,
+  kind: Annotation['kind'],
+  sourceText: string,
+  startLine: number,
+): Annotation | undefined {
+  const needle = sourceText.trim();
+  if (!needle) {
+    return undefined;
+  }
+  return session
+    .annotations(path)
+    .find(
+      (a) =>
+        a.kind === kind &&
+        a.sourceText.trim() === needle &&
+        (startLine <= 0 || a.startLine <= 0 || a.startLine === startLine),
+    );
+}
+
 /** Explains the selected code and stores it as a persisted annotation. */
 async function annotateWithExplanation(
   path: string,
@@ -1093,6 +1131,19 @@ async function annotateWithExplanation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  // Reuse an existing explanation for the same selection instead of calling the
+  // model again (which would append a second, differently-worded card). The
+  // result is persisted, so the saved one is what the user asked to "explain".
+  const existing = findAnnotation(path, 'explain', text, startLine);
+  if (existing) {
+    DocumentPanel.setAiBusy(path, false);
+    await refreshDocPanel(path);
+    if (existing.endLine > 0) {
+      DocumentPanel.scrollTo(existing.startLine, existing.endLine);
+    }
+    transientInfo(m().analysis.reuseExplanation);
+    return;
+  }
   const model = await models.resolve();
   if (!model) {
     DocumentPanel.setAiBusy(path, false);

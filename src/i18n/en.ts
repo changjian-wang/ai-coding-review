@@ -72,6 +72,8 @@ export const en = {
   analysis: {
     translating: 'Code Review: translating…',
     explaining: 'Code Review: explaining…',
+    reuseExplanation: 'Already explained — showing the saved result (delete it to regenerate)',
+    reuseTranslation: 'Already translated — showing the saved result (delete it to regenerate)',
     pickFileToAnalyze: 'Pick a file to analyze in the workbench first',
     pickFile: 'Pick a file in the workbench first',
     deletedFileHandled: (rel: string) =>

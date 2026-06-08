@@ -61,6 +61,8 @@ export const zh: Messages = {
   analysis: {
     translating: 'Code Review：翻译中…',
     explaining: 'Code Review：解释中…',
+    reuseExplanation: '这段已解释过，已为你显示之前的结果（删除后可重新生成）',
+    reuseTranslation: '这段已翻译过，已为你显示之前的结果（删除后可重新生成）',
     pickFileToAnalyze: '请先在工作台中选择要分析的文件',
     pickFile: '请先在工作台中选择一个文件',
     deletedFileHandled: (rel) => `${rel} 是删除文件，已作为无需源文件分析处理`,
