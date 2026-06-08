@@ -319,6 +319,8 @@ export class DocumentPanel {
   .gutter { flex:none; width:52px; text-align:right; padding-right:12px; color:var(--dim); user-select:none; opacity:.6; }
   .ln.seen .gutter { color:var(--green); opacity:1; }
   .ln.seen { box-shadow:inset 2px 0 0 var(--green); }
+  .ln.locate-hit { background:rgba(197,134,192,.16); box-shadow:inset 3px 0 0 #c586c0; }
+  .ln.locate-hit.seen { box-shadow:inset 3px 0 0 #c586c0, inset 5px 0 0 var(--green); }
   .code { flex:1; }
   .fmark { position:absolute; left:2px; width:6px; height:6px; border-radius:50%; top:.45em; }
   .fmark.bug { background:var(--red); }
@@ -486,6 +488,9 @@ const seen = new Set();
 let io = null;
 const visible = new Set();
 let seenTimer = null;
+// Persistent 「定位」 highlight: stays lit until you locate elsewhere or switch
+// files, instead of flashing and fading. Re-applied after every source render.
+let locatedRange = null;
 
 const $ = (id) => document.getElementById(id);
 const contentEl = $('content');
@@ -780,6 +785,8 @@ function render() {
   // file (e.g. after re-analysis) should keep the reader where they were.
   const isNewFile = model.path !== loadedPath;
   loadedPath = model.path;
+  // A located highlight belongs to the file it was set in; drop it on switch.
+  if (isNewFile) locatedRange = null;
   // Drive the analyze button from this file's real state, so switching away from
   // an analyzing file shows the new file's (idle) button instead of a stuck
   // 分析中… left over from the previous file.
@@ -825,6 +832,27 @@ function setMode(m, resetScroll) {
   const top = resetScroll ? 0 : contentEl.scrollTop;
   if (m === 'reading' && model.isMarkdown) renderReading(); else renderSource();
   contentEl.scrollTop = top;
+  // A full source re-render drops per-row classes, so re-paint the persistent
+  // locate highlight onto the (possibly freshly rendered) rows.
+  applyLocateHighlight();
+}
+
+// Persistent locate highlight -------------------------------------------------
+function clearLocateHighlight() {
+  const prev = contentEl.querySelectorAll('.ln.locate-hit');
+  for (const r of prev) r.classList.remove('locate-hit');
+}
+
+function applyLocateHighlight() {
+  clearLocateHighlight();
+  if (!locatedRange) return;
+  // Rows stream in chunks on large files; force-render up to the target so the
+  // highlight always lands even right after a mode toggle / re-render.
+  ensureSrcRenderedThrough(locatedRange.end);
+  for (let l = locatedRange.start; l <= locatedRange.end; l++) {
+    const row = contentEl.querySelector('.ln[data-line="' + l + '"]');
+    if (row) row.classList.add('locate-hit');
+  }
 }
 
 // Selection popover -------------------------------------------------------
@@ -911,15 +939,11 @@ window.addEventListener('message', (ev) => {
     const end = (msg.endLine && msg.endLine > start) ? msg.endLine : start;
     // The target line may not be rendered yet on a large file — flush up to it.
     ensureSrcRenderedThrough(end);
+    // Persistent highlight: stays lit until the next locate or a file switch.
+    locatedRange = { start: start, end: end };
+    applyLocateHighlight();
     const first = contentEl.querySelector('.ln[data-line="' + start + '"]');
     if (first) first.scrollIntoView({ block:'center' });
-    for (let l = start; l <= end; l++) {
-      const row = contentEl.querySelector('.ln[data-line="' + l + '"]');
-      if (!row) continue;
-      row.style.transition='background .6s';
-      row.style.background='rgba(197,134,192,.3)';
-      setTimeout((function(r){ return function(){ r.style.background=''; }; })(row), 1100);
-    }
   }
 });
 

@@ -836,20 +836,20 @@ function buildDocModel(
 }
 
 /**
- * Computes live-document anchors for every finding that has an applied Copilot
- * fix. Reads the file text once and locates each fix's `newText`, returning a
- * map of findingId → 1-based start/last line. Findings without an applied fix
- * (or whose snippet can no longer be found) are omitted, so callers fall back to
- * the stored snapshot lines. This mirrors {@link reanchorToAppliedFix} but
- * batches a whole file in a single read.
+ * Computes live-document anchors for findings in a file. Reads the file text
+ * once and, per finding, locates either the applied fix's current `newText` or
+ * (when no fix is applied) the finding's verbatim `anchor` snippet, returning a
+ * map of findingId → 1-based start/last line. Findings whose snippet can no
+ * longer be found are omitted, so callers fall back to the stored snapshot
+ * lines. This keeps the inline card's line in sync with the real code and with
+ * the 「定位」 action, instead of the model's (sometimes wrong) reported line.
  */
 async function computeFindingAnchors(
   relPath: string,
 ): Promise<Map<string, { line: number; endLine: number }>> {
   const anchors = new Map<string, { line: number; endLine: number }>();
   const findings = session.findings(relPath);
-  const pending = findings.filter((f) => appliedFixes.has(fixKey(relPath, f.id)));
-  if (pending.length === 0) {
+  if (findings.length === 0) {
     return anchors;
   }
   const cwd = activeCwd();
@@ -860,12 +860,17 @@ async function computeFindingAnchors(
     const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), relPath);
     const doc = await vscode.workspace.openTextDocument(fileUri);
     const docLines = doc.getText().split(/\r?\n/);
-    for (const f of pending) {
+    for (const f of findings) {
       const edit = appliedFixes.get(fixKey(relPath, f.id));
-      if (!edit) {
+      // Anchor the inline card to real code: prefer an applied fix's current
+      // text, otherwise the finding's verbatim `anchor` snippet. This keeps the
+      // card's line in sync with the actual code (and with the 「定位」 action),
+      // instead of the model's reported line number which can be off.
+      const snippet = edit?.newText ?? f.anchor;
+      if (!snippet) {
         continue;
       }
-      const hit = locateSnippetLines(docLines, edit.newText);
+      const hit = locateSnippetLines(docLines, snippet);
       if (hit) {
         anchors.set(f.id, hit);
       }
