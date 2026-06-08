@@ -51,6 +51,8 @@ export interface DocActions {
   explain(path: string, startLine: number, endLine: number, text: string): void;
   note(path: string, startLine: number, endLine: number, text: string): void;
   removeAnnotation(path: string, id: string): void;
+  /** Re-runs the model for an AI annotation (translate/explain), replacing it. */
+  regenerateAnnotation(path: string, id: string): void;
   disposeFinding(path: string, id: string, kind: DocFindingDisposition): void;
   /** Opens the fix-proposal panel for a finding to *view* it, without changing its disposition. */
   viewFix(path: string, id: string): void;
@@ -66,6 +68,7 @@ type Inbound =
   | { type: 'explain'; startLine: number; endLine: number; text: string }
   | { type: 'note'; startLine: number; endLine: number; text: string }
   | { type: 'removeAnnotation'; id: string }
+  | { type: 'regenerateAnnotation'; id: string }
   | { type: 'dispose'; id: string; kind: DocFindingDisposition }
   | { type: 'viewFix'; id: string }
   | { type: 'locate'; line: number; endLine?: number; id?: string }
@@ -214,6 +217,9 @@ export class DocumentPanel {
         break;
       case 'removeAnnotation':
         this.actions.removeAnnotation(path, m.id);
+        break;
+      case 'regenerateAnnotation':
+        this.actions.regenerateAnnotation(path, m.id);
         break;
       case 'dispose':
         this.actions.disposeFinding(path, m.id, m.kind);
@@ -411,6 +417,8 @@ export class DocumentPanel {
   .anno-head { display:flex; align-items:center; gap:8px; padding:6px 10px; cursor:pointer; }
   .anno-kind { color:var(--purple); font-weight:600; }
   .anno-where { color:var(--dim); font-size:11px; }
+  .anno-regen { margin-left:auto; opacity:.6; padding:0 6px; }
+  .anno-regen:hover { opacity:1; color:var(--blue); }
   .anno-x { margin-left:auto; opacity:.6; padding:0 6px; }
   .anno-x:hover { opacity:1; color:var(--red); }
   .anno-body { padding:0 10px 10px; line-height:1.6; white-space:pre-wrap; }
@@ -604,17 +612,21 @@ function findingCard(f) {
 function annoCard(a) {
   const where = a.startLine > 0 ? (a.endLine > a.startLine ? fmt(T.annoLineRange, a.startLine, a.endLine) : fmt(T.annoLine, a.startLine)) : T.annoSelection;
   const kind = a.kind === 'translate' ? T.annoTranslate : a.kind === 'explain' ? T.annoExplain : T.annoNote;
+  const isAi = a.kind === 'translate' || a.kind === 'explain';
   const div = document.createElement('div');
   div.className = 'anno anno-' + a.kind;
   div.innerHTML =
     '<div class="anno-head"><span class="anno-kind">' + kind + '</span>' +
     '<span class="anno-where">' + where + '</span>' +
+    (isAi ? '<span class="anno-regen" title="' + T.regenerate + '">⟳</span>' : '') +
     '<span class="anno-x" title="' + T.delete + '">✕</span></div>' +
     '<div class="anno-body"></div>';
   div.querySelector('.anno-body').textContent = a.content;
   div.querySelector('.anno-head').addEventListener('click', (e) => {
     if (e.target.classList.contains('anno-x')) {
       vscode.postMessage({ type:'removeAnnotation', id:a.id });
+    } else if (e.target.classList.contains('anno-regen')) {
+      vscode.postMessage({ type:'regenerateAnnotation', id:a.id });
     } else {
       div.classList.toggle('collapsed');
     }

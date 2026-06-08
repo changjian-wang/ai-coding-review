@@ -274,6 +274,7 @@ export const zh: Messages = {
     annoTranslate: '译文',
     annoExplain: '解释',
     annoNote: '批注',
+    regenerate: '重新生成',
     delete: '删除',
     otherFindings: '其他发现',
     unlocatedAnnotations: '未定位批注',

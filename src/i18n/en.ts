@@ -306,6 +306,7 @@ export const en = {
     annoTranslate: 'Translation',
     annoExplain: 'Explanation',
     annoNote: 'Note',
+    regenerate: 'Regenerate',
     delete: 'Delete',
     otherFindings: 'Other findings',
     unlocatedAnnotations: 'Unlocated annotations',

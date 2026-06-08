@@ -1033,6 +1033,7 @@ function docActions() {
       session.removeAnnotation(path, id);
       refreshDocPanel(path);
     },
+    regenerateAnnotation: (path: string, id: string) => void regenerateAnnotation(path, id),
     disposeFinding: (path: string, id: string, kind: FindingDispositionKind) => {
       void disposeFinding(path, id, kind);
     },
@@ -1095,6 +1096,28 @@ async function annotateWithTranslation(
       }
     },
   );
+}
+
+/**
+ * Re-runs the model for an existing AI annotation (translate/explain): removes
+ * the current one, then regenerates from its stored `sourceText`. Lets the
+ * reviewer get a fresh answer when unhappy with the current one, without having
+ * to re-select the code. No-op for note annotations (not model-generated).
+ */
+async function regenerateAnnotation(path: string, id: string): Promise<void> {
+  const existing = session.annotations(path).find((a) => a.id === id);
+  if (!existing || (existing.kind !== 'explain' && existing.kind !== 'translate')) {
+    return;
+  }
+  const { kind, startLine, endLine, sourceText } = existing;
+  // Drop the old one first so the reuse short-circuit doesn't just re-show it.
+  session.removeAnnotation(path, id);
+  DocumentPanel.setAiBusy(path, true);
+  if (kind === 'explain') {
+    await annotateWithExplanation(path, startLine, endLine, sourceText);
+  } else {
+    await annotateWithTranslation(path, startLine, endLine, sourceText);
+  }
 }
 
 /**
