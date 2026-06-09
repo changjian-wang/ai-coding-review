@@ -136,6 +136,44 @@ export class FixProposalPanel {
     } catch {
       FixProposalPanel.cache = new Map();
     }
+    FixProposalPanel.migrateLegacyKeys();
+  }
+
+  /**
+   * One-time migration of pre-0.0.77 scope-scoped keys to the file-based format.
+   *
+   * Old key: "{repo}::{scopeId}::{headSha}::{rel}::{hash}" (5 segments)
+   * New key: "{repo}::{rel}::{hash}"                       (3 segments)
+   *
+   * The {repo} and {hash} segments are identical between both formats — only the
+   * middle {scopeId}::{headSha} was dropped — so we can rebuild the new key from
+   * the old one WITHOUT re-deriving the finding hash (i.e. no LLM round-trip).
+   * When several scopes produced an entry for the same file+finding, the most
+   * recently generated one wins. Idempotent: legacy keys are deleted, so a second
+   * pass finds nothing. Safe-by-omission: anything that is not exactly 5 segments
+   * (the 3-segment new format, the 4-segment "global::…" one-click-fix keys, or a
+   * repo/path that happens to contain "::") is left untouched — at worst the
+   * proposal regenerates once instead of being mis-mapped.
+   */
+  private static migrateLegacyKeys(): void {
+    let changed = false;
+    for (const [oldKey, entry] of [...FixProposalPanel.cache.entries()]) {
+      const parts = oldKey.split('::');
+      if (parts.length !== 5) {
+        continue;
+      }
+      const [repo, , , rel, hash] = parts;
+      const newKey = `${repo}::${rel}::${hash}`;
+      const existing = FixProposalPanel.cache.get(newKey);
+      if (!existing || existing.generatedAt < entry.generatedAt) {
+        FixProposalPanel.cache.set(newKey, entry);
+      }
+      FixProposalPanel.cache.delete(oldKey);
+      changed = true;
+    }
+    if (changed) {
+      FixProposalPanel.flush();
+    }
   }
 
   private static keyOf(request: FixProposalRequest): string {

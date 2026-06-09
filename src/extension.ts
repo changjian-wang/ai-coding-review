@@ -1587,10 +1587,12 @@ function hashString(value: string): string {
 }
 
 function fixProposalCacheKey(rel: string, finding: Finding): string {
-  const reviewSet = session.reviewSet;
-  const reviewPart = reviewSet
-    ? `${session.getRepoName()}::${reviewSet.scopeId}::${reviewSet.headSha}`
-    : 'no-review';
+  // File-based key: a fix proposal follows the FILE + finding content, not the
+  // review scope or commit. Re-selecting a scope (or opening the same file under
+  // a different scope/headSha) still hits the cached proposal instead of
+  // regenerating. The finding hash already shifts when the file's content moves
+  // the finding, so a genuinely stale proposal misses on its own.
+  const repoPart = session.getRepoName() || 'no-repo';
   const findingPart = [
     finding.id,
     finding.line,
@@ -1599,7 +1601,7 @@ function fixProposalCacheKey(rel: string, finding: Finding): string {
     finding.detail,
     finding.suggestion ?? '',
   ].join('\0');
-  return `${reviewPart}::${rel}::${hashString(findingPart)}`;
+  return `${repoPart}::${rel}::${hashString(findingPart)}`;
 }
 
 function composeCommentBody(finding: { title: string; detail: string; suggestion?: string }): string {
