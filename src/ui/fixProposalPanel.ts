@@ -482,15 +482,15 @@ export class FixProposalPanel {
     const text = doc.getText();
     const edit = new vscode.WorkspaceEdit();
     for (const e of edits) {
-      // Tolerant, whitespace-insensitive location (matches the applicability
-      // check), so an edit that locates uniquely can always be applied.
-      const hits = locateEditOffsets(text, e.oldText);
-      if (hits.length !== 1) {
+      // Strict placement first; on the indentation-tolerant fallback the
+      // replacement is re-indented to the file so applying never eats indent.
+      const r = resolveEditAt(text, e.oldText, e.newText);
+      if (!r) {
         return false;
       }
-      const start = doc.positionAt(hits[0].start);
-      const end = doc.positionAt(hits[0].end);
-      edit.replace(this.request.fileUri, new vscode.Range(start, end), e.newText);
+      const start = doc.positionAt(r.start);
+      const end = doc.positionAt(r.end);
+      edit.replace(this.request.fileUri, new vscode.Range(start, end), r.replacement);
     }
     const ok = await vscode.workspace.applyEdit(edit);
     if (ok) {
@@ -907,9 +907,32 @@ function countOccurrences(haystack: string, needle: string): number {
  * whitespace differences.
  */
 function locateEditOffsets(haystack: string, needle: string): { start: number; end: number }[] {
-  const norm = (l: string) => l.replace(/\s+$/, '');
-  // Build line spans of the haystack: each line's [start,end) offset in the
-  // original string, plus its trailing-trimmed text.
+  const strict = locateLinesBy(haystack, needle, trimEndOnly);
+  if (strict.length > 0) {
+    return strict;
+  }
+  return locateLinesBy(haystack, needle, trimBothEnds);
+}
+
+/** Leading run of spaces/tabs on a line (its indentation). */
+function leadingWhitespace(s: string): string {
+  return (s.match(/^[ \t]*/) || [''])[0];
+}
+
+const trimEndOnly = (l: string) => l.replace(/\s+$/, '');
+const trimBothEnds = (l: string) => l.trim();
+
+/**
+ * Line-based matcher: returns char-offset ranges into the ORIGINAL `haystack`
+ * for every place `needle` occurs, comparing lines through `norm` (callers pick
+ * how tolerant). Leading/trailing blank needle lines are dropped so a match
+ * lands on real content.
+ */
+function locateLinesBy(
+  haystack: string,
+  needle: string,
+  norm: (l: string) => string,
+): { start: number; end: number }[] {
   const lines: { start: number; end: number; text: string }[] = [];
   let pos = 0;
   for (const raw of haystack.split('\n')) {
@@ -917,7 +940,6 @@ function locateEditOffsets(haystack: string, needle: string): { start: number; e
     lines.push({ start: pos, end: pos + raw.length, text: norm(raw) });
     pos += raw.length + 1; // +1 for the '\n' we split on
   }
-  // Needle as trailing-trimmed lines, with leading/trailing blank lines dropped.
   let needleLines = needle.split(/\r?\n/).map(norm);
   while (needleLines.length > 0 && needleLines[0] === '') {
     needleLines.shift();
@@ -942,6 +964,64 @@ function locateEditOffsets(haystack: string, needle: string): { start: number; e
     }
   }
   return out;
+}
+
+/**
+ * Resolves one edit against the live file for application: the exact byte range
+ * to replace plus the replacement text, or `null` when the edit cannot be
+ * placed uniquely (zero or multiple matches — never guess).
+ *
+ * When the match is found only via the indentation-tolerant fallback, the
+ * replacement is re-indented to the file's actual indent so applying it does
+ * NOT strip indentation; `newText`'s internal relative indentation is kept.
+ */
+function resolveEditAt(
+  haystack: string,
+  oldText: string,
+  newText: string,
+): { start: number; end: number; replacement: string } | null {
+  const strict = locateLinesBy(haystack, oldText, trimEndOnly);
+  if (strict.length === 1) {
+    return { start: strict[0].start, end: strict[0].end, replacement: newText };
+  }
+  if (strict.length > 1) {
+    return null;
+  }
+  const tolerant = locateLinesBy(haystack, oldText, trimBothEnds);
+  if (tolerant.length !== 1) {
+    return null;
+  }
+  const hit = tolerant[0];
+  return { start: hit.start, end: hit.end, replacement: reindentToFile(haystack, hit, newText) };
+}
+
+/**
+ * Re-indents `newText` so its outermost indentation matches the file line at
+ * `hit.start`, preserving `newText`'s internal relative indentation. Used only
+ * on the tolerant-fallback path, where the model dropped/changed leading indent.
+ */
+function reindentToFile(
+  haystack: string,
+  hit: { start: number; end: number },
+  newText: string,
+): string {
+  let nlPos = haystack.indexOf('\n', hit.start);
+  if (nlPos === -1 || nlPos > hit.end) {
+    nlPos = hit.end;
+  }
+  const origIndent = leadingWhitespace(haystack.slice(hit.start, nlPos));
+  const lines = newText.split('\n');
+  let minIndent = Infinity;
+  for (const l of lines) {
+    if (l.trim() === '') {
+      continue;
+    }
+    minIndent = Math.min(minIndent, leadingWhitespace(l).length);
+  }
+  if (!isFinite(minIndent)) {
+    minIndent = 0;
+  }
+  return lines.map((l) => (l.trim() === '' ? '' : origIndent + l.slice(minIndent))).join('\n');
 }
 
 
