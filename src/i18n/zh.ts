@@ -182,7 +182,7 @@ export const zh: Messages = {
     confirmPr: (pr, label) => `将把审查结论写回 PR #${pr}：${label}。确认提交？`,
     submitToGitHub: '提交到 GitHub',
     prBody: (ready, total) =>
-      `Reviewed via Code Review Gate — ${ready}/${total} 文件已逐行通读并确认，全局结论已核对。`,
+      `Reviewed via Code Review — ${ready}/${total} 文件已逐行通读并确认，全局结论已核对。`,
     postedToPr: (pr, label) => `已写回 PR #${pr}（${label}）`,
     recordedLocal: (label) => `审查结论已记录：${label}`,
   },
@@ -401,6 +401,20 @@ export const zh: Messages = {
     generating: '生成中…',
     fixWithCopilot: '🪄 Copilot 修复',
     fixedBadge: '✓ 已修复',
+    // 待办清单化改版
+    sectionPending: '待处理问题',
+    sectionHandled: '已处理',
+    sectionBasis: '分析依据',
+    basisEvidenceTitle: '证据链：文件级判断为何被全局事实修正',
+    basisVerdictsTitle: '翻转判断（文件级 → 全局求解）',
+    progressHandled: (handled, total) => `已处理 ${handled} / ${total}`,
+    allHandledHint: '全部修复落点已处理，可以提交 Approve。',
+    pendingHint: (n) => `还有 ${n} 项待处理。`,
+    noTodos: '没有需要处理的跨文件修复落点。',
+    actIgnore: '忽略',
+    actComment: '写为评论',
+    revert: '撤销处置',
+    handledEmpty: '（暂无已处理项）',
   },
 
   gh: {

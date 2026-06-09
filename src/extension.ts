@@ -1609,7 +1609,7 @@ function composeCommentBody(finding: { title: string; detail: string; suggestion
   if (finding.suggestion) {
     parts.push('', m().fix.suggestionLabel(finding.suggestion));
   }
-  parts.push('', '_via Code Review Gate_');
+  parts.push('', '_via Code Review_');
   return parts.join('\n');
 }
 
@@ -1720,6 +1720,25 @@ function cancelGlobalAnalysis(): void {
   }
 }
 
+/**
+ * Switches from the global report back to the file-level review ("① 文件级审查"
+ * tab). Reveals the workbench and brings the document panel to the front of its
+ * column so it's no longer hidden behind the global-report tab; if no file is
+ * open yet, opens the selected (or first) review file.
+ */
+async function switchToFileReview(): Promise<void> {
+  await openWorkbench();
+  if (DocumentPanel.currentPath) {
+    DocumentPanel.focus();
+    return;
+  }
+  const first = workbenchSelected ?? session.reviewSet?.files[0]?.path;
+  if (first) {
+    await openFileInPanel(first);
+    DocumentPanel.focus();
+  }
+}
+
 function showGlobalReport(): void {
   const report = session.globalReport;
   if (!report) {
@@ -1731,25 +1750,24 @@ function showGlobalReport(): void {
   const findingsCount = reviewSet
     ? reviewSet.files.reduce((sum, f) => sum + session.findings(f.path).length, 0)
     : 0;
-  GlobalReportPanel.show(
-    report,
-    session.globalConfirmed,
-    locateInFile,
-    () => session.confirmGlobal(),
-    (spotId, file, line) => void openGlobalFix(spotId, file, line),
-    {
+  GlobalReportPanel.show(report, session.globalConfirmed, {
+    onLocate: locateInFile,
+    onConfirm: () => session.confirmGlobal(),
+    onGlobalFix: (spotId, file, line) => void openGlobalFix(spotId, file, line),
+    onGlobalIgnore: (spotId, file, line) => void disposeGlobalFix(spotId, file, line, 'ignored'),
+    onGlobalComment: (spotId, file, line) => void disposeGlobalFix(spotId, file, line, 'commented'),
+    onGlobalRevert: (spotId, file, line) => void revertGlobalFix(spotId, file, line),
+    onGotoFiles: () => void switchToFileReview(),
+    fixDisposition: (spotId, file, line) =>
+      session.globalFixDisposition(spotId, file, line, globalFixAnchor(spotId))?.kind,
+    stats: {
       seen: cov.seen,
       total: cov.total,
       filesReady: cov.filesReady,
       filesTotal: cov.filesTotal,
       findings: findingsCount,
     },
-    () => void vscode.commands.executeCommand('codereview.openWorkbench'),
-    (spotId, file, line) => {
-      const d = session.globalFixDisposition(spotId, file, line, globalFixAnchor(spotId));
-      return d?.kind === 'fixed';
-    },
-  );
+  });
 }
 
 /** Looks up a global fix spot's anchor snippet by id, for disposition resolution. */
@@ -1828,6 +1846,144 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
       })();
     },
   });
+}
+
+/**
+ * Disposes a global fix spot as `commented` or `ignored` (the `fixed` path goes
+ * through {@link openGlobalFix}). Mirrors the file-level {@link disposeFinding}
+ * side effects — PR line comment / local note for `commented`, an ignore reason
+ * for `ignored` — but records the result via {@link ReviewSession.setGlobalFixDisposition}
+ * so spots that map to no file-level finding still persist (design X).
+ */
+async function disposeGlobalFix(
+  spotId: string,
+  file: string,
+  _line: number,
+  kind: 'commented' | 'ignored',
+): Promise<void> {
+  const reviewSet = session.reviewSet;
+  if (!reviewSet) {
+    return;
+  }
+  if (!ensureReviewPath(file, m().actions.disposeFinding)) {
+    return;
+  }
+  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
+  if (!spot) {
+    return;
+  }
+  const cwd = activeCwd();
+  if (!cwd) {
+    return;
+  }
+  const findingLike = { title: spot.title, detail: spot.detail, suggestion: spot.suggestion };
+
+  if (kind === 'commented') {
+    const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
+    const body = composeCommentBody(findingLike);
+    if (prMatch) {
+      const prNumber = Number(prMatch[1]);
+      try {
+        const result = await postPrLineComment(cwd, prNumber, reviewSet.headSha, file, spot.line, body);
+        session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
+          kind: 'commented',
+          ref: String(result.id),
+          at: Date.now(),
+        });
+        transientInfo(m().finding.postedLineComment(prNumber));
+      } catch (err) {
+        try {
+          const fallbackBody = `**${file}:${spot.line}**\n\n${body}`;
+          await postPrComment(cwd, prNumber, fallbackBody);
+          session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
+            kind: 'commented',
+            ref: `pr-${prNumber}:comment`,
+            at: Date.now(),
+          });
+          transientInfo(m().finding.postedFallbackComment(prNumber));
+        } catch (fallbackErr) {
+          void vscode.window.showErrorMessage(
+            m().finding.postCommentFailed((fallbackErr as Error).message || (err as Error).message),
+          );
+          return;
+        }
+      }
+    } else {
+      try {
+        const findingForNote: Finding = {
+          id: spotId,
+          line: spot.line,
+          endLine: spot.endLine,
+          anchor: spot.anchor,
+          severity: spot.severity,
+          title: spot.title,
+          detail: spot.detail,
+          suggestion: spot.suggestion,
+        };
+        const filePath = await appendLocalFindingNote(cwd, reviewSet.scopeId, file, findingForNote, body);
+        session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
+          kind: 'commented',
+          ref: filePath,
+          at: Date.now(),
+        });
+        transientInfo(m().finding.recordedLocal(path.relative(cwd, filePath)));
+      } catch (err) {
+        void vscode.window.showErrorMessage(m().finding.localCommentFailed((err as Error).message));
+        return;
+      }
+    }
+  } else {
+    const reason = await vscode.window.showInputBox({
+      title: m().finding.ignoreTitle(spot.title),
+      prompt: m().finding.ignorePrompt,
+      placeHolder: m().finding.ignorePlaceholder,
+      ignoreFocusOut: true,
+      validateInput: (v) => (v.trim().length >= 4 ? null : m().finding.ignoreMinLength),
+    });
+    if (!reason) {
+      return;
+    }
+    session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
+      kind: 'ignored',
+      reason: reason.trim(),
+      at: Date.now(),
+    });
+    transientInfo(m().finding.ignored);
+  }
+  WorkbenchPanel.refreshIfOpen();
+  GlobalReportPanel.refreshIfOpen();
+}
+
+/**
+ * Clears a global fix spot's disposition (the "revert" action in the handled
+ * list). If the spot was `fixed` and we still hold the applied edit, also revert
+ * the file change — matching the file-level undo semantics.
+ */
+async function revertGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
+  if (!ensureReviewPath(file, m().actions.disposeFinding)) {
+    return;
+  }
+  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
+  const anchor = spot?.anchor;
+  const current = spot
+    ? session.globalFixDisposition(spotId, file, spot.line, anchor)
+    : undefined;
+  if (current?.kind === 'fixed') {
+    await revertAppliedFix(file, spotId);
+    deleteAppliedFix(fixKey(file, spotId));
+  }
+  if (spot) {
+    session.setGlobalFixDisposition(spotId, file, spot.line, anchor, null);
+  }
+  transientInfo(m().finding.dispositionReverted(file));
+  WorkbenchPanel.refreshIfOpen();
+  GlobalReportPanel.refreshIfOpen();
+  if (spot) {
+    void (async () => {
+      await reloadDocPanel(file);
+      await locateInFile(file, spot.line, spot.endLine);
+    })();
+  }
 }
 
 /** Builds a Markdown review report from the session and opens it as a new document. */

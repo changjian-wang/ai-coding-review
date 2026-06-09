@@ -1,19 +1,23 @@
 import * as vscode from 'vscode';
 import type {
   GlobalReport,
-  FindingSeverity,
+  GlobalFixSpot,
 } from '../ai/types';
 import { transientInfo } from './toast';
 import { esc, escAttr, nonce as makeNonce } from './html';
 import { m, resolveLanguage } from '../i18n';
 import { DocumentPanel } from './documentPanel';
 
-const SEVERITY_ORDER: FindingSeverity[] = ['bug', 'conditional', 'suggestion'];
+/** Disposition kind of a fix spot — mirrors {@link FindingDisposition.kind}. */
+type SpotDispositionKind = 'fixed' | 'commented' | 'ignored';
 
 /** Message from the webview to the extension. */
 type InboundMessage =
   | { type: 'locate'; file: string; line: number }
   | { type: 'globalFix'; id: string; file: string; line: number }
+  | { type: 'globalIgnore'; id: string; file: string; line: number }
+  | { type: 'globalComment'; id: string; file: string; line: number }
+  | { type: 'globalRevert'; id: string; file: string; line: number }
   | { type: 'confirm' }
   | { type: 'gotoFiles' };
 
@@ -27,45 +31,60 @@ export interface GlobalReportStats {
 }
 
 /**
- * The single rich webview in the extension: shows the cross-file global
- * analysis report (conclusion + evidence chain + fix spots), with locate
- * buttons and a "confirm read" gate action.
+ * Callbacks + state the panel needs, bundled into one object so the call site
+ * isn't a long positional argument list (and so adding a handler doesn't shift
+ * every other argument).
+ */
+export interface GlobalReportHandlers {
+  onLocate: (file: string, line: number) => void;
+  onConfirm: () => void;
+  onGlobalFix?: (spotId: string, file: string, line: number) => void;
+  onGlobalIgnore?: (spotId: string, file: string, line: number) => void;
+  onGlobalComment?: (spotId: string, file: string, line: number) => void;
+  onGlobalRevert?: (spotId: string, file: string, line: number) => void;
+  onGotoFiles?: () => void;
+  /** Current disposition of a fix spot, used to bucket it into pending vs handled. */
+  fixDisposition?: (spotId: string, file: string, line: number) => SpotDispositionKind | undefined;
+  stats?: GlobalReportStats;
+}
+
+/**
+ * The single rich webview in the extension: shows the cross-file global analysis
+ * as a to-do list — a dynamic conclusion banner with a progress bar, the pending
+ * fix spots as actionable items, a collapsed "handled" section, and a collapsed
+ * "analysis basis" (conclusion + evidence chain + verdict flips).
  */
 export class GlobalReportPanel {
   private static current?: GlobalReportPanel;
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
   private disposed = false;
-  private onLocate: (file: string, line: number) => void;
-  private onConfirm: () => void;
-  private onGlobalFix?: (spotId: string, file: string, line: number) => void;
-  /** Returns true when a fix spot has been disposed (fixed), for badge rendering. */
-  private fixDisposed?: (spotId: string, file: string, line: number) => boolean;
-  private onGotoFiles?: () => void;
-  private stats?: GlobalReportStats;
+  private handlers: GlobalReportHandlers;
   private lastReport?: GlobalReport;
   private lastConfirmed = false;
 
-  private constructor(
-    panel: vscode.WebviewPanel,
-    onLocate: (file: string, line: number) => void,
-    onConfirm: () => void,
-  ) {
+  private constructor(panel: vscode.WebviewPanel, handlers: GlobalReportHandlers) {
     this.panel = panel;
-    this.onLocate = onLocate;
-    this.onConfirm = onConfirm;
+    this.handlers = handlers;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (msg: InboundMessage) => {
+        const h = this.handlers;
         if (msg.type === 'locate') {
-          this.onLocate(msg.file, msg.line);
+          h.onLocate(msg.file, msg.line);
         } else if (msg.type === 'globalFix') {
-          this.onGlobalFix?.(msg.id, msg.file, msg.line);
+          h.onGlobalFix?.(msg.id, msg.file, msg.line);
+        } else if (msg.type === 'globalIgnore') {
+          h.onGlobalIgnore?.(msg.id, msg.file, msg.line);
+        } else if (msg.type === 'globalComment') {
+          h.onGlobalComment?.(msg.id, msg.file, msg.line);
+        } else if (msg.type === 'globalRevert') {
+          h.onGlobalRevert?.(msg.id, msg.file, msg.line);
         } else if (msg.type === 'confirm') {
-          this.onConfirm();
+          h.onConfirm();
           transientInfo(m().globalPanel.confirmedRead);
         } else if (msg.type === 'gotoFiles') {
-          this.onGotoFiles?.();
+          h.onGotoFiles?.();
         }
       },
       null,
@@ -77,12 +96,7 @@ export class GlobalReportPanel {
   static show(
     report: GlobalReport,
     confirmed: boolean,
-    onLocate: (file: string, line: number) => void,
-    onConfirm: () => void,
-    onGlobalFix?: (spotId: string, file: string, line: number) => void,
-    stats?: GlobalReportStats,
-    onGotoFiles?: () => void,
-    fixDisposed?: (spotId: string, file: string, line: number) => boolean,
+    handlers: GlobalReportHandlers,
   ): GlobalReportPanel {
     // Open as a TAB in the SAME group as the code (document) view, so the report
     // and the file are tabs you switch between — not a split that has to be
@@ -90,12 +104,7 @@ export class GlobalReportPanel {
     const column = DocumentPanel.viewColumn ?? vscode.ViewColumn.Active;
     if (GlobalReportPanel.current) {
       const existing = GlobalReportPanel.current;
-      existing.onLocate = onLocate;
-      existing.onConfirm = onConfirm;
-      existing.onGlobalFix = onGlobalFix;
-      existing.fixDisposed = fixDisposed;
-      existing.onGotoFiles = onGotoFiles;
-      existing.stats = stats;
+      existing.handlers = handlers;
       existing.panel.reveal(column);
       existing.update(report, confirmed);
       return existing;
@@ -106,11 +115,7 @@ export class GlobalReportPanel {
       column,
       { enableScripts: true, retainContextWhenHidden: true },
     );
-    const instance = new GlobalReportPanel(panel, onLocate, onConfirm);
-    instance.onGlobalFix = onGlobalFix;
-    instance.fixDisposed = fixDisposed;
-    instance.onGotoFiles = onGotoFiles;
-    instance.stats = stats;
+    const instance = new GlobalReportPanel(panel, handlers);
     GlobalReportPanel.current = instance;
     instance.update(report, confirmed);
     return instance;
@@ -151,50 +156,64 @@ export class GlobalReportPanel {
           .join('')}</div>`
       : `<p class="muted">${esc(t.noEvidence)}</p>`;
 
-    // Decision panel counts derived from verdicts + fix spots.
-    const realBugs =
-      report.verdicts.filter((v) => v.kind === 'found').length +
-      report.fixSpots.filter((s) => s.severity === 'bug').length;
-    const flips = report.verdicts.filter((v) => v.kind === 'flip').length;
-    const fixPaths = report.fixSpots.length;
-    const recClass =
-      report.recommendation === 'request_changes'
+    // ---- Partition fix spots into pending vs handled (by disposition kind) ----
+    const dispositionOf = this.handlers.fixDisposition;
+    const kindOf = (sp: GlobalFixSpot): SpotDispositionKind | undefined =>
+      dispositionOf?.(sp.id, sp.file, sp.line);
+    const pendingSpots = report.fixSpots.filter((sp) => !kindOf(sp));
+    const handledSpots = report.fixSpots.filter((sp) => !!kindOf(sp));
+    const total = report.fixSpots.length;
+    const handledCount = handledSpots.length;
+    const pendingCount = total - handledCount;
+    const allHandled = total > 0 && pendingCount === 0;
+    const progressPct = total > 0 ? Math.round((handledCount / total) * 100) : 100;
+
+    // ---- Dynamic conclusion banner ----
+    // When every fix spot has been handled, the banner leans toward "approve"
+    // regardless of the model's original recommendation — the to-do list is done.
+    const recClass = allHandled
+      ? 'ok'
+      : report.recommendation === 'request_changes'
         ? 'block'
         : report.recommendation === 'approve'
           ? 'ok'
           : '';
+    const recTitle =
+      allHandled && report.recommendation !== 'approve'
+        ? recLabel.approve
+        : recLabel[report.recommendation];
+    const hint = total === 0 ? t.noTodos : allHandled ? t.allHandledHint : t.pendingHint(pendingCount);
 
-    const s = this.stats;
-    const pct = s && s.total > 0 ? Math.round((s.seen / s.total) * 100) : 0;
+    const s = this.handlers.stats;
+    const covPct = s && s.total > 0 ? Math.round((s.seen / s.total) * 100) : 0;
     const heroStats = s
       ? `<div class="hero-stats">
-          <span class="hstat"><b>${pct}%</b> ${esc(t.lineCoverage)}</span>
+          <span class="hstat"><b>${covPct}%</b> ${esc(t.lineCoverage)}</span>
           <span class="hstat"><b>${s.filesReady}/${s.filesTotal}</b> ${esc(t.filesReady)}</span>
           <span class="hstat"><b>${s.findings}</b> ${esc(t.fileFindings)}</span>
         </div>`
       : '';
-    const hero = `
+    const banner = `
     <div class="hero">
       <div class="tabs">
         <button class="tab" id="tab-files">${esc(t.tabFiles)}</button>
         <span class="tab active">${esc(t.tabGlobal)}</span>
       </div>
-      <div class="hero-title">${esc(t.heroTitle)}</div>
-      ${heroStats}
-    </div>`;
-
-    const decisionPanel = `
+    </div>
     <div class="decision ${recClass}">
       <div class="decision-main">
         <div class="kicker">${esc(t.kicker)}</div>
-        <div class="decision-title">${esc(recLabel[report.recommendation])}</div>
+        <div class="decision-title">${esc(recTitle)}</div>
         <div class="decision-copy">${esc(report.conclusion)}</div>
+        <div class="progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%"></div></div>
+          <div class="progress-text">
+            <span class="ptotal">${esc(t.progressHandled(handledCount, total))}</span>
+            <span class="phint${allHandled ? ' ok' : ''}">${esc(hint)}</span>
+          </div>
+        </div>
       </div>
-      <div class="metrics">
-        <div class="metric"><div class="n red">${realBugs}</div><div class="l">${esc(t.metricRealBugs)}</div></div>
-        <div class="metric"><div class="n purple">${flips}</div><div class="l">${esc(t.metricFlips)}</div></div>
-        <div class="metric"><div class="n green">${fixPaths}</div><div class="l">${esc(t.metricFixPaths)}</div></div>
-      </div>
+      ${heroStats}
     </div>`;
 
     const verdictSection = report.verdicts.length
@@ -230,62 +249,53 @@ export class GlobalReportPanel {
           .join('')
       : `<p class="muted">${esc(t.noFlips)}</p>`;
 
-    const spotsBySeverity = SEVERITY_ORDER.map((sev) => {
-      const spots = report.fixSpots.filter((s) => s.severity === sev);
-      if (!spots.length) {
-        return '';
-      }
-      const cards = spots
-        .map((s) => {
-          const fixed = this.fixDisposed?.(s.id, s.file, s.line) ?? false;
-          const action = fixed
-            ? `<span class="fixed-badge">${esc(t.fixedBadge)}</span>`
-            : `<button class="globalfix" data-id="${escAttr(s.id)}" data-file="${escAttr(s.file)}" data-line="${s.line}">${esc(t.fixWithCopilot)}</button>`;
-          return `
-        <div class="fixitem sev-${s.severity}${fixed ? ' is-fixed' : ''}">
+    // ---- Pending to-dos: one actionable card per un-handled fix spot ----
+    const todoCard = (sp: GlobalFixSpot): string => `
+        <div class="fixitem sev-${sp.severity}">
           <div class="fixitem-h">
             <span class="sev-dot"></span>
-            <span class="tag">${sevLabel[s.severity]}</span>
-            <span class="title">${esc(s.title)}</span>
-            <span class="where">${esc(s.file)}:${s.line}</span>
+            <span class="tag">${sevLabel[sp.severity]}</span>
+            <span class="title">${esc(sp.title)}</span>
+            <span class="where">${esc(sp.file)}:${sp.line}</span>
           </div>
           <div class="fixitem-b">
-            <p class="why">${esc(s.detail)}</p>
-            ${s.suggestion ? `<p class="suggest">${esc(t.suggestionPrefix)}${esc(s.suggestion)}</p>` : ''}
+            <p class="why">${esc(sp.detail)}</p>
+            ${sp.suggestion ? `<p class="suggest">${esc(t.suggestionPrefix)}${esc(sp.suggestion)}</p>` : ''}
             <div class="card-actions">
-              <button class="locate" data-file="${escAttr(s.file)}" data-line="${s.line}">${esc(t.locate)}</button>
-              ${action}
+              <button class="locate" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
+              <button class="globalfix" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.fixWithCopilot)}</button>
+              <button class="act act-comment" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.actComment)}</button>
+              <button class="act act-ignore" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.actIgnore)}</button>
             </div>
           </div>
         </div>`;
-        })
-        .join('');
-      return `<h3>${sevLabel[sev]}</h3>${cards}`;
-    }).join('');
+    const pendingHtml = pendingSpots.length
+      ? pendingSpots.map(todoCard).join('')
+      : `<p class="muted">${esc(allHandled ? t.allHandledHint : t.noTodos)}</p>`;
 
-    const fixSection = report.fixSpots.length
-      ? spotsBySeverity
-      : `<p class="muted">${esc(t.noFixSpots)}</p>`;
-
-    // Call graph: caller → callee chain.
-    const callGraphSection = report.callGraph.length
-      ? `<div class="callgraph">${report.callGraph
-          .map(
-            (n, i) =>
-              `${i > 0 ? '<span class="cg-arrow">→</span>' : ''}<span class="cg-node${n.changed ? ' changed' : ''}"><b>${esc(n.name)}</b>${n.role ? `<span class="cg-role">${esc(n.role)}</span>` : ''}${n.lifetime ? `<span class="cg-life">${esc(n.lifetime)}</span>` : ''}</span>`,
+    // ---- Handled (collapsed), bucketed fixed → commented → ignored ----
+    const dispLabel = m().disposition;
+    const handledRow = (sp: GlobalFixSpot, kind: SpotDispositionKind): string => `
+        <div class="handled-row disp-${kind}">
+          <span class="disp-badge disp-${kind}">${esc(dispLabel[kind])}</span>
+          <span class="hrow-title">${esc(sp.title)}</span>
+          <span class="where">${esc(sp.file)}:${sp.line}</span>
+          <span class="hrow-actions">
+            <button class="locate" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
+            <button class="act act-revert" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.revert)}</button>
+          </span>
+        </div>`;
+    const handledOrder: SpotDispositionKind[] = ['fixed', 'commented', 'ignored'];
+    const handledHtml = handledSpots.length
+      ? handledOrder
+          .map((kind) =>
+            handledSpots
+              .filter((sp) => kindOf(sp) === kind)
+              .map((sp) => handledRow(sp, kind))
+              .join(''),
           )
-          .join('')}</div>`
-      : `<p class="muted">${esc(t.noCallGraph)}</p>`;
-
-    // Architecture / intent conformance checks.
-    const archSection = report.architectureChecks.length
-      ? `<ul class="glist">${report.architectureChecks
-          .map(
-            (c) =>
-              `<li class="arch-${c.status}"><span class="gi gi-${c.status}">${c.status === 'ok' ? '✓' : c.status === 'warn' ? '▲' : 'ⓘ'}</span><span><b>${esc(c.label)}</b>：${esc(c.detail)}</span></li>`,
-          )
-          .join('')}</ul>`
-      : `<p class="muted">${esc(t.noArchChecks)}</p>`;
+          .join('')
+      : `<p class="muted">${esc(t.handledEmpty)}</p>`;
 
     return `<!DOCTYPE html>
 <html lang="${lang}">
@@ -404,6 +414,38 @@ export class GlobalReportPanel {
   .gi-warn { color: var(--yellow); }
   .gi-info { color: var(--blue); }
 
+  /* Progress bar in the conclusion banner */
+  .progress-wrap { margin-top: .7rem; }
+  .progress-bar { height: 6px; border-radius: 4px; background: var(--elevated); overflow: hidden; border: 1px solid var(--line); }
+  .progress-fill { height: 100%; background: var(--green); transition: width .3s ease; }
+  .progress-text { display: flex; gap: .8rem; align-items: center; margin-top: .35rem; font-size: .74rem; }
+  .progress-text .ptotal { opacity: .7; }
+  .progress-text .phint { opacity: .7; }
+  .progress-text .phint.ok { color: var(--green); opacity: 1; font-weight: 600; }
+
+  /* Action buttons on to-do / handled rows */
+  .act { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .act:hover { background: var(--vscode-toolbar-hoverBackground); }
+
+  /* Collapsible folds (handled / analysis basis) */
+  details.fold { border: 1px solid var(--line); border-radius: 8px; margin: .7rem 0; padding: 0 .85rem; background: var(--elevated); }
+  details.fold > summary { cursor: pointer; padding: .65rem 0; font-weight: 600; font-size: .9rem; list-style: none; user-select: none; }
+  details.fold > summary::-webkit-details-marker { display: none; }
+  details.fold > summary::before { content: '▸'; display: inline-block; margin-right: .5rem; opacity: .6; transition: transform .15s ease; }
+  details.fold[open] > summary::before { transform: rotate(90deg); }
+  details.fold > *:last-child { margin-bottom: .75rem; }
+  details.fold .basis h3 { margin-top: .8rem; }
+
+  /* Handled rows (compact) */
+  .handled-row { display: flex; align-items: center; gap: .6rem; padding: .45rem 0; border-bottom: 1px solid var(--line); font-size: .84rem; }
+  .handled-row:last-child { border-bottom: none; }
+  .disp-badge { font-size: .68rem; padding: .12rem .5rem; border-radius: 6px; font-weight: 600; flex-shrink: 0; }
+  .disp-badge.disp-fixed { background: var(--green-bg); color: var(--green); }
+  .disp-badge.disp-commented { background: var(--blue-bg); color: var(--blue); }
+  .disp-badge.disp-ignored { background: var(--yellow-bg); color: var(--yellow); }
+  .handled-row .hrow-title { flex: 1; opacity: .85; }
+  .handled-row .hrow-actions { display: flex; gap: .4rem; flex-shrink: 0; }
+
   .confirm-bar { margin-top: 1.6rem; padding-top: 1rem; border-top: 1px solid var(--line); }
   #confirm { background: var(--vscode-button-background); color: var(--vscode-button-foreground); padding: .5rem 1.1rem; }
   #confirm:disabled { opacity: .6; cursor: default; }
@@ -411,21 +453,24 @@ export class GlobalReportPanel {
 </style>
 </head>
 <body>
-  ${hero}
-  ${decisionPanel}
+  ${banner}
 
-  <h2>${esc(t.sectionEvidence)}</h2>
-  ${evidence}
-  ${verdictSection}
+  <h2>${esc(t.sectionPending)}</h2>
+  ${pendingHtml}
 
-  <h2>${esc(t.sectionFixSpots)}</h2>
-  ${fixSection}
+  <details class="fold">
+    <summary>${esc(t.sectionHandled)} (${handledCount})</summary>
+    ${handledHtml}
+  </details>
 
-  <h2>${esc(t.sectionCallGraph)}</h2>
-  ${callGraphSection}
-
-  <h2>${esc(t.sectionArch)}</h2>
-  ${archSection}
+  <details class="fold">
+    <summary>${esc(t.sectionBasis)}</summary>
+    <div class="basis">
+      <h3>${esc(t.basisEvidenceTitle)}</h3>
+      ${evidence}
+      ${report.verdicts.length ? `<h3>${esc(t.basisVerdictsTitle)}</h3>${verdictSection}` : ''}
+    </div>
+  </details>
 
   <div class="confirm-bar">
     ${
@@ -460,6 +505,21 @@ export class GlobalReportPanel {
       setTimeout(() => { btn.disabled = false; }, 3000);
     });
   });
+  const wireSpotAction = (selector, type) => {
+    document.querySelectorAll(selector).forEach((btn) => {
+      btn.addEventListener('click', () => {
+        vscode.postMessage({
+          type: type,
+          id: btn.dataset.id,
+          file: btn.dataset.file,
+          line: Number(btn.dataset.line),
+        });
+      });
+    });
+  };
+  wireSpotAction('.act-ignore', 'globalIgnore');
+  wireSpotAction('.act-comment', 'globalComment');
+  wireSpotAction('.act-revert', 'globalRevert');
   const confirm = document.getElementById('confirm');
   if (confirm) {
     confirm.addEventListener('click', () => {

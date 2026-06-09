@@ -205,7 +205,7 @@ export const en = {
       `This will write the review conclusion back to PR #${pr}: ${label}. Confirm?`,
     submitToGitHub: 'Submit to GitHub',
     prBody: (ready: number, total: number) =>
-      `Reviewed via Code Review Gate — ${ready}/${total} files read line-by-line and confirmed, global conclusion verified.`,
+      `Reviewed via Code Review — ${ready}/${total} files read line-by-line and confirmed, global conclusion verified.`,
     postedToPr: (pr: number, label: string) => `Written back to PR #${pr} (${label})`,
     recordedLocal: (label: string) => `Review conclusion recorded: ${label}`,
   },
@@ -443,6 +443,20 @@ export const en = {
     generating: 'Generating…',
     fixWithCopilot: '🪄 Fix with Copilot',
     fixedBadge: '✓ Fixed',
+    // To-do list redesign
+    sectionPending: 'Pending issues',
+    sectionHandled: 'Handled',
+    sectionBasis: 'Analysis basis',
+    basisEvidenceTitle: 'Evidence chain: why file-level judgments were corrected by global facts',
+    basisVerdictsTitle: 'Verdict flips (file-level → global)',
+    progressHandled: (handled: number, total: number) => `${handled} / ${total} handled`,
+    allHandledHint: 'All fix spots handled — you can approve.',
+    pendingHint: (n: number) => `${n} item(s) still pending.`,
+    noTodos: 'No cross-file fix spots to handle.',
+    actIgnore: 'Ignore',
+    actComment: 'Write as comment',
+    revert: 'Revert',
+    handledEmpty: '(nothing handled yet)',
   },
 
   gh: {
