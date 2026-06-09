@@ -12,7 +12,7 @@ const SEVERITY_ORDER: FindingSeverity[] = ['bug', 'conditional', 'suggestion'];
 /** Message from the webview to the extension. */
 type InboundMessage =
   | { type: 'locate'; file: string; line: number }
-  | { type: 'gendiff'; file: string; line: number; title: string; detail: string; suggestion?: string }
+  | { type: 'globalFix'; id: string; file: string; line: number }
   | { type: 'confirm' }
   | { type: 'gotoFiles' };
 
@@ -37,7 +37,9 @@ export class GlobalReportPanel {
   private disposed = false;
   private onLocate: (file: string, line: number) => void;
   private onConfirm: () => void;
-  private onGenDiff?: (fix: { file: string; line: number; title: string; detail: string; suggestion?: string }) => void;
+  private onGlobalFix?: (spotId: string, file: string, line: number) => void;
+  /** Returns true when a fix spot has been disposed (fixed), for badge rendering. */
+  private fixDisposed?: (spotId: string, file: string, line: number) => boolean;
   private onGotoFiles?: () => void;
   private stats?: GlobalReportStats;
   private lastReport?: GlobalReport;
@@ -56,14 +58,8 @@ export class GlobalReportPanel {
       (msg: InboundMessage) => {
         if (msg.type === 'locate') {
           this.onLocate(msg.file, msg.line);
-        } else if (msg.type === 'gendiff') {
-          this.onGenDiff?.({
-            file: msg.file,
-            line: msg.line,
-            title: msg.title,
-            detail: msg.detail,
-            suggestion: msg.suggestion,
-          });
+        } else if (msg.type === 'globalFix') {
+          this.onGlobalFix?.(msg.id, msg.file, msg.line);
         } else if (msg.type === 'confirm') {
           this.onConfirm();
           transientInfo(m().globalPanel.confirmedRead);
@@ -82,16 +78,20 @@ export class GlobalReportPanel {
     confirmed: boolean,
     onLocate: (file: string, line: number) => void,
     onConfirm: () => void,
-    onGenDiff?: (fix: { file: string; line: number; title: string; detail: string; suggestion?: string }) => void,
+    onGlobalFix?: (spotId: string, file: string, line: number) => void,
     stats?: GlobalReportStats,
     onGotoFiles?: () => void,
+    fixDisposed?: (spotId: string, file: string, line: number) => boolean,
   ): GlobalReportPanel {
-    const column = vscode.ViewColumn.Beside;
+    // Open beside the workbench, in the SAME window the workbench lives in (it
+    // may be an auxiliary window), so the report never lands on the parent.
+    const column = vscode.ViewColumn.Active;
     if (GlobalReportPanel.current) {
       const existing = GlobalReportPanel.current;
       existing.onLocate = onLocate;
       existing.onConfirm = onConfirm;
-      existing.onGenDiff = onGenDiff;
+      existing.onGlobalFix = onGlobalFix;
+      existing.fixDisposed = fixDisposed;
       existing.onGotoFiles = onGotoFiles;
       existing.stats = stats;
       existing.panel.reveal(column);
@@ -105,7 +105,8 @@ export class GlobalReportPanel {
       { enableScripts: true, retainContextWhenHidden: true },
     );
     const instance = new GlobalReportPanel(panel, onLocate, onConfirm);
-    instance.onGenDiff = onGenDiff;
+    instance.onGlobalFix = onGlobalFix;
+    instance.fixDisposed = fixDisposed;
     instance.onGotoFiles = onGotoFiles;
     instance.stats = stats;
     GlobalReportPanel.current = instance;
@@ -233,9 +234,13 @@ export class GlobalReportPanel {
         return '';
       }
       const cards = spots
-        .map(
-          (s) => `
-        <div class="fixitem sev-${s.severity}">
+        .map((s) => {
+          const fixed = this.fixDisposed?.(s.id, s.file, s.line) ?? false;
+          const action = fixed
+            ? `<span class="fixed-badge">${esc(t.fixedBadge)}</span>`
+            : `<button class="globalfix" data-id="${escAttr(s.id)}" data-file="${escAttr(s.file)}" data-line="${s.line}">${esc(t.fixWithCopilot)}</button>`;
+          return `
+        <div class="fixitem sev-${s.severity}${fixed ? ' is-fixed' : ''}">
           <div class="fixitem-h">
             <span class="sev-dot"></span>
             <span class="tag">${sevLabel[s.severity]}</span>
@@ -247,11 +252,11 @@ export class GlobalReportPanel {
             ${s.suggestion ? `<p class="suggest">${esc(t.suggestionPrefix)}${esc(s.suggestion)}</p>` : ''}
             <div class="card-actions">
               <button class="locate" data-file="${escAttr(s.file)}" data-line="${s.line}">${esc(t.locate)}</button>
-              <button class="gendiff" data-file="${escAttr(s.file)}" data-line="${s.line}" data-title="${escAttr(s.title)}" data-detail="${escAttr(s.detail)}" data-suggestion="${escAttr(s.suggestion ?? '')}">${esc(t.genDiffBtn)}</button>
+              ${action}
             </div>
           </div>
-        </div>`,
-        )
+        </div>`;
+        })
         .join('');
       return `<h3>${sevLabel[sev]}</h3>${cards}`;
     }).join('');
@@ -374,8 +379,11 @@ export class GlobalReportPanel {
   button { font-family: inherit; cursor: pointer; border: 1px solid transparent; border-radius: 5px; padding: .32rem .75rem; font-size: .8rem; }
   .card-actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .3rem; }
   .locate { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-  .gendiff { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid rgba(86,156,214,.4); }
-  .gendiff:disabled { opacity: .6; cursor: wait; }
+  .globalfix { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: 1px solid transparent; }
+  .globalfix:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+  .globalfix:disabled { opacity: .6; cursor: wait; }
+  .fixed-badge { color: var(--vscode-charts-green, #4caf50); font-size: .8rem; font-weight: 600; align-self: center; }
+  .fixitem.is-fixed { opacity: .7; }
 
   /* Call graph */
   .callgraph { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .4rem 0 .2rem; }
@@ -437,19 +445,17 @@ export class GlobalReportPanel {
       vscode.postMessage({ type: 'locate', file: btn.dataset.file, line: Number(btn.dataset.line) });
     });
   });
-  document.querySelectorAll('.gendiff').forEach((btn) => {
+  document.querySelectorAll('.globalfix').forEach((btn) => {
     btn.addEventListener('click', () => {
       btn.disabled = true;
-      btn.textContent = T.generating;
       vscode.postMessage({
-        type: 'gendiff',
+        type: 'globalFix',
+        id: btn.dataset.id,
         file: btn.dataset.file,
         line: Number(btn.dataset.line),
-        title: btn.dataset.title,
-        detail: btn.dataset.detail,
-        suggestion: btn.dataset.suggestion || undefined,
       });
-      setTimeout(() => { btn.disabled = false; btn.textContent = T.genDiffBtn; }, 4000);
+      // Re-enable shortly in case the user dismisses the proposal panel.
+      setTimeout(() => { btn.disabled = false; }, 3000);
     });
   });
   const confirm = document.getElementById('confirm');

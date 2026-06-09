@@ -63,6 +63,8 @@ export interface DocActions {
   locate(path: string, line: number, endLine?: number, findingId?: string): void;
   analyze(path: string): void;
   jumpNext(path: string): void;
+  /** Hands keyboard focus back to the workbench file tree. */
+  focusTree(): void;
 }
 
 type Inbound =
@@ -79,7 +81,8 @@ type Inbound =
   | { type: 'viewFix'; id: string }
   | { type: 'locate'; line: number; endLine?: number; id?: string }
   | { type: 'analyze' }
-  | { type: 'jumpNext' };
+  | { type: 'jumpNext' }
+  | { type: 'focusTree' };
 
 /**
  * The Document Viewer: a webview that renders a review file in either a
@@ -169,6 +172,16 @@ export class DocumentPanel {
     }
   }
 
+  /** Reveals the document view and moves keyboard focus into it. */
+  static focus(): void {
+    const inst = DocumentPanel.current;
+    if (!inst) {
+      return;
+    }
+    inst.panel.reveal(undefined, /* preserveFocus */ false);
+    void inst.panel.webview.postMessage({ type: 'focusContent' });
+  }
+
   /**
    * Reflects analysis progress on the topbar "分析此文件" button. Only the panel
    * currently showing `path` reacts. When `on` is false, `ok` controls whether a
@@ -179,6 +192,21 @@ export class DocumentPanel {
     if (inst?.ready && inst.model?.path === path) {
       void inst.panel.webview.postMessage({ type: 'analyzing', on, ok });
     }
+  }
+
+  /**
+   * Flashes a short notice strip inside the document view (current window),
+   * replacing parent-window notifications for per-file analysis results/errors.
+   * Only the panel currently showing `path` reacts. Returns whether it was shown
+   * so callers can fall back to a normal notification when it isn't.
+   */
+  static flashNotice(path: string, message: string, kind: 'info' | 'error' = 'info', ms = 4000): boolean {
+    const inst = DocumentPanel.current;
+    if (inst?.ready && inst.model?.path === path) {
+      void inst.panel.webview.postMessage({ type: 'docNotice', message, kind, ms });
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -247,6 +275,9 @@ export class DocumentPanel {
         break;
       case 'jumpNext':
         this.actions.jumpNext(path);
+        break;
+      case 'focusTree':
+        this.actions.focusTree();
         break;
     }
   }
@@ -334,12 +365,43 @@ export class DocumentPanel {
     width:11px; opacity:1; transform:scale(1); animation:cr-spin .7s linear infinite;
   }
   #act-analyze.analyzing:hover { transform:none; box-shadow:none; }
+  /* indeterminate progress bar along the button bottom while analyzing */
+  #act-analyze { overflow:hidden; }
+  #act-analyze.analyzing::after {
+    content:''; position:absolute; left:0; bottom:0; height:2px; width:40%;
+    background:var(--vscode-button-foreground, #fff); opacity:.85; border-radius:2px;
+    animation:anBar 1.1s ease-in-out infinite;
+  }
+  @keyframes anBar { 0% { left:-40%; } 100% { left:100%; } }
+  /* in-document notice strip (replaces parent-window notifications) */
+  .doc-notice {
+    flex:none; padding:5px 12px; font-size:12px; line-height:1.5;
+    border-bottom:1px solid var(--line);
+    background:var(--vscode-inputValidation-infoBackground, rgba(86,156,214,.12));
+    color:var(--vscode-foreground);
+  }
+  .doc-notice[hidden] { display:none; }
+  .doc-notice.error {
+    background:var(--vscode-inputValidation-errorBackground, rgba(241,76,76,.14));
+    color:var(--vscode-inputValidation-errorForeground, var(--red));
+    border-bottom-color:var(--vscode-inputValidation-errorBorder, rgba(241,76,76,.4));
+  }
   #act-analyze.done {
     background:var(--green); color:var(--vscode-editor-background, #1e1e1e);
     box-shadow:0 0 0 3px color-mix(in srgb, var(--green) 28%, transparent);
   }
   #act-analyze.done:hover { transform:none; }
   @keyframes cr-spin { to { transform:rotate(360deg); } }
+  /* keyboard-shortcut badge shown after a button label */
+  .kbd {
+    margin-left:7px; padding:0 5px; min-width:15px; height:15px; line-height:15px;
+    display:inline-block; text-align:center; font-size:10px; font-weight:600;
+    border-radius:3px; border:1px solid var(--line);
+    background:color-mix(in srgb, var(--vscode-foreground, #ccc) 10%, transparent);
+    color:var(--dim); vertical-align:middle;
+  }
+  #act-analyze .kbd { border-color:color-mix(in srgb, var(--vscode-button-foreground,#fff) 40%, transparent); color:var(--vscode-button-foreground, #fff); }
+  .topbar .ico { margin-right:5px; }
   .content { flex:1; overflow:auto; position:relative; }
 
   /* Source view */
@@ -519,9 +581,10 @@ export class DocumentPanel {
       <button id="m-read" class="on">${t.readView}</button>
       <button id="m-src">${t.sourceView}</button>
     </span>
-    <button id="act-jump">${t.jumpNextUnseen}</button>
-    <button id="act-analyze"><span class="btn-spin" aria-hidden="true"></span><span class="btn-label">${t.analyzeFile}</span></button>
+    <button id="act-jump"><span class="ico">⤵</span>${t.jumpNextUnseen}</button>
+    <button id="act-analyze"><span class="btn-spin" aria-hidden="true"></span><span class="btn-label">${t.analyzeFile}</span><span class="kbd">A</span></button>
   </div>
+  <div class="doc-notice" id="docNotice" hidden></div>
   <div class="findbar collapsed" id="findbar" style="display:none">
     <button class="findbar-toggle" id="findbar-toggle"></button>
     <div class="findlist" id="findlist"></div>
@@ -1048,10 +1111,25 @@ function setAnalyzing(on, ok, silent) {
   }
 }
 
+// In-document notice strip — replaces parent-window notifications so analysis
+// results / errors are visible even when the workbench is full-screen.
+let docNoticeTimer = 0;
+function flashDocNotice(message, kind, ms) {
+  const el = $('docNotice');
+  if (!el) return;
+  el.textContent = message || '';
+  el.className = 'doc-notice' + (kind === 'error' ? ' error' : '');
+  el.hidden = false;
+  if (docNoticeTimer) clearTimeout(docNoticeTimer);
+  docNoticeTimer = setTimeout(() => { el.hidden = true; docNoticeTimer = 0; }, ms || 4000);
+}
+
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
   if (msg.type === 'load') { hideAiBusy(); model = msg.model; render(); }
   else if (msg.type === 'aiBusy') { if (!msg.on) hideAiBusy(); }
+  else if (msg.type === 'docNotice') { flashDocNotice(msg.message, msg.kind, msg.ms); }
+  else if (msg.type === 'focusContent') { contentEl.setAttribute('tabindex', '-1'); contentEl.focus(); }
   else if (msg.type === 'analyzing') { setAnalyzing(msg.on, msg.ok); }
   else if (msg.type === 'scrollTo') {
     if (mode !== 'source') setMode('source');
@@ -1065,6 +1143,58 @@ window.addEventListener('message', (ev) => {
     const first = contentEl.querySelector('.ln[data-line="' + start + '"]');
     if (first) first.scrollIntoView({ block:'center' });
   }
+});
+
+// ---- Keyboard navigation (LOCAL ONLY — never triggers a paid model call
+// except the explicit A = analyze) ------------------------------------------
+let findingPtr = -1;
+function findingNav() {
+  // Findings sorted by line; J cycles through them.
+  return (model && model.findings ? model.findings.slice() : []).sort((a, b) => a.line - b.line);
+}
+function jumpToFinding(idx) {
+  const list = findingNav();
+  if (list.length === 0) return;
+  findingPtr = ((idx % list.length) + list.length) % list.length; // wrap both ways
+  const f = list[findingPtr];
+  if (mode !== 'source') setMode('source');
+  const start = f.line;
+  const end = (f.endLine && f.endLine > start) ? f.endLine : start;
+  ensureSrcRenderedThrough(end);
+  locatedRange = { start: start, end: end };
+  applyLocateHighlight();
+  const first = contentEl.querySelector('.ln[data-line="' + start + '"]');
+  if (first) first.scrollIntoView({ block:'center' });
+}
+function typingInField(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+}
+window.addEventListener('keydown', (e) => {
+  // Never hijack keys while editing a note or in any input.
+  if (typingInField(e.target)) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === 'j' || k === 'J') {
+    e.preventDefault();
+    jumpToFinding(findingPtr + 1); // wraps to first after the last
+  } else if (k === 'a' || k === 'A') {
+    // The ONLY shortcut that may cost tokens — mirrors the 分析此文件 button.
+    const btn = $('act-analyze');
+    if (btn && !btn.classList.contains('analyzing')) {
+      e.preventDefault();
+      setAnalyzing(true);
+      vscode.postMessage({ type:'analyze' });
+    }
+  } else if (k === 'ArrowLeft' || k === 'Escape') {
+    // Hand focus back to the file tree. Ignore ArrowLeft mid-text-selection.
+    const sel = window.getSelection();
+    if (k === 'ArrowLeft' && sel && !sel.isCollapsed) return;
+    e.preventDefault();
+    vscode.postMessage({ type:'focusTree' });
+  }
+  // ArrowUp/ArrowDown fall through to the browser → natural code scrolling.
 });
 
 vscode.postMessage({ type:'ready' });

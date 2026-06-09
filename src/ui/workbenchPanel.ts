@@ -70,6 +70,10 @@ export interface WorkbenchTokenUsage {
 /** Actions the workbench can trigger in the extension host. */
 export interface WorkbenchActions {
   open(path: string): void;
+  /** Opens a file AND moves keyboard focus into the document view. */
+  openFocus(path: string): void;
+  /** Moves keyboard focus to the document view, if a file is showing. */
+  focusDoc(): void;
   disposeFinding(path: string, id: string, kind: FindingDispositionKind): void;
   locate(path: string, line: number): void;
   globalAnalysis(): void;
@@ -122,6 +126,8 @@ interface WorkbenchPatchSnapshot {
 
 type InboundMessage =
   | { type: 'select'; path: string }
+  | { type: 'openFocus'; path: string }
+  | { type: 'focusDoc' }
   | { type: 'dispose'; path: string; id: string; kind: FindingDispositionKind }
   | { type: 'locate'; path: string; line: number }
   | { type: 'global' }
@@ -222,6 +228,16 @@ export class WorkbenchPanel {
     WorkbenchPanel.current?.scheduleRefresh();
   }
 
+  /** Reveals the workbench and moves keyboard focus into its file tree. */
+  static focusTree(): void {
+    const inst = WorkbenchPanel.current;
+    if (!inst) {
+      return;
+    }
+    inst.panel.reveal(undefined, /* preserveFocus */ false);
+    void inst.panel.webview.postMessage({ type: 'focusTree' });
+  }
+
   /**
    * Forces a full HTML rebuild (not the in-place patch), if open. Needed when
    * something outside the file-structure signature changes the rendered markup —
@@ -243,6 +259,20 @@ export class WorkbenchPanel {
       active,
       message: message ?? '',
     });
+  }
+
+  /**
+   * Flashes a short notice inside the workbench (current window), used instead of
+   * a parent-window notification — which is invisible when the workbench lives in
+   * its own auxiliary window. `kind` styles it warn (default) or error.
+   */
+  static flashNotice(message: string, kind: 'warn' | 'error' = 'warn'): boolean {
+    const inst = WorkbenchPanel.current;
+    if (!inst) {
+      return false;
+    }
+    void inst.panel.webview.postMessage({ type: 'notice', message, kind });
+    return true;
   }
 
   /** Clears persisted folder expand/collapse state so a new review re-initialises it. */
@@ -369,6 +399,12 @@ export class WorkbenchPanel {
     switch (msg.type) {
       case 'select':
         this.actions.open(msg.path);
+        break;
+      case 'openFocus':
+        this.actions.openFocus(msg.path);
+        break;
+      case 'focusDoc':
+        this.actions.focusDoc();
         break;
       case 'dispose':
         this.actions.disposeFinding(msg.path, msg.id, msg.kind);
@@ -598,6 +634,15 @@ export class WorkbenchPanel {
   button:disabled { opacity:.5; cursor:default; }
   .empty { color:var(--dim); text-align:center; margin-top:18vh; line-height:1.8; }
   .confirmed-tag { color:var(--green); font-size:.76rem; }
+  .wb-notice { margin-top:.4rem; padding:.4rem .55rem; border-radius:6px; font-size:.74rem; line-height:1.5;
+    background:var(--vscode-inputValidation-warningBackground, rgba(216,192,32,.14));
+    color:var(--vscode-inputValidation-warningForeground, var(--yellow));
+    border:1px solid var(--vscode-inputValidation-warningBorder, rgba(216,192,32,.4)); }
+  .wb-notice[hidden] { display:none; }
+  .wb-notice.error {
+    background:var(--vscode-inputValidation-errorBackground, rgba(241,76,76,.14));
+    color:var(--vscode-inputValidation-errorForeground, var(--red));
+    border-color:var(--vscode-inputValidation-errorBorder, rgba(241,76,76,.4)); }
 </style>
 </head>
 <body>
@@ -630,6 +675,7 @@ export class WorkbenchPanel {
             <button class="gp-cancel" id="globalCancel">${esc(t.cancel)}</button>
           </div>
         </div>
+        <div class="wb-notice" id="wbNotice" hidden></div>
         <div class="model-row">
           <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">${esc(t.modelPrefix)}<b>${esc(state.modelLabel)}</b></span>
           <button id="pickModel">${esc(t.switch)}</button>
@@ -855,6 +901,60 @@ export class WorkbenchPanel {
     });
   }, { passive: true });
 
+  // Keyboard navigation (LOCAL ONLY — selecting/opening files never costs tokens).
+  treeEl.setAttribute('tabindex', '0');
+  function visibleIndexOf(path) {
+    for (let i = 0; i < visible.length; i++) if (visible[i].path === path) return i;
+    return -1;
+  }
+  function scrollRowIntoView(i) {
+    const top = i * ROW_H, bottom = top + ROW_H;
+    if (top < treeEl.scrollTop) treeEl.scrollTop = top;
+    else if (bottom > treeEl.scrollTop + treeEl.clientHeight) treeEl.scrollTop = bottom - treeEl.clientHeight;
+    renderWindow();
+  }
+  function moveSelection(delta) {
+    if (visible.length === 0) return;
+    let i = selectedPath ? visibleIndexOf(selectedPath) : -1;
+    // Step to the next/prev FILE row (skip folders for selection).
+    let next = i;
+    for (let step = 0; step < visible.length; step++) {
+      next = next + delta;
+      if (next < 0) next = visible.length - 1;
+      if (next >= visible.length) next = 0;
+      if (visible[next].kind === 'file') break;
+    }
+    const row = visible[next];
+    if (!row || row.kind !== 'file') return;
+    for (const r of ROWS) if (r.kind === 'file') r.active = (r.path === row.path);
+    selectedPath = row.path;
+    renderWindow();
+    scrollRowIntoView(next);
+  }
+  treeEl.addEventListener('keydown', (e) => {
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    const k = e.key;
+    if (k === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+    else if (k === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+    else if (k === 'Enter') {
+      e.preventDefault();
+      const i = selectedPath ? visibleIndexOf(selectedPath) : -1;
+      const row = i >= 0 ? visible[i] : null;
+      if (row && row.kind === 'folder') {
+        if (EXPANDED.has(row.path)) EXPANDED.delete(row.path); else EXPANDED.add(row.path);
+        computeVisible(); renderWindow(); send({ type:'toggleFolder', path: row.path });
+      } else if (selectedPath) {
+        // Open the selected file AND move focus into the code view.
+        send({ type:'openFocus', path: selectedPath });
+      }
+    } else if (k === 'ArrowRight') {
+      e.preventDefault();
+      // Jump focus to the code view (if a file is showing there).
+      send({ type:'focusDoc' });
+    }
+  });
+
   filterInput.addEventListener('input', () => {
     const s = vscode.getState() || {};
     s.filterScope = reviewKey;
@@ -898,9 +998,24 @@ export class WorkbenchPanel {
     if (active) { const m = byId('globalProgMsg'); if (m) m.textContent = message || ''; }
   }
 
+  // In-workbench notice (replaces parent-window notifications, which are
+  // invisible when the workbench lives in its own auxiliary window).
+  let noticeTimer = 0;
+  function flashNotice(message, kind) {
+    const el = byId('wbNotice');
+    if (!el) return;
+    el.textContent = message || '';
+    el.className = 'wb-notice' + (kind === 'error' ? ' error' : kind === 'warn' ? ' warn' : '');
+    el.hidden = false;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { el.hidden = true; noticeTimer = 0; }, 6000);
+  }
+
   window.addEventListener('message', (e) => {
     const msg = e.data;
     if (msg && msg.type === 'globalProgress') { setGlobalProgress(msg.active, msg.message); return; }
+    if (msg && msg.type === 'focusTree') { treeEl.focus(); return; }
+    if (msg && msg.type === 'notice') { flashNotice(msg.message, msg.kind); return; }
     if (!msg || msg.type !== 'patch') return;
     (msg.files || []).forEach((p) => {
       const r = rowByPath.get(p.path);

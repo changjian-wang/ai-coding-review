@@ -8,7 +8,6 @@ import { ModelProvider } from './ai/modelProvider';
 import {
   analyzeFile,
   analyzeGlobal,
-  generateFixDiff,
   generateFixProposals,
   translateSelection,
   explainCode,
@@ -23,7 +22,6 @@ import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
-import { runWithProgress } from './ui/progressSteps';
 import { WorkbenchPanel, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
 import { DocumentPanel, type DocModel } from './ui/documentPanel';
 import { FixProposalPanel } from './ui/fixProposalPanel';
@@ -544,6 +542,8 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
 function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
   return {
     open: (path) => void openFileInPanel(path),
+    openFocus: (path) => void (async () => { await openFileInPanel(path); DocumentPanel.focus(); })(),
+    focusDoc: () => DocumentPanel.focus(),
     disposeFinding: (path, id, kind) => void disposeFinding(path, id, kind),
     locate: (path, line) => void locateInFile(path, line),
     globalAnalysis: () => void runGlobalAnalysis(),
@@ -1053,6 +1053,7 @@ function docActions() {
       void locateInFile(path, line, endLine, findingId),
     analyze: (path: string) => void analyzeByPath(path),
     jumpNext: (path: string) => jumpToNextUnseen(path),
+    focusTree: () => WorkbenchPanel.focusTree(),
   };
 }
 
@@ -1293,7 +1294,9 @@ async function analyzeByPath(rel: string): Promise<void> {
   }
   const model = await models.resolve();
   if (!model) {
-    void vscode.window.showErrorMessage(m().model.noModel);
+    if (!DocumentPanel.flashNotice(rel, m().model.noModel, 'error')) {
+      void vscode.window.showErrorMessage(m().model.noModel);
+    }
     return;
   }
 
@@ -1302,7 +1305,9 @@ async function analyzeByPath(rel: string): Promise<void> {
     const uri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
     document = await vscode.workspace.openTextDocument(uri);
   } catch {
-    void vscode.window.showWarningMessage(m().analysis.cannotOpen(rel));
+    if (!DocumentPanel.flashNotice(rel, m().analysis.cannotOpen(rel), 'error')) {
+      void vscode.window.showWarningMessage(m().analysis.cannotOpen(rel));
+    }
     return;
   }
 
@@ -1310,33 +1315,35 @@ async function analyzeByPath(rel: string): Promise<void> {
   // (the user may switch scope mid-analysis) is discarded instead of overwriting
   // the current session's findings.
   const reviewSet = session.reviewSet;
-  const fileName = rel.split('/').pop() ?? rel;
   analyzingPaths.add(rel);
   WorkbenchPanel.refreshIfOpen();
+  // Progress + result feedback lives in the document view (current window), not a
+  // parent-window notification that is invisible when the workbench is full-screen.
+  // The 「分析此文件」 button shows an indeterminate progress bar via setAnalyzing.
   DocumentPanel.setAnalyzing(rel, true);
+  const cts = new vscode.CancellationTokenSource();
   let ok = false;
   try {
-    await runWithProgress(m().analysis.analyzingFile(rel), async (token, report) => {
-      try {
-        report(m().analysis.callingModel(fileName));
-        const findings = await analyzeFile(model, document, token);
-        if (session.reviewSet !== reviewSet) {
-          return;
-        }
-        report(m().analysis.writingFindings);
-        session.setFindings(rel, findings);
-        refreshDocPanel(rel);
-        ok = true;
-        transientInfo(
-          findings.length
-            ? m().analysis.foundIssues(rel, findings.length)
-            : m().analysis.noIssues(rel),
-        );
-      } catch (err) {
-        reportError(err);
-      }
-    });
+    const findings = await analyzeFile(model, document, cts.token);
+    if (session.reviewSet !== reviewSet) {
+      return;
+    }
+    session.setFindings(rel, findings);
+    refreshDocPanel(rel);
+    ok = true;
+    DocumentPanel.flashNotice(
+      rel,
+      findings.length ? m().analysis.foundIssues(rel, findings.length) : m().analysis.noIssues(rel),
+      'info',
+    );
+  } catch (err) {
+    const message =
+      err instanceof AnalysisError ? err.message : String((err as Error)?.message ?? err);
+    if (!DocumentPanel.flashNotice(rel, m().review.error(message), 'error')) {
+      reportError(err);
+    }
   } finally {
+    cts.dispose();
     analyzingPaths.delete(rel);
     WorkbenchPanel.refreshIfOpen();
     DocumentPanel.setAnalyzing(rel, false, ok);
@@ -1636,20 +1643,24 @@ async function runGlobalAnalysis(): Promise<void> {
   }
   const unready = reviewSet.files.filter((f) => !session.fileFullySeen(f.path));
   if (unready.length) {
-    const pick = await vscode.window.showWarningMessage(
-      m().global.confirmUnready(unready.length),
-      m().common.continue,
-      m().common.cancel,
-    );
-    if (pick !== m().common.continue) {
-      WorkbenchPanel.setGlobalProgress(false);
-      return;
+    // Do NOT run global analysis until everything is read. Surface this inside
+    // the workbench (current window) — a parent-window prompt is invisible when
+    // the workbench is in its own auxiliary window — and jump to the first
+    // unread file so the reviewer can see exactly what is left.
+    WorkbenchPanel.setGlobalProgress(false);
+    const shown = WorkbenchPanel.flashNotice(m().global.blockedUnready(unready.length), 'warn');
+    if (!shown) {
+      transientWarning(m().global.blockedUnready(unready.length));
     }
+    void openFileInPanel(unready[0].path);
+    return;
   }
   const model = await models.resolve();
   if (!model) {
     WorkbenchPanel.setGlobalProgress(false);
-    void vscode.window.showErrorMessage(m().model.noModel);
+    if (!WorkbenchPanel.flashNotice(m().model.noModel, 'error')) {
+      void vscode.window.showErrorMessage(m().model.noModel);
+    }
     return;
   }
 
@@ -1723,7 +1734,7 @@ function showGlobalReport(): void {
     session.globalConfirmed,
     locateInFile,
     () => session.confirmGlobal(),
-    generateCandidateDiff,
+    (spotId, file, line) => void openGlobalFix(spotId, file, line),
     {
       seen: cov.seen,
       total: cov.total,
@@ -1732,7 +1743,89 @@ function showGlobalReport(): void {
       findings: findingsCount,
     },
     () => void vscode.commands.executeCommand('codereview.openWorkbench'),
+    (spotId, file, line) => {
+      const d = session.globalFixDisposition(spotId, file, line, globalFixAnchor(spotId));
+      return d?.kind === 'fixed';
+    },
   );
+}
+
+/** Looks up a global fix spot's anchor snippet by id, for disposition resolution. */
+function globalFixAnchor(spotId: string): string | undefined {
+  return session.globalReport?.fixSpots.find((s) => s.id === spotId)?.anchor;
+}
+
+/**
+ * Opens the fix-proposal panel for a global fix spot and, when a proposal is
+ * applied, records the disposition via design Y+X (reuse the mapped file-level
+ * finding's disposition, else an independent global store). Lets cross-file
+ * findings be fixed with the same one-click flow as file-level findings.
+ */
+async function openGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
+  if (!ensureReviewPath(file, m().actions.analyze)) {
+    return;
+  }
+  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
+  if (!spot) {
+    return;
+  }
+  const cwd = activeCwd();
+  if (!cwd) {
+    return;
+  }
+  await locateInFile(file, spot.line, spot.endLine);
+  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
+  const findingLike: Finding = {
+    id: spotId,
+    line: spot.line,
+    endLine: spot.endLine,
+    anchor: spot.anchor,
+    severity: spot.severity,
+    title: spot.title,
+    detail: spot.detail,
+    suggestion: spot.suggestion,
+  };
+  FixProposalPanel.show({
+    rel: file,
+    cacheKey: `global::${session.getRepoName()}::${file}::${hashString(spotId + spot.title + spot.detail)}`,
+    fileUri,
+    finding: {
+      id: spotId,
+      line: spot.line,
+      title: spot.title,
+      detail: spot.detail,
+      suggestion: spot.suggestion,
+    },
+    generate: async (token, userContext) => {
+      const model = await models.resolve();
+      if (!model) {
+        throw new Error(m().fix.noModelClipboard);
+      }
+      const content = await readReviewFileText(file);
+      return generateFixProposals(model, file, content, findingLike, token, userContext);
+    },
+    onApplied: (edit) => {
+      setAppliedFix(fixKey(file, spotId), edit);
+      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, { kind: 'fixed', at: Date.now() });
+      WorkbenchPanel.refreshIfOpen();
+      GlobalReportPanel.refreshIfOpen();
+      void (async () => {
+        await reloadDocPanel(file);
+        await locateInFile(file, spot.line, spot.endLine);
+      })();
+      transientInfo(m().fix.applied);
+    },
+    onUndone: () => {
+      deleteAppliedFix(fixKey(file, spotId));
+      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, null);
+      WorkbenchPanel.refreshIfOpen();
+      GlobalReportPanel.refreshIfOpen();
+      void (async () => {
+        await reloadDocPanel(file);
+        await locateInFile(file, spot.line, spot.endLine);
+      })();
+    },
+  });
 }
 
 /** Builds a Markdown review report from the session and opens it as a new document. */
@@ -1766,51 +1859,6 @@ async function exportReviewReport(): Promise<void> {
   const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: markdown });
   await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
   transientInfo(m().report.exported);
-}
-
-/** Generates a candidate unified diff for a fix spot and opens it in an editor. */
-async function generateCandidateDiff(fix: {
-  file: string;
-  line: number;
-  title: string;
-  detail: string;
-  suggestion?: string;
-}): Promise<void> {
-  const cwd = activeCwd();
-  if (!cwd) {
-    return;
-  }
-  // The fix spot comes from the model's global report; only act on files that
-  // are actually part of the current review set to avoid reading arbitrary paths.
-  if (!session.reviewSet?.files.some((f) => f.path === fix.file)) {
-    void vscode.window.showWarningMessage(m().global.fixFileNotInScope(fix.file));
-    return;
-  }
-  const model = await models.resolve();
-  if (!model) {
-    void vscode.window.showErrorMessage(m().model.noModel);
-    return;
-  }
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: m().global.generatingDiff(fix.file),
-      cancellable: true,
-    },
-    async (_p, token) => {
-      try {
-        const content = await readReviewFileText(fix.file);
-        const diff = await generateFixDiff(model, fix.file, content, fix, token);
-        const diffDoc = await vscode.workspace.openTextDocument({
-          language: 'diff',
-          content: diff || m().global.noDiff,
-        });
-        await vscode.window.showTextDocument(diffDoc, { preview: true, viewColumn: vscode.ViewColumn.Active });
-      } catch (err) {
-        reportError(err);
-      }
-    },
-  );
 }
 
 async function locateInFile(

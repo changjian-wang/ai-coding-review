@@ -178,6 +178,7 @@ export const en = {
     inProgress: 'Global analysis is already running…',
     inProgressWait: 'Global analysis is already running, please wait',
     confirmUnready: (n: number) => `${n} file(s) not fully read. Run global analysis anyway?`,
+    blockedUnready: (n: number) => `${n} file(s) not fully read — read them through first, then run global analysis.`,
     preparing: (total: number) => `Preparing to analyze ${total} file(s)…`,
     reading: (read: number, total: number, p: string) =>
       `Reading sources (${read}/${total}) ${p}…`,
@@ -440,7 +441,8 @@ export const en = {
     confirmedReadBadge: '✓ Confirmed reading the global conclusion',
     confirmReadBtn: 'Confirm I read the global conclusion',
     generating: 'Generating…',
-    genDiffBtn: 'Let AI generate a candidate diff',
+    fixWithCopilot: '🪄 Fix with Copilot',
+    fixedBadge: '✓ Fixed',
   },
 
   gh: {

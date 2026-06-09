@@ -159,6 +159,7 @@ export const zh: Messages = {
     inProgress: '全局分析正在进行中…',
     inProgressWait: '全局分析正在进行中，请稍候',
     confirmUnready: (n) => `还有 ${n} 个文件未读完，仍要进行全局分析吗？`,
+    blockedUnready: (n) => `还有 ${n} 个文件未读完——请先读完再进行全局分析。`,
     preparing: (total) => `准备分析 ${total} 个文件…`,
     reading: (read, total, p) => `读取源码 (${read}/${total}) ${p}…`,
     analyzing: (total) => `已读取 ${total} 个文件，正在调用模型进行跨文件分析…`,
@@ -398,7 +399,8 @@ export const zh: Messages = {
     confirmedReadBadge: '✓ 已确认阅读全局结论',
     confirmReadBtn: '确认读过全局结论',
     generating: '生成中…',
-    genDiffBtn: '让 AI 生成候选 diff',
+    fixWithCopilot: '🪄 Copilot 修复',
+    fixedBadge: '✓ 已修复',
   },
 
   gh: {

@@ -440,12 +440,14 @@ export class FixProposalPanel {
     const text = doc.getText();
     const edit = new vscode.WorkspaceEdit();
     for (const e of edits) {
-      const idx = text.indexOf(e.oldText);
-      if (idx < 0 || text.indexOf(e.oldText, idx + 1) >= 0) {
+      // Tolerant, whitespace-insensitive location (matches the applicability
+      // check), so an edit that locates uniquely can always be applied.
+      const hits = locateEditOffsets(text, e.oldText);
+      if (hits.length !== 1) {
         return false;
       }
-      const start = doc.positionAt(idx);
-      const end = doc.positionAt(idx + e.oldText.length);
+      const start = doc.positionAt(hits[0].start);
+      const end = doc.positionAt(hits[0].end);
       edit.replace(this.request.fileUri, new vscode.Range(start, end), e.newText);
     }
     const ok = await vscode.workspace.applyEdit(edit);
@@ -835,13 +837,56 @@ function countOccurrences(haystack: string, needle: string): number {
   if (!needle) {
     return 0;
   }
-  let n = 0;
-  let i = 0;
-  while ((i = haystack.indexOf(needle, i)) !== -1) {
-    n++;
-    i += needle.length;
+  return locateEditOffsets(haystack, needle).length;
+}
+
+/**
+ * Locates every occurrence of `needle` inside `haystack` tolerantly: comparison
+ * is line-based with trailing whitespace and EOL (CRLF/LF) ignored, so a model
+ * snippet whose indentation/line-endings differ slightly from the file still
+ * matches. Returns character offset ranges into the ORIGINAL `haystack` (so the
+ * exact bytes can be replaced). Leading/trailing blank lines in `needle` are
+ * dropped so the match lands on real content.
+ *
+ * This fixes the "看得见却无法应用" case where exact `indexOf(oldText)` failed on
+ * whitespace differences.
+ */
+function locateEditOffsets(haystack: string, needle: string): { start: number; end: number }[] {
+  const norm = (l: string) => l.replace(/\s+$/, '');
+  // Build line spans of the haystack: each line's [start,end) offset in the
+  // original string, plus its trailing-trimmed text.
+  const lines: { start: number; end: number; text: string }[] = [];
+  let pos = 0;
+  for (const raw of haystack.split('\n')) {
+    // raw excludes the '\n'; it may still carry a trailing '\r'.
+    lines.push({ start: pos, end: pos + raw.length, text: norm(raw) });
+    pos += raw.length + 1; // +1 for the '\n' we split on
   }
-  return n;
+  // Needle as trailing-trimmed lines, with leading/trailing blank lines dropped.
+  let needleLines = needle.split(/\r?\n/).map(norm);
+  while (needleLines.length > 0 && needleLines[0] === '') {
+    needleLines.shift();
+  }
+  while (needleLines.length > 0 && needleLines[needleLines.length - 1] === '') {
+    needleLines.pop();
+  }
+  if (needleLines.length === 0) {
+    return [];
+  }
+  const out: { start: number; end: number }[] = [];
+  for (let i = 0; i + needleLines.length <= lines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < needleLines.length; j++) {
+      if (lines[i + j].text !== needleLines[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      out.push({ start: lines[i].start, end: lines[i + needleLines.length - 1].end });
+    }
+  }
+  return out;
 }
 
 

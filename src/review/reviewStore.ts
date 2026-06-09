@@ -69,6 +69,12 @@ export interface ReviewSnapshot {
   /** Cross-file analysis report, once global analysis has run. */
   globalReport?: GlobalReport;
   globalDone: boolean;
+  /**
+   * Dispositions for global fix spots that could NOT be mapped to a file-level
+   * finding (pure cross-file discoveries). Keyed by the fix spot's stable id.
+   * Mappable spots reuse the file-level finding's disposition instead.
+   */
+  globalFixDispositions?: Record<string, FindingDisposition>;
   /** The reviewer's final verdict, once submitted. */
   conclusion?: ReviewConclusion;
   /** Estimated LLM token usage accumulated over this review (approximate). */

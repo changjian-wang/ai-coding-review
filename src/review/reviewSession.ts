@@ -351,6 +351,72 @@ export class ReviewSession {
     return this.snapshot?.globalReport;
   }
 
+  /**
+   * Maps a global fix spot to the file-level finding it refers to, when one
+   * exists (same file + overlapping line, or matching anchor). Lets a global
+   * fix reuse — and stay in sync with — the file-level disposition (design Y).
+   * Returns undefined for pure cross-file discoveries (design X applies).
+   */
+  resolveFixSpotFinding(file: string, line: number, anchor?: string): Finding | undefined {
+    const findings = this.findings(file);
+    if (anchor && anchor.trim()) {
+      const byAnchor = findings.find((f) => f.anchor && f.anchor.trim() === anchor.trim());
+      if (byAnchor) {
+        return byAnchor;
+      }
+    }
+    return findings.find((f) => {
+      const start = f.line;
+      const end = f.endLine && f.endLine > f.line ? f.endLine : f.line;
+      return line >= start && line <= end;
+    });
+  }
+
+  /**
+   * Disposition of a global fix spot, resolving design Y (file-level finding) or
+   * design X (independent store) automatically.
+   */
+  globalFixDisposition(
+    spotId: string,
+    file: string,
+    line: number,
+    anchor?: string,
+  ): FindingDisposition | undefined {
+    const finding = this.resolveFixSpotFinding(file, line, anchor);
+    if (finding) {
+      return this.findingDisposition(file, finding.id);
+    }
+    return this.snapshot?.globalFixDispositions?.[spotId];
+  }
+
+  /**
+   * Records (or clears) a global fix spot's disposition. Writes to the mapped
+   * file-level finding when one exists (Y), else to the independent store (X).
+   */
+  setGlobalFixDisposition(
+    spotId: string,
+    file: string,
+    line: number,
+    anchor: string | undefined,
+    disposition: FindingDisposition | null,
+  ): void {
+    const finding = this.resolveFixSpotFinding(file, line, anchor);
+    if (finding) {
+      this.setFindingDisposition(file, finding.id, disposition);
+      return;
+    }
+    if (!this.snapshot) {
+      return;
+    }
+    const store = (this.snapshot.globalFixDispositions ??= {});
+    if (disposition) {
+      store[spotId] = disposition;
+    } else {
+      delete store[spotId];
+    }
+    void this.persist();
+  }
+
   /** Reviewer confirms they have read the global conclusion. */
   confirmGlobal(): void {
     if (this.snapshot?.globalReport) {
