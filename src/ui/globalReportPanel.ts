@@ -208,9 +208,10 @@ export class GlobalReportPanel {
       : `<span class="gate-done-badge">${esc(t.confirmedReadBadge)}</span>`;
     const gateChecklist = gatePassed
       ? `<div class="gate-pass">${esc(t.gateAllMet)}</div>`
-      : `<ul class="gate-list">
-          ${gateRow(filesAllReady, filesAllReady ? t.gateFilesDone : m().conclusion.gateFilesUnready(filesTotal - filesReady), filesAction)}
-          ${gateRow(confirmed, confirmed ? t.gateGlobalDone : m().conclusion.gateGlobalUnconfirmed, confirmAction)}
+      : `<div class="gate-howto">${esc(t.gateHowTo)}</div>
+        <ul class="gate-list">
+          ${gateRow(filesAllReady, filesAllReady ? t.gateFilesDone : t.gateStepFiles(filesTotal - filesReady), filesAction)}
+          ${gateRow(confirmed, confirmed ? t.gateGlobalDone : t.gateStepGlobal, confirmAction)}
         </ul>`;
     const banner = `
     <div class="hero">
@@ -442,6 +443,7 @@ export class GlobalReportPanel {
 
   /* Gate checklist in the decision banner */
   .gate-wrap { margin-top: .7rem; }
+  .gate-howto { font-size: .8rem; font-weight: 600; margin-bottom: .5rem; opacity: .92; }
   .gate-list { list-style: none; padding: 0; margin: 0; display: grid; gap: .45rem; }
   .gate-item { display: flex; align-items: center; gap: .5rem; font-size: .82rem; }
   .gate-item .gate-mark { width: 1rem; text-align: center; flex-shrink: 0; }
