@@ -334,6 +334,8 @@ export const en = {
     translatingInline: 'Translating…',
     toggleTitle: 'Click to expand / collapse',
     line: 'Line {0}',
+    estimatedLineHint:
+      "Estimated line: the finding's anchor snippet wasn't found in the file, so this line comes from the model and may be off.",
     suggestionPrefix: 'Suggestion: ',
     locate: 'Locate',
     revertPrefix: 'Undo ',

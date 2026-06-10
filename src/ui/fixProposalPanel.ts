@@ -423,15 +423,19 @@ export class FixProposalPanel {
     let best = edits[0];
     let bestDist = Number.POSITIVE_INFINITY;
     for (const e of edits) {
-      const idx = content.indexOf(e.oldText);
-      if (idx < 0) {
-        continue;
-      }
-      const startLine = content.slice(0, idx).split('\n').length; // 1-based
-      const dist = Math.abs(startLine - targetLine);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = e;
+      // Locate via the layered matcher (NOT exact indexOf): the model's oldText
+      // often differs from the file by indentation, so indexOf returns -1 and the
+      // edit gets skipped — collapsing the choice back to edits[0] (typically a
+      // top-of-block comment), which is exactly the "post-apply jumps to the
+      // _comment line" bug. locateEditOffsets is whitespace/punct tolerant.
+      const hits = locateEditOffsets(content, e.oldText);
+      for (const hit of hits) {
+        const startLine = content.slice(0, hit.start).split('\n').length; // 1-based
+        const dist = Math.abs(startLine - targetLine);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = e;
+        }
       }
     }
     return best;
@@ -566,25 +570,34 @@ export class FixProposalPanel {
       return fallback;
     }
     const applied = this.state.proposals.find((p) => p.applied);
-    if (!applied) {
+    if (!applied || applied.edits.length === 0) {
       return fallback;
     }
     try {
       const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
       const text = doc.getText();
-      const anchor = applied.edits[0]?.newText ?? '';
-      const idx = anchor ? text.indexOf(anchor) : -1;
-      if (idx < 0) {
-        return fallback;
+      // Among ALL applied edits' newText occurrences, show the one starting
+      // nearest the finding line — NOT blindly edits[0], which for a multi-edit
+      // fix is usually a top-of-block comment far from the real change (that made
+      // the header jump to e.g. the _comment line 47 instead of the Path at 65).
+      // Use the layered matcher so indentation/EOL drift after save still locates.
+      const target = this.request.finding.line;
+      let bestLine = -1;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const e of applied.edits) {
+        if (!e.newText) {
+          continue;
+        }
+        for (const hit of locateEditOffsets(text, e.newText)) {
+          const startLine = doc.positionAt(hit.start).line + 1;
+          const dist = Math.abs(startLine - target);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestLine = startLine;
+          }
+        }
       }
-      // Anchor to the last line of the applied content. positionAt points just
-      // past the snippet; if it ends with a newline, step back to the real末行.
-      const end = doc.positionAt(idx + anchor.length);
-      let zeroBased = end.line;
-      if (end.character === 0 && zeroBased > 0) {
-        zeroBased -= 1;
-      }
-      return zeroBased + 1;
+      return bestLine > 0 ? bestLine : fallback;
     } catch {
       return fallback;
     }

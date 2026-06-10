@@ -302,6 +302,7 @@ export const zh: Messages = {
     translatingInline: '正在翻译…',
     toggleTitle: '点击展开 / 收起',
     line: '第 {0} 行',
+    estimatedLineHint: '估计行号：未在文件中找到该发现的锚点片段，此行号来自模型，可能不准。',
     suggestionPrefix: '建议：',
     locate: '定位',
     revertPrefix: '撤销 ',

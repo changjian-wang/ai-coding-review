@@ -15,6 +15,13 @@ export interface DocFinding {
   suggestion?: string;
   disposition?: DocFindingDisposition;
   dispositionReason?: string;
+  /**
+   * True when the line came from the model's reported number because the
+   * finding's `anchor` snippet could NOT be located in the file — so the line is
+   * an estimate and may be off. Drives a small "~" marker so a mis-placed card
+   * (the hard-to-reproduce case) is at least identifiable.
+   */
+  estimatedLine?: boolean;
 }
 
 /** A persisted annotation (translation, explanation, or note) anchored to a file. */
@@ -465,6 +472,7 @@ export class DocumentPanel {
   .finditem.suggestion .fi-dot { background:var(--blue); }
   .fi-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .fi-line { font-family:var(--vscode-editor-font-family, monospace); font-size:11px; color:var(--blue); flex:none; }
+  .fi-line.estimated, .f-line.estimated { color:var(--yellow, #d8c020); cursor:help; }
   .fi-ok { color:var(--green); flex:none; }
 
   /* Reading view */
@@ -638,7 +646,9 @@ function findingCard(f) {
     '<span class="f-title"></span>' +
     '<span class="f-status"></span>' +
     '<span class="f-spacer"></span>' +
-    '<span class="f-line">' + fmt(T.line, f.line) + '</span>';
+    '<span class="f-line' + (f.estimatedLine ? ' estimated' : '') + '"' +
+      (f.estimatedLine ? ' title="' + T.estimatedLineHint + '"' : '') + '>' +
+      (f.estimatedLine ? '~' : '') + fmt(T.line, f.line) + '</span>';
   head.querySelector('.f-title').textContent = f.title;
   if (f.disposition) {
     head.querySelector('.f-status').textContent = '✓ ' + (DISP_LABEL[f.disposition] || f.disposition);
@@ -983,7 +993,9 @@ function renderFindbar() {
     item.className = 'finditem ' + f.severity + (f.disposition ? ' confirmed' : '');
     item.innerHTML =
       '<span class="fi-dot"></span><span class="fi-title"></span>' +
-      '<span class="fi-line">' + fmt(T.line, f.line) + '</span>' +
+      '<span class="fi-line' + (f.estimatedLine ? ' estimated' : '') + '"' +
+        (f.estimatedLine ? ' title="' + T.estimatedLineHint + '"' : '') + '>' +
+        (f.estimatedLine ? '~' : '') + fmt(T.line, f.line) + '</span>' +
       (f.disposition ? '<span class="fi-ok">✓</span>' : '');
     item.querySelector('.fi-title').textContent = f.title;
     item.addEventListener('click', () => focusFindingCard(f));

@@ -821,6 +821,11 @@ function buildDocModel(
         suggestion: f.suggestion,
         disposition: d?.kind,
         dispositionReason: d?.reason,
+        // The line is an estimate when the finding HAS an anchor snippet but it
+        // could not be located (no `anchors` entry) — we fell back to the model's
+        // reported line, which may be wrong. No anchor at all = nothing to verify
+        // against, so we don't flag it.
+        estimatedLine: !!f.anchor && !a,
       };
     }),
     annotations: session.annotations(relPath).map((a) => ({
@@ -883,41 +888,49 @@ async function computeFindingAnchors(
 
 /**
  * Locates a multi-line snippet inside a document by *line* content, returning
- * its 1-based start and last line. Matching is EOL- and trailing-whitespace
- * insensitive (each line is `trimEnd`-compared), which is essential because
- * `applyEdit` inserts the proposal's `\n`-terminated text but a subsequent
- * `save()` may normalise the file to CRLF — making a raw `indexOf(newText)`
- * fail forever. Leading/trailing blank lines in the snippet are ignored so the
- * anchor lands on real content. Returns undefined when no unambiguous match
- * exists.
+ * its 1-based start and last line. Matching is layered, mirroring the fix-panel
+ * apply matcher so finding anchors locate as reliably as fixes do:
+ *   1. strict  — trailing-whitespace-insensitive (exact content);
+ *   2. tolerant — trim both ends (indentation drift, common when the model
+ *      re-emits the snippet with different leading spaces);
+ *   3. punct   — also ignore a trailing comma/semicolon (model drops the file's
+ *      "}," → "}" on a boundary line).
+ * Each layer is tried whole before the next; the first match wins (anchors are
+ * meant to be unique). EOL- and trailing-whitespace insensitive throughout,
+ * essential because an applied edit's `\n` text may be normalised to CRLF on
+ * save. Leading/trailing blank lines in the snippet are ignored. Returns
+ * undefined when no layer matches.
  */
 function locateSnippetLines(
   docLines: string[],
   snippet: string,
 ): { line: number; endLine: number } | undefined {
-  const needle = snippet
-    .split(/\r?\n/)
-    .map((l) => l.replace(/\s+$/, ''))
-    .filter((l, i, arr) => {
-      // drop leading/trailing blank lines but keep interior ones
-      const before = arr.slice(0, i).every((x) => x === '');
-      const after = arr.slice(i + 1).every((x) => x === '');
-      return !(l === '' && (before || after));
-    });
-  if (needle.length === 0) {
+  const rawNeedle = snippet.split(/\r?\n/).filter((l, i, arr) => {
+    // drop leading/trailing blank lines but keep interior ones
+    const before = arr.slice(0, i).every((x) => x.trim() === '');
+    const after = arr.slice(i + 1).every((x) => x.trim() === '');
+    return !(l.trim() === '' && (before || after));
+  });
+  if (rawNeedle.length === 0) {
     return undefined;
   }
-  const hay = docLines.map((l) => l.replace(/\s+$/, ''));
-  for (let i = 0; i + needle.length <= hay.length; i++) {
-    let ok = true;
-    for (let j = 0; j < needle.length; j++) {
-      if (hay[i + j] !== needle[j]) {
-        ok = false;
-        break;
+  const trimEnd = (l: string) => l.replace(/\s+$/, '');
+  const trimBoth = (l: string) => l.trim();
+  const trimPunct = (l: string) => l.trim().replace(/[,;]$/, '');
+  for (const norm of [trimEnd, trimBoth, trimPunct]) {
+    const needle = rawNeedle.map(norm);
+    const hay = docLines.map(norm);
+    for (let i = 0; i + needle.length <= hay.length; i++) {
+      let ok = true;
+      for (let j = 0; j < needle.length; j++) {
+        if (hay[i + j] !== needle[j]) {
+          ok = false;
+          break;
+        }
       }
-    }
-    if (ok) {
-      return { line: i + 1, endLine: i + needle.length };
+      if (ok) {
+        return { line: i + 1, endLine: i + needle.length };
+      }
     }
   }
   return undefined;
