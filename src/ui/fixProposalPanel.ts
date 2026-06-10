@@ -116,6 +116,17 @@ export class FixProposalPanel {
     FixProposalPanel.instance?.panel.dispose();
   }
 
+  /**
+   * Closes the panel only if it's showing a proposal for `rel`. Called when that
+   * file is re-analyzed: the findings (and their ids) are replaced, so a proposal
+   * tied to an old finding is stale and must not linger next to fresh results.
+   */
+  static closeIfFile(rel: string): void {
+    if (FixProposalPanel.instance?.request.rel === rel) {
+      FixProposalPanel.instance.panel.dispose();
+    }
+  }
+
   /** Re-renders the open panel in the current language (after a language switch). */
   static refreshIfOpen(): void {
     const inst = FixProposalPanel.instance;
@@ -723,8 +734,16 @@ export class FixProposalPanel {
           } else if (p.applicable) {
             badge = '<span class="badge">' + esc(fmt(T.badgeProposal, i + 1)) + multi + '</span>';
           } else {
-            const bad = (p.matches || []).filter(function (m) { return m !== 1; }).length;
-            badge = '<span class="badge">' + esc(fmt(T.badgeUnlocatable, bad, editCount)) + '</span>';
+            // Diagnose precisely: 0 = snippet not found (file changed / drift),
+            // >1 = ambiguous. The old "{bad}/{total}" read like a success count
+            // ("1/1") and confused users. Show the worst edit's real状况 plus a
+            // hover with every edit's match count.
+            const ms = p.matches || [];
+            const gone = ms.filter(function (m) { return m === 0; }).length;
+            const ambig = ms.filter(function (m) { return m > 1; }).length;
+            const label = gone > 0 ? T.badgeNotFound : T.badgeAmbiguous;
+            const detail = ms.map(function (m, k) { return fmt(T.editMatchDetail, k + 1, m); }).join('\\n');
+            badge = '<span class="badge bad-badge" title="' + esc(detail) + '">' + esc(label) + '</span>';
           }
           let btn;
           if (p.applied) {
@@ -911,7 +930,16 @@ function locateEditOffsets(haystack: string, needle: string): { start: number; e
   if (strict.length > 0) {
     return strict;
   }
-  return locateLinesBy(haystack, needle, trimBothEnds);
+  const tolerant = locateLinesBy(haystack, needle, trimBothEnds);
+  if (tolerant.length > 0) {
+    return tolerant;
+  }
+  // Last resort: models frequently drop a trailing comma/semicolon on a JSON/JS
+  // boundary line (file has "}," but the snippet has "}"), which breaks the
+  // exact line compare and yields 0 matches. Ignore a single trailing , or ;
+  // when comparing. Replacement still rewrites the file's real byte range, so
+  // the original punctuation is preserved unless newText changes it.
+  return locateLinesBy(haystack, needle, trimNoPunct);
 }
 
 /** Leading run of spaces/tabs on a line (its indentation). */
@@ -921,6 +949,8 @@ function leadingWhitespace(s: string): string {
 
 const trimEndOnly = (l: string) => l.replace(/\s+$/, '');
 const trimBothEnds = (l: string) => l.trim();
+/** Trim both ends, then drop a single trailing comma/semicolon (JSON/JS boundary drift). */
+const trimNoPunct = (l: string) => l.trim().replace(/[,;]$/, '');
 
 /**
  * Line-based matcher: returns char-offset ranges into the ORIGINAL `haystack`
@@ -988,11 +1018,29 @@ function resolveEditAt(
     return null;
   }
   const tolerant = locateLinesBy(haystack, oldText, trimBothEnds);
-  if (tolerant.length !== 1) {
+  if (tolerant.length === 1) {
+    const hit = tolerant[0];
+    return { start: hit.start, end: hit.end, replacement: reindentToFile(haystack, hit, newText) };
+  }
+  if (tolerant.length > 1) {
     return null;
   }
-  const hit = tolerant[0];
-  return { start: hit.start, end: hit.end, replacement: reindentToFile(haystack, hit, newText) };
+  // Last resort: ignore a trailing comma/semicolon difference on boundary lines
+  // (model dropped the file's "}," → "}"). Re-indent as usual, then preserve the
+  // file's own trailing punctuation so applying never strips a comma and breaks
+  // the JSON/JS — append it only when newText's last line doesn't already end
+  // with the same punctuation.
+  const noPunct = locateLinesBy(haystack, oldText, trimNoPunct);
+  if (noPunct.length !== 1) {
+    return null;
+  }
+  const h = noPunct[0];
+  let replacement = reindentToFile(haystack, h, newText);
+  const filePunct = (haystack.slice(h.start, h.end).match(/[,;]\s*$/) || [''])[0].trim();
+  if (filePunct && !/[,;]\s*$/.test(replacement)) {
+    replacement += filePunct;
+  }
+  return { start: h.start, end: h.end, replacement };
 }
 
 /**

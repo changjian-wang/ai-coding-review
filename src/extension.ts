@@ -1327,6 +1327,10 @@ async function analyzeByPath(rel: string): Promise<void> {
       return;
     }
     session.setFindings(rel, findings);
+    // Re-analysis replaces this file's findings (new ids), so any fix proposal
+    // open for THIS file is now tied to a finding that no longer exists — close
+    // it instead of leaving a stale proposal beside the fresh results.
+    FixProposalPanel.closeIfFile(rel);
     refreshDocPanel(rel);
     ok = true;
     DocumentPanel.flashNotice(
@@ -1360,7 +1364,11 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
     return;
   }
   const findingId = finding.id;
-  await locateInFile(rel, finding.line, finding.endLine, finding.id);
+  // Opening the fix panel must NOT move the document — the reviewer is reading a
+  // specific spot and only the explicit 「定位」 button should scroll. Resolve the
+  // finding's CURRENT line via the shared authority (no side effects), so the
+  // panel header/edit-picking use the live line while the document stays put.
+  const { startLine: liveLine } = await resolveLiveRange(rel, finding.line, finding.endLine, finding.id);
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
@@ -1368,7 +1376,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
     fileUri,
     finding: {
       id: finding.id,
-      line: finding.line,
+      line: liveLine,
       title: finding.title,
       detail: finding.detail,
       suggestion: finding.suggestion,
@@ -1797,7 +1805,10 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   if (!cwd) {
     return;
   }
-  await locateInFile(file, spot.line, spot.endLine);
+  // Opening the fix panel must NOT move the document — only the report's explicit
+  // 「定位」 scrolls. Resolve the spot's current line via the shared authority
+  // (no side effects) so the panel header is right while the document stays put.
+  const { startLine: liveLine } = await resolveLiveRange(file, spot.line, spot.endLine, spotId);
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
   const findingLike: Finding = {
     id: spotId,
@@ -1815,7 +1826,7 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
     fileUri,
     finding: {
       id: spotId,
-      line: spot.line,
+      line: liveLine,
       title: spot.title,
       detail: spot.detail,
       suggestion: spot.suggestion,
@@ -2022,26 +2033,25 @@ async function exportReviewReport(): Promise<void> {
   transientInfo(m().report.exported);
 }
 
-async function locateInFile(
+/**
+ * Resolves a finding's CURRENT 1-based line range in the live document — the
+ * single source of truth for "where is this finding now". Pure/read-only: it
+ * neither opens the document panel nor scrolls. Precedence (content beats the
+ * drift-prone stored numbers):
+ *   1. an applied Copilot fix → its current text in the live document;
+ *   2. otherwise the finding's verbatim `anchor` snippet from analysis;
+ *   3. fall back to the stored line numbers.
+ * The result is clamped to the file length.
+ */
+async function resolveLiveRange(
   relPath: string,
   line: number,
   endLine?: number,
   findingId?: string,
-): Promise<void> {
-  if (!ensureReviewPath(relPath, m().actions.locate)) {
-    return;
-  }
-  if (DocumentPanel.currentPath !== relPath) {
-    await openFileInPanel(relPath);
-  }
-  const total = session.fileState(relPath)?.totalLines ?? 0;
+): Promise<{ startLine: number; stopLine: number }> {
   let startLine = Math.max(1, Math.floor(Number.isFinite(line) ? line : 1));
   let stopLine = endLine && endLine > startLine ? Math.floor(endLine) : startLine;
 
-  // Prefer content-based anchoring over the (drift-prone) line numbers:
-  //   1. an applied Copilot fix → locate its current text in the live document;
-  //   2. otherwise the finding's verbatim `anchor` snippet from analysis;
-  //   3. only fall back to the stored line numbers when neither resolves.
   const reanchored = findingId ? await reanchorToAppliedFix(relPath, findingId) : undefined;
   if (reanchored) {
     startLine = reanchored.startLine;
@@ -2054,10 +2064,34 @@ async function locateInFile(
     }
   }
 
+  const total = session.fileState(relPath)?.totalLines ?? 0;
   if (total > 0) {
     startLine = Math.min(startLine, total);
     stopLine = Math.min(stopLine, total);
   }
+  return { startLine, stopLine };
+}
+
+/**
+ * Reveals a finding in the document panel and SCROLLS it into view. Thin
+ * composition over {@link resolveLiveRange} (the line-resolution authority) plus
+ * the two side effects — opening the panel and scrolling. Callers that only need
+ * the line (e.g. opening the fix panel without moving the document) should call
+ * `resolveLiveRange` directly instead of this.
+ */
+async function locateInFile(
+  relPath: string,
+  line: number,
+  endLine?: number,
+  findingId?: string,
+): Promise<void> {
+  if (!ensureReviewPath(relPath, m().actions.locate)) {
+    return;
+  }
+  if (DocumentPanel.currentPath !== relPath) {
+    await openFileInPanel(relPath);
+  }
+  const { startLine, stopLine } = await resolveLiveRange(relPath, line, endLine, findingId);
   DocumentPanel.scrollTo(startLine, stopLine);
 }
 

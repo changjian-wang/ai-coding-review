@@ -625,6 +625,7 @@ const DISP_LABEL = DISP;
 function findingCard(f) {
   const div = document.createElement('div');
   div.className = 'finding ' + f.severity + (f.disposition ? ' disposed' : '');
+  div.dataset.findingId = f.id;
   // Default-collapse anything already dealt with (fixed / commented / ignored)
   // so resolved findings stop splitting the code; keep open findings expanded.
   if (f.disposition) div.classList.add('collapsed');
@@ -985,7 +986,7 @@ function renderFindbar() {
       '<span class="fi-line">' + fmt(T.line, f.line) + '</span>' +
       (f.disposition ? '<span class="fi-ok">✓</span>' : '');
     item.querySelector('.fi-title').textContent = f.title;
-    item.addEventListener('click', () => vscode.postMessage({ type:'locate', line:f.line, endLine:f.endLine, id:f.id }));
+    item.addEventListener('click', () => focusFindingCard(f));
     list.appendChild(item);
   }
 }
@@ -1142,13 +1143,34 @@ window.addEventListener('message', (ev) => {
 });
 
 /**
- * Scrolls the source view so the 1-based line sits at the vertical center of the
- * viewport. Uses the row's real offsetTop (not scrollIntoView, which mis-centers
- * while later finding/annotation cards are still streaming in and the document
- * height is still growing). Runs after a frame so layout is settled.
+ * Forces enough rows rendered that the target line can actually be centered: the
+ * line PLUS roughly half a viewport of rows below it. Without this, locating a
+ * line whose following rows haven't streamed in yet leaves the document too
+ * short to scroll, so the target sticks near the top with a big empty gap above
+ * (seen right after applying a fix, which reloads + re-chunks the document).
+ */
+function ensureCentered(line) {
+  if (!srcCtx || srcCtx.i >= srcCtx.total) return;
+  const row = contentEl.querySelector('.ln[data-line="' + line + '"]');
+  const rowH = row ? row.offsetHeight || 18 : 18;
+  const halfViewportRows = Math.ceil((contentEl.clientHeight / 2) / rowH) + 4;
+  ensureSrcRenderedThrough(line + halfViewportRows);
+}
+
+/**
+ * Scrolls the source view so the located CODE line sits at the vertical center
+ * of the viewport — the intent of the card's 「定位」 button: go look at the code.
+ * (Reading a finding's card is the other intent — clicking the finding in the
+ * list or pressing J — and goes through focusFindingCard / centerCard.) Uses the
+ * row's real offsetTop (not scrollIntoView, which mis-centers while later cards
+ * are still streaming in and the document height is still growing). Runs after a
+ * frame so layout is settled.
  */
 function centerLine(line) {
   const doIt = () => {
+    // Make sure there's enough content below the target to actually center it,
+    // otherwise scrollTop is capped and the line sticks to the top.
+    ensureCentered(line);
     const row = contentEl.querySelector('.ln[data-line="' + line + '"]');
     if (!row) return;
     const target = row.offsetTop - (contentEl.clientHeight / 2) + (row.offsetHeight / 2);
@@ -1159,8 +1181,52 @@ function centerLine(line) {
   requestAnimationFrame(() => requestAnimationFrame(doIt));
 }
 
-// ---- Keyboard navigation (LOCAL ONLY — never triggers a paid model call
-// except the explicit A = analyze) ------------------------------------------
+/**
+ * Centers a finding's CARD (not its code line) in the viewport — the intent when
+ * you click a finding in the list or press J: you want to READ the problem, so
+ * the card is what should land in the middle. (Clicking the card's own 「定位」
+ * button is the other intent — go look at the code — and goes through scrollTo /
+ * centerLine instead.) Switches to source mode, makes sure the target line is
+ * rendered, expands the card if it was collapsed, lights the locate highlight on
+ * the code line, then centers the card.
+ */
+function focusFindingCard(f) {
+  if (mode !== 'source') setMode('source');
+  const start = f.line;
+  const end = (f.endLine && f.endLine > start) ? f.endLine : start;
+  ensureSrcRenderedThrough(end);
+  // Keep the gutter/line highlight so you can still see which code it's about.
+  locatedRange = { start: start, end: end };
+  applyLocateHighlight();
+  centerCard(f.id, start);
+}
+
+/**
+ * Scrolls so the finding card with the given id sits at the vertical center.
+ * Expands a collapsed card first (you clicked to read it). Falls back to
+ * centering the code line when the card isn't found (e.g. an out-of-bounds
+ * finding rendered only in the footer).
+ */
+function centerCard(findingId, fallbackLine) {
+  const doIt = () => {
+    // Ensure enough rows below so the card can reach the middle (not capped to
+    // the top) — same streaming-height issue centerLine guards against.
+    ensureCentered(fallbackLine);
+    const card = contentEl.querySelector('.finding[data-finding-id="' + findingId + '"]');
+    if (!card) {
+      const row = contentEl.querySelector('.ln[data-line="' + fallbackLine + '"]');
+      if (!row) return;
+      contentEl.scrollTop = Math.max(0, row.offsetTop - (contentEl.clientHeight / 2) + (row.offsetHeight / 2));
+      return;
+    }
+    card.classList.remove('collapsed');
+    const mid = card.offsetTop + card.offsetHeight / 2;
+    contentEl.scrollTop = Math.max(0, mid - (contentEl.clientHeight / 2));
+  };
+  // Two rAFs: the first lets the mode switch / expand commit, the second
+  // measures after layout so offsetTop/offsetHeight are final.
+  requestAnimationFrame(() => requestAnimationFrame(doIt));
+}
 let findingPtr = -1;
 function findingNav() {
   // Findings sorted by line; J cycles through them.
@@ -1170,14 +1236,9 @@ function jumpToFinding(idx) {
   const list = findingNav();
   if (list.length === 0) return;
   findingPtr = ((idx % list.length) + list.length) % list.length; // wrap both ways
-  const f = list[findingPtr];
-  if (mode !== 'source') setMode('source');
-  const start = f.line;
-  const end = (f.endLine && f.endLine > start) ? f.endLine : start;
-  ensureSrcRenderedThrough(end);
-  locatedRange = { start: start, end: end };
-  applyLocateHighlight();
-  centerLine(start);
+  // J browses findings — same "read the problem" intent as clicking the list,
+  // so center the card, not the code line.
+  focusFindingCard(list[findingPtr]);
 }
 function typingInField(el) {
   if (!el) return false;
