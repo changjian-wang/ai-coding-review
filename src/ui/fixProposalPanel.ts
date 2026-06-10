@@ -15,6 +15,12 @@ export interface FixProposalRequest {
   generate: (token: vscode.CancellationToken, userContext?: string) => Promise<FixProposal[]>;
   /** Called after a proposal is successfully applied (so disposition can flip). */
   onApplied: (edit: { oldText: string; newText: string }) => void;
+  /**
+   * Called after edits change the file, with each edit's line splice (pre-edit
+   * coordinates) so seen-line coverage can be remapped to stay attached to the
+   * code. Fires for both apply and undo.
+   */
+  onSplices?: (splices: { startLine: number; oldLineCount: number; newLineCount: number }[]) => void;
   /** Called whenever the file content changes via this panel (apply or undo). */
   onFileChanged?: () => void;
   /** Called when the user reverts via the panel's own undo button. */
@@ -267,6 +273,7 @@ export class FixProposalPanel {
       const content = await this.currentFileText();
       const views: ProposalView[] = proposals.map((p) => buildView(p, content, false));
       this.setState({ kind: 'ready', proposals: views });
+      this.logLocateDiagnostics(views, content, 'generate');
       FixProposalPanel.saveCache(key, {
         proposals: views.map(toCached),
         lastApplied: undefined,
@@ -302,6 +309,43 @@ export class FixProposalPanel {
     });
     const lastApplied = views.find((p) => p.applied)?.title;
     this.setState({ kind: 'ready', proposals: views, lastApplied });
+    this.logLocateDiagnostics(views, content, 'restore');
+  }
+
+  /**
+   * Observability (temporary): logs, once per generation/restore, which locate
+   * rung each proposal edit lands on — so the real "无法应用" frequency and the
+   * exact-vs-loose-vs-fail distribution can be measured on a big project before
+   * the line-number-contract rework. Never throws; pure observation.
+   */
+  private logLocateDiagnostics(
+    views: ProposalView[],
+    content: string,
+    source: 'generate' | 'restore',
+  ): void {
+    try {
+      const rel = vscode.workspace.asRelativePath(this.request.fileUri);
+      const log = applyLog();
+      const stamp = new Date().toISOString();
+      views.forEach((p, pi) => {
+        const cls = p.edits.map((e) => classifyLocate(content, e.oldText));
+        const summary = cls
+          .map((c, ei) => `edit${ei + 1}=${c.rung}${c.count !== 1 ? `×${c.count}` : ''}`)
+          .join(' ');
+        const applicable = cls.every((c) => c.count === 1);
+        log.appendLine(
+          `[${stamp}] ${source} ${rel} · #${pi + 1} "${p.title}" applicable=${applicable} · ${summary}`,
+        );
+        cls.forEach((c, ei) => {
+          if (c.rung !== 'L1-exact') {
+            const firstOld = p.edits[ei].oldText.split('\n').find((l) => l.trim() !== '') ?? '';
+            log.appendLine(`    ↳ edit${ei + 1} ${c.rung}: ${JSON.stringify(firstOld.slice(0, 90))}`);
+          }
+        });
+      });
+    } catch {
+      // diagnostics must never break the panel
+    }
   }
 
   /** Snapshots the current panel state into the cache (no-op if not yet ready). */
@@ -496,19 +540,33 @@ export class FixProposalPanel {
     const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
     const text = doc.getText();
     const edit = new vscode.WorkspaceEdit();
+    const splices: { startLine: number; oldLineCount: number; newLineCount: number }[] = [];
     for (const e of edits) {
       // Strict placement first; on the indentation-tolerant fallback the
       // replacement is re-indented to the file so applying never eats indent.
       const r = resolveEditAt(text, e.oldText, e.newText);
       if (!r) {
+        const firstOld = e.oldText.split('\n').find((l) => l.trim() !== '') ?? '';
+        applyLog().appendLine(
+          `[${new Date().toISOString()}] apply-FAIL ${vscode.workspace.asRelativePath(this.request.fileUri)} · ${classifyLocate(text, e.oldText).rung} · ${JSON.stringify(firstOld.slice(0, 90))}`,
+        );
         return false;
       }
       const start = doc.positionAt(r.start);
       const end = doc.positionAt(r.end);
+      // Line splice in PRE-edit coordinates, for seen-line remapping.
+      splices.push({
+        startLine: start.line + 1,
+        oldLineCount: end.line - start.line + 1,
+        newLineCount: r.replacement.split('\n').length,
+      });
       edit.replace(this.request.fileUri, new vscode.Range(start, end), r.replacement);
     }
     const ok = await vscode.workspace.applyEdit(edit);
     if (ok) {
+      // Remap coverage BEFORE the downstream reload re-measures totalLines, so the
+      // new lines read as unread and shifted lines keep their state.
+      this.request.onSplices?.(splices);
       // Auto-save so downstream tools (linters, watchers, the next analysis pass)
       // see the change immediately. Users can still revert via 「撤销修改」 or VCS.
       try {
@@ -1067,6 +1125,52 @@ function locateFlexibleBlock(
     }
   }
   return out;
+}
+
+/**
+ * Ordered tolerance ladder used by {@link locateEditOffsets} (applicability) and
+ * {@link resolveEditAt} (apply). Kept as one array so the OBSERVABILITY classifier
+ * ({@link classifyLocate}) reports exactly the rung those two would land on.
+ *
+ * NOTE: this MUST stay in the same order as the rungs inside `locateEditOffsets`
+ * and `resolveEditAt`. If you add/remove/reorder a rung there, update it here.
+ */
+const LOCATE_LADDER: { name: string; find: (h: string, n: string) => { start: number; end: number }[] }[] = [
+  { name: 'L1-exact', find: (h, n) => locateLinesBy(h, n, trimEndOnly) },
+  { name: 'L2-indent', find: (h, n) => locateLinesBy(h, n, trimBothEnds) },
+  { name: 'L3-punct', find: (h, n) => locateLinesBy(h, n, trimNoPunct) },
+  { name: 'L4-collapse', find: (h, n) => locateLinesBy(h, n, trimCollapse) },
+  { name: 'L5-flexible', find: (h, n) => locateFlexibleBlock(h, n) },
+];
+
+/**
+ * Classifies how an edit's `oldText` locates in `haystack`: which ladder rung
+ * first yields a match and the match count there. Mirrors the first-non-empty
+ * semantics of {@link locateEditOffsets}, so `count` equals what
+ * {@link countOccurrences} returns (1 = applicable, 0 = not found, >1 = ambiguous).
+ * Pure observation — never changes apply behaviour.
+ */
+function classifyLocate(haystack: string, needle: string): { rung: string; count: number } {
+  for (const rung of LOCATE_LADDER) {
+    const hits = rung.find(haystack, needle);
+    if (hits.length > 0) {
+      return { rung: rung.name, count: hits.length };
+    }
+  }
+  return { rung: 'FAIL', count: 0 };
+}
+
+/**
+ * Lazy OutputChannel for apply/locate observability (temporary instrumentation
+ * to measure the real "无法应用" frequency and rung distribution before the
+ * line-number-contract rework). Visible to the user: Output → "AI Coding Review · Apply".
+ */
+let applyLogChannel: vscode.OutputChannel | undefined;
+function applyLog(): vscode.OutputChannel {
+  if (!applyLogChannel) {
+    applyLogChannel = vscode.window.createOutputChannel('AI Coding Review · Apply');
+  }
+  return applyLogChannel;
 }
 
 /**

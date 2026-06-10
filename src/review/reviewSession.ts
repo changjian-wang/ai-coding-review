@@ -232,6 +232,47 @@ export class ReviewSession {
     return true;
   }
 
+  /**
+   * Remaps seen-line coverage after an applied fix splices the file. The applied
+   * code is AI-generated, so the WHOLE new block is marked unread (so the reviewer
+   * must re-read what the model wrote), while lines outside the block keep their
+   * prior read/unread state attached to the same code: lines below the edit shift
+   * by the line delta, lines above are untouched. Splices are in the file's
+   * pre-edit coordinates; multiple splices (one proposal, several edits) are
+   * folded high-line-first so each stays valid in original coordinates.
+   */
+  remapSeenAfterSplices(
+    path: string,
+    splices: { startLine: number; oldLineCount: number; newLineCount: number }[],
+  ): void {
+    if (this.isDeletedFile(path) || splices.length === 0) {
+      return;
+    }
+    const s = this.fileState(path);
+    if (!s) {
+      return;
+    }
+    const ordered = [...splices].sort((a, b) => b.startLine - a.startLine);
+    let seen = new Set(s.seenLines);
+    for (const sp of ordered) {
+      const delta = sp.newLineCount - sp.oldLineCount;
+      const removedEnd = sp.startLine + sp.oldLineCount; // 1-based, exclusive (pre-edit coords)
+      const next = new Set<number>();
+      for (const p of seen) {
+        if (p < sp.startLine) {
+          next.add(p); // above the edit: untouched
+        } else if (p >= removedEnd) {
+          next.add(p + delta); // below the edit: shift, keep state
+        }
+        // else: inside the replaced region → drop, so the whole applied block
+        // [startLine, startLine+newLineCount) ends up unread (never re-added).
+      }
+      seen = next;
+    }
+    s.seenLines = [...seen].sort((a, b) => a - b);
+    this.persistFile(path);
+  }
+
   /** A file is "ready" when it has been analyzed and every finding has a disposition. */
   fileReady(path: string): boolean {
     if (this.isDeletedFile(path)) {

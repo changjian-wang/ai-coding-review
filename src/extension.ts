@@ -1435,6 +1435,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
       })();
       transientInfo(m().fix.applied);
     },
+    onSplices: (splices) => session.remapSeenAfterSplices(rel, splices),
     onUndone: () => {
       deleteAppliedFix(fixKey(rel, findingId));
       session.setFindingDisposition(rel, findingId, null);
@@ -1863,6 +1864,7 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
       })();
       transientInfo(m().fix.applied);
     },
+    onSplices: (splices) => session.remapSeenAfterSplices(file, splices),
     onUndone: () => {
       deleteAppliedFix(fixKey(file, spotId));
       session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, null);
