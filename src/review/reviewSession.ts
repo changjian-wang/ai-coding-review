@@ -178,7 +178,10 @@ export class ReviewSession {
       return { seen: 0, total: 0 };
     }
     const s = this.fileState(path);
-    return { seen: s?.seenLines.length ?? 0, total: s?.totalLines ?? 0 };
+    const total = s?.totalLines ?? 0;
+    const seen = s?.seenLines.length ?? 0;
+    // Clamp so historical out-of-range data can never render as e.g. 190/189.
+    return { seen: total > 0 ? Math.min(seen, total) : seen, total };
   }
 
   /** Records the file's total line count, the first time it is opened. */
@@ -189,6 +192,15 @@ export class ReviewSession {
     const s = this.fileState(path);
     if (s && s.totalLines !== total) {
       s.totalLines = total;
+      // Drop any seen lines now beyond the (re-measured) end of file, so seen can
+      // never exceed total — otherwise a later, smaller line count leaves stale
+      // out-of-range entries and coverage shows e.g. 190/189.
+      if (total > 0) {
+        const trimmed = s.seenLines.filter((l) => l <= total);
+        if (trimmed.length !== s.seenLines.length) {
+          s.seenLines = trimmed;
+        }
+      }
       this.persistFile(path);
     }
   }
