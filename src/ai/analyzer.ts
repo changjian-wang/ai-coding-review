@@ -108,7 +108,16 @@ async function ask(
   ];
   let out = '';
   try {
-    const response = await model.sendRequest(messages, {}, token);
+    // Temperature 0: this is a review tool, so its value is reproducibility —
+    // the same input should yield the same findings, not a fresh random subset
+    // each run (which forced re-analyzing until results converged). Determinism
+    // over diversity for every op (analyze/global/fix/diff). Not all providers
+    // honor this identically, but it sharply cuts run-to-run variance.
+    const response = await model.sendRequest(
+      messages,
+      { modelOptions: { temperature: 0 } },
+      token,
+    );
     for await (const chunk of response.text) {
       out += chunk;
     }
