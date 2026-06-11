@@ -21,7 +21,7 @@ Ships **AI Coding Review** to the VS Code Marketplace. Mirrors [`docs/RELEASING.
 | Marketplace item id | `changjian-wang.ai-coding-review` | `publisher` + `name` in `package.json` |
 | Publisher | `changjian-wang` | marketplace.visualstudio.com/manage |
 | Store title | `AI Coding Review` | `displayName` |
-| Repo | `changjian-wang/codereview` (public) | GitHub |
+| Repo | `changjian-wang/ai-coding-review` (public) | GitHub |
 
 > The bare id `codereview` is taken on the Marketplace, so `name` is `ai-coding-review`. **Changing `name` or `publisher` rewrites the install id AND every README badge/link `itemName`** (`https://img.shields.io/visual-studio-marketplace/.../changjian-wang.ai-coding-review`). If you must change it, grep both READMEs for the old `itemName` and fix every occurrence or the badges/links die.
 

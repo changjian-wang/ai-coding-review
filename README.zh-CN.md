@@ -10,7 +10,7 @@ VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 
 [English](README.md) | 简体中文
 
-<img src="https://raw.githubusercontent.com/changjian-wang/codereview/main/docs/images/workbench-zh.png" width="820" alt="代码审查工作台" />
+<img src="https://raw.githubusercontent.com/changjian-wang/ai-coding-review/main/docs/images/workbench-zh.png" width="820" alt="代码审查工作台" />
 
 ## 核心理念
 

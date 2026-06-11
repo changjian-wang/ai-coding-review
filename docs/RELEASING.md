@@ -9,7 +9,7 @@ How to cut and publish a new version of **AI Coding Review** to the VS Code Mark
 | Marketplace item | `changjian-wang.ai-coding-review` | derived from `publisher` + `name` in `package.json` |
 | Publisher | `changjian-wang` | https://marketplace.visualstudio.com/manage |
 | Store title | `AI Coding Review` | `displayName` in `package.json` |
-| Repo | `changjian-wang/codereview` (public) | GitHub |
+| Repo | `changjian-wang/ai-coding-review` (public) | GitHub |
 
 > The bare id `codereview` is taken on the Marketplace, so the extension id
 > (`name`) is `ai-coding-review`. Changing `name` or `publisher`

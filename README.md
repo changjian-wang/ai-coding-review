@@ -10,7 +10,7 @@ VS Code extension · powered by the GitHub CLI and Copilot models
 
 English | [简体中文](README.zh-CN.md)
 
-<img src="https://raw.githubusercontent.com/changjian-wang/codereview/main/docs/images/workbench-en.png" width="820" alt="AI Coding Review Workbench" />
+<img src="https://raw.githubusercontent.com/changjian-wang/ai-coding-review/main/docs/images/workbench-en.png" width="820" alt="AI Coding Review Workbench" />
 
 ## Core ideas
 
