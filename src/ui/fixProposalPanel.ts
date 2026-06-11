@@ -3,6 +3,14 @@ import type { FixEdit, FixProposal } from '../ai/analyzer';
 import { escAttr as escapeHtml, nonce as makeNonce } from './html';
 import { m, fmt, resolveLanguage } from '../i18n';
 import { DocumentPanel } from './documentPanel';
+import {
+  editStatus,
+  hashContent,
+  isPresent,
+  looseMatches,
+  resolveEditAt,
+  strictMatches,
+} from '../review/editLocator';
 
 /** Inputs needed to drive the panel. */
 export interface FixProposalRequest {
@@ -32,10 +40,14 @@ interface ProposalView {
   rationale: string;
   /** One or more edits applied together as a single solution. */
   edits: FixEdit[];
-  /** Per-edit occurrence count of the text we'd search for (oldText, or newText once applied). */
-  matches: number[];
-  /** True when every edit can be uniquely located, so the whole proposal is applicable. */
+  /** True when every edit can be located (line-anchored or strict-unique), so the whole proposal is applicable. */
   applicable: boolean;
+  /**
+   * When not applicable, why: `'gone'` (an original snippet no longer matches the
+   * file — the file changed, so regenerate) or `'ambiguous'` (no line anchor and
+   * the snippet matches several places). Undefined when applicable or applied.
+   */
+  blockReason?: 'gone' | 'ambiguous';
   applied: boolean;
   /** Pre-rendered HTML showing a minimal +/- diff for every edit in this proposal. */
   diffHtml: string;
@@ -59,6 +71,14 @@ interface CachedEntry {
   proposals: CachedProposal[];
   lastApplied?: string;
   generatedAt: number;
+  /**
+   * Hash of the file content the proposals were generated against. On restore we
+   * regenerate when this no longer matches the live file AND nothing is applied
+   * yet — so the model's line anchors / snippets always refer to the current file
+   * instead of being fuzzily forced onto drifted content. Absent for legacy and
+   * post-apply snapshots (those rely on per-edit content verification instead).
+   */
+  fileHash?: string;
   /** Reviewer's supplementary note used to steer (re)generation; persisted so it survives reloads. */
   supplement?: string;
 }
@@ -273,11 +293,11 @@ export class FixProposalPanel {
       const content = await this.currentFileText();
       const views: ProposalView[] = proposals.map((p) => buildView(p, content, false));
       this.setState({ kind: 'ready', proposals: views });
-      this.logLocateDiagnostics(views, content, 'generate');
       FixProposalPanel.saveCache(key, {
         proposals: views.map(toCached),
         lastApplied: undefined,
         generatedAt: Date.now(),
+        fileHash: hashContent(content),
         supplement: supplement || undefined,
       });
     } catch (err) {
@@ -297,55 +317,28 @@ export class FixProposalPanel {
   /** Rebuilds runtime ProposalView state from a cached entry against the current file content. */
   private async restoreFromCache(entry: CachedEntry): Promise<void> {
     const content = await this.currentFileText();
+    const anyApplied = entry.proposals.some((p) => p.applied);
+    // Anti-drift: if the file changed since these proposals were generated and we
+    // haven't applied any of them, the cached line anchors / snippets refer to a
+    // stale file. Regenerate against the live content instead of fuzzily forcing
+    // them on — this is the root-cause fix for 「无法应用」 after a sync/edit.
+    // (When something IS applied, the file legitimately changed because WE changed
+    // it, so we keep the cache and verify the applied state by content presence.)
+    if (!anyApplied && entry.fileHash && entry.fileHash !== hashContent(content)) {
+      throw new Error('stale-cache');
+    }
     const views: ProposalView[] = entry.proposals.map((cached) => {
       const p = normaliseCached(cached);
       if (p.applied) {
         // Treat as still applied only when every edit's replacement is present;
         // otherwise the change was undone externally — show it as re-appliable.
-        const allPresent = p.edits.every((e) => countOccurrences(content, e.newText) >= 1);
+        const allPresent = p.edits.every((e) => isPresent(content, e.newText));
         return buildView(p, content, allPresent);
       }
       return buildView(p, content, false);
     });
     const lastApplied = views.find((p) => p.applied)?.title;
     this.setState({ kind: 'ready', proposals: views, lastApplied });
-    this.logLocateDiagnostics(views, content, 'restore');
-  }
-
-  /**
-   * Observability (temporary): logs, once per generation/restore, which locate
-   * rung each proposal edit lands on — so the real "无法应用" frequency and the
-   * exact-vs-loose-vs-fail distribution can be measured on a big project before
-   * the line-number-contract rework. Never throws; pure observation.
-   */
-  private logLocateDiagnostics(
-    views: ProposalView[],
-    content: string,
-    source: 'generate' | 'restore',
-  ): void {
-    try {
-      const rel = vscode.workspace.asRelativePath(this.request.fileUri);
-      const log = applyLog();
-      const stamp = new Date().toISOString();
-      views.forEach((p, pi) => {
-        const cls = p.edits.map((e) => classifyLocate(content, e.oldText));
-        const summary = cls
-          .map((c, ei) => `edit${ei + 1}=${c.rung}${c.count !== 1 ? `×${c.count}` : ''}`)
-          .join(' ');
-        const applicable = cls.every((c) => c.count === 1);
-        log.appendLine(
-          `[${stamp}] ${source} ${rel} · #${pi + 1} "${p.title}" applicable=${applicable} · ${summary}`,
-        );
-        cls.forEach((c, ei) => {
-          if (c.rung !== 'L1-exact') {
-            const firstOld = p.edits[ei].oldText.split('\n').find((l) => l.trim() !== '') ?? '';
-            log.appendLine(`    ↳ edit${ei + 1} ${c.rung}: ${JSON.stringify(firstOld.slice(0, 90))}`);
-          }
-        });
-      });
-    } catch {
-      // diagnostics must never break the panel
-    }
   }
 
   /** Snapshots the current panel state into the cache (no-op if not yet ready). */
@@ -354,11 +347,15 @@ export class FixProposalPanel {
       return;
     }
     const key = FixProposalPanel.keyOf(this.request);
-    const generatedAt = FixProposalPanel.cache.get(key)?.generatedAt ?? Date.now();
+    const prev = FixProposalPanel.cache.get(key);
+    const generatedAt = prev?.generatedAt ?? Date.now();
     FixProposalPanel.saveCache(key, {
       proposals: this.state.proposals.map(toCached),
       lastApplied: this.state.lastApplied,
       generatedAt,
+      // Preserve the generation-time file hash so anti-drift still fires on the
+      // next restore. (Cleared once a proposal is applied — see restoreFromCache.)
+      fileHash: prev?.fileHash,
       supplement: this.currentSupplement || undefined,
     });
   }
@@ -413,17 +410,22 @@ export class FixProposalPanel {
       return;
     }
     const content = await this.currentFileText();
-    // Every edit in the proposal must locate uniquely, or we apply none of them.
+    // Every edit must resolve (line-anchored or strict-unique) before we touch
+    // the file, or we apply none of them. No fuzzy fallback: if an edit can't be
+    // verified against the current content, we refuse and ask for a regenerate
+    // rather than risk writing to the wrong place.
     for (const e of proposal.edits) {
-      const matches = countOccurrences(content, e.oldText);
-      if (matches === 0) {
-        this.markProposalError(idx, m().fixPanel.locateGone);
-        return;
+      if (resolveEditAt(content, e)) {
+        continue;
       }
-      if (matches > 1) {
-        this.markProposalError(idx, fmt(m().fixPanel.locateAmbiguous, matches));
-        return;
-      }
+      const reason = editStatus(content, e);
+      this.markProposalError(
+        idx,
+        reason === 'ambiguous'
+          ? fmt(m().fixPanel.locateAmbiguous, strictMatches(content, e.oldText).length)
+          : m().fixPanel.locateGone,
+      );
+      return;
     }
     const ok = await this.applyEdits(proposal.edits);
     if (!ok) {
@@ -454,10 +456,10 @@ export class FixProposalPanel {
 
   /**
    * Picks which edit of a (possibly multi-segment) proposal to anchor the
-   * post-apply locate on. We score each edit by the 1-based line where its
-   * `oldText` begins in the pre-apply `content` and choose the one closest to
-   * the finding's line. This avoids anchoring to a top-of-file `using`/import
-   * edit when the real fix is elsewhere. Falls back to the first edit.
+   * post-apply locate on. Prefers the edit whose declared `startLine` is closest
+   * to the finding's line; for edits without a line anchor, falls back to where
+   * `oldText` resolves in the pre-apply `content`. This avoids anchoring to a
+   * top-of-file `using`/import edit when the real fix is elsewhere.
    */
   private anchorEditFor(edits: FixEdit[], content: string): FixEdit {
     if (edits.length <= 1) {
@@ -467,19 +469,14 @@ export class FixProposalPanel {
     let best = edits[0];
     let bestDist = Number.POSITIVE_INFINITY;
     for (const e of edits) {
-      // Locate via the layered matcher (NOT exact indexOf): the model's oldText
-      // often differs from the file by indentation, so indexOf returns -1 and the
-      // edit gets skipped — collapsing the choice back to edits[0] (typically a
-      // top-of-block comment), which is exactly the "post-apply jumps to the
-      // _comment line" bug. locateEditOffsets is whitespace/punct tolerant.
-      const hits = locateEditOffsets(content, e.oldText);
-      for (const hit of hits) {
-        const startLine = content.slice(0, hit.start).split('\n').length; // 1-based
-        const dist = Math.abs(startLine - targetLine);
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = e;
-        }
+      const startLine = e.startLine ?? resolveEditAt(content, e)?.startLine;
+      if (startLine === undefined) {
+        continue;
+      }
+      const dist = Math.abs(startLine - targetLine);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = e;
       }
     }
     return best;
@@ -492,7 +489,7 @@ export class FixProposalPanel {
     }
     const content = await this.currentFileText();
     for (const e of proposal.edits) {
-      const matches = countOccurrences(content, e.newText);
+      const matches = looseMatches(content, e.newText).length;
       if (matches === 0) {
         void vscode.window.showWarningMessage(m().fixPanel.undoGone);
         return;
@@ -502,8 +499,15 @@ export class FixProposalPanel {
         return;
       }
     }
-    // Reverse each edit (newText → oldText) and apply them as one undo step.
-    const reversed = proposal.edits.map((e) => ({ oldText: e.newText, newText: e.oldText }));
+    // Reverse each edit (newText → oldText) as one undo step. Carry the line
+    // anchor forward so a single-edit revert line-anchors on newText (tolerant of
+    // the reindent apply may have done); multi-edit reverts fall back to Ctrl+Z.
+    const reversed: FixEdit[] = proposal.edits.map((e) => ({
+      oldText: e.newText,
+      newText: e.oldText,
+      ...(e.startLine ? { startLine: e.startLine } : {}),
+      ...(e.endLine ? { endLine: e.endLine } : {}),
+    }));
     const ok = await this.applyEdits(reversed);
     if (!ok) {
       void vscode.window.showWarningMessage(m().fixPanel.undoRace);
@@ -533,8 +537,9 @@ export class FixProposalPanel {
   }
 
   /**
-   * Applies a set of edits as a single workspace edit (one undo step). Every
-   * `oldText` must locate uniquely in the current file, or nothing is applied.
+   * Applies a set of edits as a single workspace edit (one undo step). Every edit
+   * must resolve via {@link resolveEditAt} (line-anchored verify, else strict
+   * unique content match), or nothing is applied — never a fuzzy guess.
    */
   private async applyEdits(edits: FixEdit[]): Promise<boolean> {
     const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
@@ -542,14 +547,8 @@ export class FixProposalPanel {
     const edit = new vscode.WorkspaceEdit();
     const splices: { startLine: number; oldLineCount: number; newLineCount: number }[] = [];
     for (const e of edits) {
-      // Strict placement first; on the indentation-tolerant fallback the
-      // replacement is re-indented to the file so applying never eats indent.
-      const r = resolveEditAt(text, e.oldText, e.newText);
+      const r = resolveEditAt(text, e);
       if (!r) {
-        const firstOld = e.oldText.split('\n').find((l) => l.trim() !== '') ?? '';
-        applyLog().appendLine(
-          `[${new Date().toISOString()}] apply-FAIL ${vscode.workspace.asRelativePath(this.request.fileUri)} · ${classifyLocate(text, e.oldText).rung} · ${JSON.stringify(firstOld.slice(0, 90))}`,
-        );
         return false;
       }
       const start = doc.positionAt(r.start);
@@ -634,24 +633,26 @@ export class FixProposalPanel {
     try {
       const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
       const text = doc.getText();
-      // Among ALL applied edits' newText occurrences, show the one starting
-      // nearest the finding line — NOT blindly edits[0], which for a multi-edit
-      // fix is usually a top-of-block comment far from the real change (that made
-      // the header jump to e.g. the _comment line 47 instead of the Path at 65).
-      // Use the layered matcher so indentation/EOL drift after save still locates.
+      // Show the change nearest the finding line — NOT blindly edits[0], which for
+      // a multi-edit fix is usually a top-of-block comment far from the real edit.
+      // Prefer each edit's declared startLine (robust, no search); fall back to a
+      // loose search of newText (tolerant of the reindent apply may have done).
       const target = this.request.finding.line;
       let bestLine = -1;
       let bestDist = Number.POSITIVE_INFINITY;
-      for (const e of applied.edits) {
-        if (!e.newText) {
-          continue;
+      const consider = (line: number) => {
+        const dist = Math.abs(line - target);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestLine = line;
         }
-        for (const hit of locateEditOffsets(text, e.newText)) {
-          const startLine = doc.positionAt(hit.start).line + 1;
-          const dist = Math.abs(startLine - target);
-          if (dist < bestDist) {
-            bestDist = dist;
-            bestLine = startLine;
+      };
+      for (const e of applied.edits) {
+        if (e.startLine) {
+          consider(e.startLine);
+        } else if (e.newText) {
+          for (const hit of looseMatches(text, e.newText)) {
+            consider(hit.line);
           }
         }
       }
@@ -805,16 +806,12 @@ export class FixProposalPanel {
           } else if (p.applicable) {
             badge = '<span class="badge">' + esc(fmt(T.badgeProposal, i + 1)) + multi + '</span>';
           } else {
-            // Diagnose precisely: 0 = snippet not found (file changed / drift),
-            // >1 = ambiguous. The old "{bad}/{total}" read like a success count
-            // ("1/1") and confused users. Show the worst edit's real状况 plus a
-            // hover with every edit's match count.
-            const ms = p.matches || [];
-            const gone = ms.filter(function (m) { return m === 0; }).length;
-            const ambig = ms.filter(function (m) { return m > 1; }).length;
-            const label = gone > 0 ? T.badgeNotFound : T.badgeAmbiguous;
-            const detail = ms.map(function (m, k) { return fmt(T.editMatchDetail, k + 1, m); }).join('\\n');
-            badge = '<span class="badge bad-badge" title="' + esc(detail) + '">' + esc(label) + '</span>';
+            // Not applicable. With the line-anchored contract this is almost
+            // always 'gone' (the file changed since generation → regenerate);
+            // 'ambiguous' only when the model gave no line anchor and the snippet
+            // repeats. Either way the cure is the same: 「重新生成」.
+            const label = p.blockReason === 'ambiguous' ? T.badgeAmbiguous : T.badgeNotFound;
+            badge = '<span class="badge bad-badge">' + esc(label) + '</span>';
           }
           let btn;
           if (p.applied) {
@@ -925,22 +922,30 @@ function fixProposalColumn(): vscode.ViewColumn {
 
 /**
  * Builds a runtime ProposalView from a proposal's edits against the current file
- * content. `applied` controls whether we search for each edit's replacement
- * (newText) or its original (oldText) when computing match counts. A proposal is
- * applicable only when it is not yet applied and every edit locates uniquely.
+ * content. A proposal is applicable only when it is not yet applied and every
+ * edit resolves (line-anchored verify, or a strict unique content match). When
+ * it can't apply, {@link ProposalView.blockReason} explains why for the badge.
  */
 function buildView(
   p: { title: string; rationale: string; edits: FixEdit[] },
   content: string,
   applied: boolean,
 ): ProposalView {
-  const matches = p.edits.map((e) => countOccurrences(content, applied ? e.newText : e.oldText));
+  let applicable = false;
+  let blockReason: 'gone' | 'ambiguous' | undefined;
+  if (!applied && p.edits.length > 0) {
+    const statuses = p.edits.map((e) => editStatus(content, e));
+    applicable = statuses.every((s) => s === 'ok');
+    if (!applicable) {
+      blockReason = statuses.some((s) => s === 'gone') ? 'gone' : 'ambiguous';
+    }
+  }
   return {
     title: p.title,
     rationale: p.rationale,
     edits: p.edits,
-    matches,
-    applicable: !applied && matches.length > 0 && matches.every((m) => m === 1),
+    applicable,
+    blockReason,
     applied,
     diffHtml: p.edits.map((e) => renderInlineDiff(e.oldText, e.newText)).join(''),
   };
@@ -976,284 +981,6 @@ function renderInlineDiff(oldText: string, newText: string): string {
 
 function diffRow(cls: 'add' | 'del' | 'ctx', sign: string, text: string): string {
   return `<div class="row ${cls}"><span class="sign">${sign}</span><span class="text">${escapeHtml(text) || '&nbsp;'}</span></div>`;
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  if (!needle) {
-    return 0;
-  }
-  return locateEditOffsets(haystack, needle).length;
-}
-
-/**
- * Locates every occurrence of `needle` inside `haystack` tolerantly: comparison
- * is line-based with trailing whitespace and EOL (CRLF/LF) ignored, so a model
- * snippet whose indentation/line-endings differ slightly from the file still
- * matches. Returns character offset ranges into the ORIGINAL `haystack` (so the
- * exact bytes can be replaced). Leading/trailing blank lines in `needle` are
- * dropped so the match lands on real content.
- *
- * This fixes the "看得见却无法应用" case where exact `indexOf(oldText)` failed on
- * whitespace differences.
- */
-function locateEditOffsets(haystack: string, needle: string): { start: number; end: number }[] {
-  const strict = locateLinesBy(haystack, needle, trimEndOnly);
-  if (strict.length > 0) {
-    return strict;
-  }
-  const tolerant = locateLinesBy(haystack, needle, trimBothEnds);
-  if (tolerant.length > 0) {
-    return tolerant;
-  }
-  // Models frequently drop a trailing comma/semicolon on a JSON/JS boundary line
-  // (file has "}," but the snippet has "}"), which breaks the exact line compare.
-  const noPunct = locateLinesBy(haystack, needle, trimNoPunct);
-  if (noPunct.length > 0) {
-    return noPunct;
-  }
-  // Collapse internal whitespace runs — handles operator/comment/tab-vs-space
-  // spacing differences inside a line (e.g. "a == b" vs "a  ==  b").
-  const collapsed = locateLinesBy(haystack, needle, trimCollapse);
-  if (collapsed.length > 0) {
-    return collapsed;
-  }
-  // Last resort: ignore ALL whitespace and interior blank lines, so a multi-line
-  // block that differs only by space-vs-nospace adjacency ("//x" vs "// x",
-  // "( a )" vs "(a)") or a reflowed blank line still matches. The replacement
-  // still rewrites the file's real byte span, so nothing is corrupted.
-  return locateFlexibleBlock(haystack, needle);
-}
-
-/** Leading run of spaces/tabs on a line (its indentation). */
-function leadingWhitespace(s: string): string {
-  return (s.match(/^[ \t]*/) || [''])[0];
-}
-
-const trimEndOnly = (l: string) => l.replace(/\s+$/, '');
-const trimBothEnds = (l: string) => l.trim();
-/** Trim both ends, then drop a single trailing comma/semicolon (JSON/JS boundary drift). */
-const trimNoPunct = (l: string) => l.trim().replace(/[,;]$/, '');
-/** Collapse internal whitespace runs to one space (+ drop trailing , ;). */
-const trimCollapse = (l: string) => l.trim().replace(/\s+/g, ' ').replace(/[,;]$/, '');
-/** Remove ALL whitespace (+ drop trailing , ;) — the most lenient line compare. */
-const stripAllWs = (l: string) => l.replace(/\s+/g, '').replace(/[,;]$/, '');
-
-/**
- * Line-based matcher: returns char-offset ranges into the ORIGINAL `haystack`
- * for every place `needle` occurs, comparing lines through `norm` (callers pick
- * how tolerant). Leading/trailing blank needle lines are dropped so a match
- * lands on real content.
- */
-function locateLinesBy(
-  haystack: string,
-  needle: string,
-  norm: (l: string) => string,
-): { start: number; end: number }[] {
-  const lines: { start: number; end: number; text: string }[] = [];
-  let pos = 0;
-  for (const raw of haystack.split('\n')) {
-    // raw excludes the '\n'; it may still carry a trailing '\r'.
-    lines.push({ start: pos, end: pos + raw.length, text: norm(raw) });
-    pos += raw.length + 1; // +1 for the '\n' we split on
-  }
-  let needleLines = needle.split(/\r?\n/).map(norm);
-  while (needleLines.length > 0 && needleLines[0] === '') {
-    needleLines.shift();
-  }
-  while (needleLines.length > 0 && needleLines[needleLines.length - 1] === '') {
-    needleLines.pop();
-  }
-  if (needleLines.length === 0) {
-    return [];
-  }
-  const out: { start: number; end: number }[] = [];
-  for (let i = 0; i + needleLines.length <= lines.length; i++) {
-    let ok = true;
-    for (let j = 0; j < needleLines.length; j++) {
-      if (lines[i + j].text !== needleLines[j]) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) {
-      out.push({ start: lines[i].start, end: lines[i + needleLines.length - 1].end });
-    }
-  }
-  return out;
-}
-
-/**
- * Most-lenient block matcher: compares only NON-BLANK lines with ALL whitespace
- * removed, so a snippet that differs from the file by space-vs-nospace adjacency,
- * operator/comment spacing, or an added/dropped interior blank line still
- * matches. The returned span covers the contiguous real bytes from the first to
- * the last matched line (interleaved blank lines included), so the caller can
- * replace the exact original block. Used only as the final fallback.
- */
-function locateFlexibleBlock(
-  haystack: string,
-  needle: string,
-): { start: number; end: number }[] {
-  const hlines: { start: number; end: number; norm: string }[] = [];
-  let pos = 0;
-  for (const raw of haystack.split('\n')) {
-    hlines.push({ start: pos, end: pos + raw.length, norm: stripAllWs(raw) });
-    pos += raw.length + 1;
-  }
-  // Indices of non-blank haystack lines (after stripping all whitespace).
-  const hIdx: number[] = [];
-  for (let i = 0; i < hlines.length; i++) {
-    if (hlines[i].norm !== '') {
-      hIdx.push(i);
-    }
-  }
-  const nNorm = needle.split(/\r?\n/).map(stripAllWs).filter((l) => l !== '');
-  if (nNorm.length === 0) {
-    return [];
-  }
-  const out: { start: number; end: number }[] = [];
-  for (let a = 0; a + nNorm.length <= hIdx.length; a++) {
-    let ok = true;
-    for (let b = 0; b < nNorm.length; b++) {
-      if (hlines[hIdx[a + b]].norm !== nNorm[b]) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) {
-      out.push({ start: hlines[hIdx[a]].start, end: hlines[hIdx[a + nNorm.length - 1]].end });
-    }
-  }
-  return out;
-}
-
-/**
- * Ordered tolerance ladder used by {@link locateEditOffsets} (applicability) and
- * {@link resolveEditAt} (apply). Kept as one array so the OBSERVABILITY classifier
- * ({@link classifyLocate}) reports exactly the rung those two would land on.
- *
- * NOTE: this MUST stay in the same order as the rungs inside `locateEditOffsets`
- * and `resolveEditAt`. If you add/remove/reorder a rung there, update it here.
- */
-const LOCATE_LADDER: { name: string; find: (h: string, n: string) => { start: number; end: number }[] }[] = [
-  { name: 'L1-exact', find: (h, n) => locateLinesBy(h, n, trimEndOnly) },
-  { name: 'L2-indent', find: (h, n) => locateLinesBy(h, n, trimBothEnds) },
-  { name: 'L3-punct', find: (h, n) => locateLinesBy(h, n, trimNoPunct) },
-  { name: 'L4-collapse', find: (h, n) => locateLinesBy(h, n, trimCollapse) },
-  { name: 'L5-flexible', find: (h, n) => locateFlexibleBlock(h, n) },
-];
-
-/**
- * Classifies how an edit's `oldText` locates in `haystack`: which ladder rung
- * first yields a match and the match count there. Mirrors the first-non-empty
- * semantics of {@link locateEditOffsets}, so `count` equals what
- * {@link countOccurrences} returns (1 = applicable, 0 = not found, >1 = ambiguous).
- * Pure observation — never changes apply behaviour.
- */
-function classifyLocate(haystack: string, needle: string): { rung: string; count: number } {
-  for (const rung of LOCATE_LADDER) {
-    const hits = rung.find(haystack, needle);
-    if (hits.length > 0) {
-      return { rung: rung.name, count: hits.length };
-    }
-  }
-  return { rung: 'FAIL', count: 0 };
-}
-
-/**
- * Lazy OutputChannel for apply/locate observability (temporary instrumentation
- * to measure the real "无法应用" frequency and rung distribution before the
- * line-number-contract rework). Visible to the user: Output → "AI Coding Review · Apply".
- */
-let applyLogChannel: vscode.OutputChannel | undefined;
-function applyLog(): vscode.OutputChannel {
-  if (!applyLogChannel) {
-    applyLogChannel = vscode.window.createOutputChannel('AI Coding Review · Apply');
-  }
-  return applyLogChannel;
-}
-
-/**
- * Resolves one edit against the live file for application: the exact byte range
- * to replace plus the replacement text, or `null` when the edit cannot be placed
- * uniquely (zero or multiple matches — never guess). Walks the same tolerance
- * ladder as {@link locateEditOffsets}, least-aggressive first, refusing on
- * ambiguity at every rung. Beyond the strict rung the replacement is re-indented
- * to the file's actual indent so applying never strips indentation.
- */
-function resolveEditAt(
-  haystack: string,
-  oldText: string,
-  newText: string,
-): { start: number; end: number; replacement: string } | null {
-  // L1 strict: replacement verbatim (zero regression when the snippet matches).
-  const strict = locateLinesBy(haystack, oldText, trimEndOnly);
-  if (strict.length === 1) {
-    return { start: strict[0].start, end: strict[0].end, replacement: newText };
-  }
-  if (strict.length > 1) {
-    return null;
-  }
-  // L2 indentation-tolerant: reindent the replacement to the file's indent.
-  const tolerant = locateLinesBy(haystack, oldText, trimBothEnds);
-  if (tolerant.length === 1) {
-    const hit = tolerant[0];
-    return { start: hit.start, end: hit.end, replacement: reindentToFile(haystack, hit, newText) };
-  }
-  if (tolerant.length > 1) {
-    return null;
-  }
-  // L3 trailing-punct, L4 collapsed-whitespace, L5 flexible block: each reindents
-  // and preserves the file's own trailing , ; when newText dropped it. Try the
-  // least-aggressive first; refuse on ambiguity at every rung (never guess).
-  for (const hits of [
-    locateLinesBy(haystack, oldText, trimNoPunct),
-    locateLinesBy(haystack, oldText, trimCollapse),
-    locateFlexibleBlock(haystack, oldText),
-  ]) {
-    if (hits.length > 1) {
-      return null;
-    }
-    if (hits.length === 1) {
-      const h = hits[0];
-      let replacement = reindentToFile(haystack, h, newText);
-      const filePunct = (haystack.slice(h.start, h.end).match(/[,;]\s*$/) || [''])[0].trim();
-      if (filePunct && !/[,;]\s*$/.test(replacement)) {
-        replacement += filePunct;
-      }
-      return { start: h.start, end: h.end, replacement };
-    }
-  }
-  return null;
-}
-
-/**
- * Re-indents `newText` so its outermost indentation matches the file line at
- * `hit.start`, preserving `newText`'s internal relative indentation. Used only
- * on the tolerant-fallback path, where the model dropped/changed leading indent.
- */
-function reindentToFile(
-  haystack: string,
-  hit: { start: number; end: number },
-  newText: string,
-): string {
-  let nlPos = haystack.indexOf('\n', hit.start);
-  if (nlPos === -1 || nlPos > hit.end) {
-    nlPos = hit.end;
-  }
-  const origIndent = leadingWhitespace(haystack.slice(hit.start, nlPos));
-  const lines = newText.split('\n');
-  let minIndent = Infinity;
-  for (const l of lines) {
-    if (l.trim() === '') {
-      continue;
-    }
-    minIndent = Math.min(minIndent, leadingWhitespace(l).length);
-  }
-  if (!isFinite(minIndent)) {
-    minIndent = 0;
-  }
-  return lines.map((l) => (l.trim() === '' ? '' : origIndent + l.slice(minIndent))).join('\n');
 }
 
 
