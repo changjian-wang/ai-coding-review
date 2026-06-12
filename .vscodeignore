@@ -8,4 +8,5 @@ tsconfig.json
 **/*.ts
 .gitignore
 docs/**
+.github/**
 *.vsix
