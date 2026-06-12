@@ -92,6 +92,7 @@ AI Coding Review 全面双语（English / 简体中文），**默认英文**。
 | `codereview.submitConclusion` | 提交审查结论 |
 | `codereview.jumpToNextUnseen` | 跳到下一处未读行 |
 | `codereview.pickModel` | 选择分析模型 |
+| `codereview.pickLanguage` | 切换体验语言（UI + LLM 输出） |
 
 ### 配置
 
@@ -130,6 +131,7 @@ src/
 ```bash
 npm install
 npm run compile            # 或 npm run watch；按 F5 启动扩展开发宿主
+npm test                   # 运行单元测试（vitest）
 npm run package            # 生产构建（esbuild --production）
 npx @vscode/vsce package   # 生成 .vsix
 ```

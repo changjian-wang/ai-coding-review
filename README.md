@@ -92,6 +92,7 @@ AI Coding Review is fully bilingual (English / 简体中文), **English by defau
 | `codereview.submitConclusion` | Submit the review conclusion |
 | `codereview.jumpToNextUnseen` | Jump to the next unseen line |
 | `codereview.pickModel` | Select the analysis model |
+| `codereview.pickLanguage` | Switch the experience language (UI + LLM output) |
 
 ### Settings
 
@@ -130,6 +131,7 @@ src/
 ```bash
 npm install
 npm run compile            # or npm run watch; press F5 to launch the Extension Development Host
+npm test                   # run the unit tests (vitest)
 npm run package            # production build (esbuild --production)
 npx @vscode/vsce package   # produce a .vsix
 ```
