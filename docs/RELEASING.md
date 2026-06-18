@@ -1,6 +1,8 @@
 # Releasing
 
-How to cut and publish a new version of **AI Coding Review** to the VS Code Marketplace.
+How to cut and publish a new version of **AI Coding Review** to the VS Code
+Marketplace, and cut a matching GitHub release with the packaged `.vsix`
+attached.
 
 ## Identity (do not change casually)
 
@@ -26,22 +28,33 @@ How to cut and publish a new version of **AI Coding Review** to the VS Code Mark
 
 ## Publish a new version
 
+Ship the **same** artifact to both the Marketplace and a GitHub release: package
+once, then publish that exact `.vsix` and attach it to the release.
+
 ```sh
 # 1. sanity check: types + bundle compile
 npm run compile
 
-# 2. publish (bumps version in package.json, packages, uploads in one shot)
-npx --yes @vscode/vsce publish patch      # 0.0.50 -> 0.0.51
-#   use `minor` / `major` for bigger bumps, or plain `publish` to ship the
-#   version already in package.json.
+# 2. bump the version in package.json (e.g. 0.1.3 -> 0.1.4) and commit the
+#    behavior change + bump together.
 
-# 3. sync the version-bump commit back to GitHub
+# 3. package ONCE -> ai-coding-review-<version>.vsix (shipped to BOTH targets).
+npx --yes @vscode/vsce package
+
+# 4. publish that exact package.
+npx --yes @vscode/vsce publish --packagePath ai-coding-review-<version>.vsix
+
+# 5. sync the version-bump commit back to GitHub.
 git push
+
+# 6. cut the GitHub release and attach the vsix (uses `gh` auth, not the PAT).
+gh release create v<version> ai-coding-review-<version>.vsix \
+  --target main --title "v<version>" --notes "<one-line summary>"
 ```
 
-The README shows live Marketplace badges (version / installs / rating), so there
-is **no hand-written version number to update** — the badges self-update once the
-new version is live.
+Replace `<version>` with the value now in `package.json`. The README shows live
+Marketplace badges (version / installs / rating), so there is **no hand-written
+version number to update** — the badges self-update once the new version is live.
 
 ## Notes / gotchas
 
@@ -54,3 +67,8 @@ new version is live.
   the 1 MB default; this repo is configured to 500 MB locally.
 - If `vsce login` fails with 401, the PAT scope is wrong (needs Marketplace →
   Manage) or the token was mis-copied.
+- The **GitHub release uses a different credential than publishing**: `gh release
+  create` needs `gh auth login` (a GitHub token), not the Azure DevOps PAT that
+  `vsce` uses. Verify with `gh release view v<version>` (shows the `.vsix` asset).
+- `gh release create` fails if the tag `v<version>` already exists — bump first,
+  or re-attach with `gh release upload v<version> <file> --clobber`.
