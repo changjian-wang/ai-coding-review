@@ -48,6 +48,10 @@ export interface WorkbenchState {
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
+  /** Repo name shown in the toolbar HUD (basename of the review cwd). */
+  repoName: string;
+  /** Current git branch label (or short detached SHA); undefined if unknown. */
+  branch?: string;
   /** Estimated LLM token usage for this review (approximate, not billed). */
   tokenUsage?: WorkbenchTokenUsage;
   conclusion?: {
@@ -85,6 +89,10 @@ export interface WorkbenchActions {
   pickModel(): void;
   /** Opens the language picker (UI + LLM output language). */
   pickLanguage(): void;
+  /** Switches the active git branch (native VS Code checkout UI). */
+  pickBranch(): void;
+  /** Switches which workspace folder (project) is under review. */
+  pickProject(): void;
   /** Opens the scope picker (used both for first-time review and for switching). */
   pickScope(): void;
 }
@@ -137,6 +145,8 @@ type InboundMessage =
   | { type: 'submit' }
   | { type: 'pickModel' }
   | { type: 'pickLanguage' }
+  | { type: 'pickBranch' }
+  | { type: 'pickProject' }
   | { type: 'pickScope' }
   | { type: 'toggleFolder'; path: string };
 
@@ -439,6 +449,12 @@ export class WorkbenchPanel {
       case 'pickLanguage':
         this.actions.pickLanguage();
         break;
+      case 'pickBranch':
+        this.actions.pickBranch();
+        break;
+      case 'pickProject':
+        this.actions.pickProject();
+        break;
       case 'pickScope':
         this.actions.pickScope();
         break;
@@ -637,6 +653,10 @@ export class WorkbenchPanel {
   .lang-label { flex:1; font-size:.74rem; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .lang-label b { color:var(--blue); font-weight:600; }
   .lang-row button { flex:none; }
+  .info-row { display:flex; align-items:center; gap:.4rem; margin-top:.3rem; }
+  .info-label { flex:1; font-size:.74rem; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .info-label b { color:var(--blue); font-weight:600; }
+  .info-row button { flex:none; }
   button { font-family:inherit; font-size:.78rem; cursor:pointer; border:1px solid var(--line); border-radius:5px; padding:.34rem .5rem; background:var(--vscode-button-secondaryBackground); color:var(--vscode-button-secondaryForeground); white-space:nowrap; }
   button:hover { background:var(--vscode-toolbar-hoverBackground); }
   button.primary { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
@@ -692,6 +712,14 @@ export class WorkbenchPanel {
         <div class="lang-row">
           <span class="lang-label" title="${escAttr(t.languageTitle)}">${esc(t.languagePrefix)}<b>${esc(languageLabel(t))}</b></span>
           <button id="pickLanguage">${esc(t.switch)}</button>
+        </div>
+        <div class="info-row">
+          <span class="info-label" title="${escAttr(state.repoName)}">${esc(t.repoPrefix)}<b>${esc(state.repoName)}</b></span>
+          <button id="pickProject">${esc(t.switch)}</button>
+        </div>
+        <div class="info-row">
+          <span class="info-label" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
+          <button id="pickBranch">${esc(t.switch)}</button>
         </div>
       </div>
       <div class="hud">
@@ -989,6 +1017,8 @@ export class WorkbenchPanel {
   byId('exportReport')?.addEventListener('click', () => send({ type:'exportReport' }));
   byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
   byId('pickLanguage')?.addEventListener('click', () => send({ type:'pickLanguage' }));
+  byId('pickProject')?.addEventListener('click', () => send({ type:'pickProject' }));
+  byId('pickBranch')?.addEventListener('click', () => send({ type:'pickBranch' }));
   byId('pickScope')?.addEventListener('click', () => send({ type:'pickScope' }));
   byId('submit')?.addEventListener('click', () => send({ type:'submit' }));
 

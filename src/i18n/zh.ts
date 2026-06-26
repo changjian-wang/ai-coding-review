@@ -46,6 +46,7 @@ export const zh: Messages = {
     notStartedWarn: '尚未开始审查',
     saveFailed: (msg) => `AI Coding Review：审查进度保存失败：${msg}`,
     error: (msg) => `AI Coding Review：${msg}`,
+    singleProject: '当前工作区只有一个项目，无需切换。',
   },
 
   model: {
@@ -251,6 +252,8 @@ export const zh: Messages = {
     langEn: 'English',
     langZh: '中文 (zh-CN)',
     langAuto: '跟随系统',
+    repoPrefix: '项目：',
+    branchPrefix: '分支：',
     lineCoverage: '行覆盖',
     filesReady: '文件就绪',
     gatePass: '门禁已通过，可提交结论',
@@ -425,6 +428,7 @@ export const zh: Messages = {
     prParseFailed: '无法解析 gh 返回的 PR 数据。',
     repoViewParseFailed: '无法解析 gh repo view 返回。',
     commentParseFailed: 'PR 评论已发送但响应解析失败。',
+    noCurrentPr: '当前分支没有关联的 PR。请切换到有 PR 的分支，或改用「选择源码文件/文件夹」。',
   },
 
   git: {

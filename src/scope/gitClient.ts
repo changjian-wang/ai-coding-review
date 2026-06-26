@@ -141,3 +141,16 @@ export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[
 export async function workingTreeFiles(cwd: string): Promise<ReviewFile[]> {
   return diffFilesWithStatus(cwd, ['HEAD']);
 }
+
+/**
+ * Current branch name. On a detached HEAD `git branch --show-current` is empty,
+ * so fall back to a short SHA prefixed with '@' (e.g. '@1a2b3c4') for the HUD.
+ */
+export async function currentBranch(cwd: string): Promise<string> {
+  const name = (await git(['branch', '--show-current'], cwd)).trim();
+  if (name) {
+    return name;
+  }
+  const sha = (await git(['rev-parse', '--short', 'HEAD'], cwd)).trim();
+  return sha ? `@${sha}` : '';
+}

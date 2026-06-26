@@ -57,6 +57,7 @@ export const en = {
     notStartedWarn: 'Review has not started yet',
     saveFailed: (msg: string) => `AI Coding Review: failed to save review progress: ${msg}`,
     error: (msg: string) => `AI Coding Review: ${msg}`,
+    singleProject: 'Only one project in this workspace — nothing to switch to.',
   },
 
   model: {
@@ -281,6 +282,8 @@ export const en = {
     langEn: 'English',
     langZh: '中文 (zh-CN)',
     langAuto: 'Auto',
+    repoPrefix: 'Project: ',
+    branchPrefix: 'Branch: ',
     lineCoverage: 'Line coverage',
     filesReady: 'Files ready',
     gatePass: 'Gate passed — you can submit the conclusion',
@@ -469,6 +472,7 @@ export const en = {
     prParseFailed: 'Could not parse the PR data returned by gh.',
     repoViewParseFailed: 'Could not parse the gh repo view response.',
     commentParseFailed: 'The PR comment was sent but the response could not be parsed.',
+    noCurrentPr: 'The current branch has no associated PR. Switch to a branch that has one, or use "Pick source files/folders".',
   },
 
   git: {

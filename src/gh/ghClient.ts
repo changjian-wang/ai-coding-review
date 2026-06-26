@@ -46,10 +46,17 @@ export async function ensureAuth(cwd: string): Promise<void> {
 
 /** Loads the PR associated with the current branch in `cwd`. */
 export async function getCurrentPr(cwd: string): Promise<PullRequest> {
-  const json = await runGh(
-    ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,headRefOid,files'],
-    cwd,
-  );
+  let json: string;
+  try {
+    json = await runGh(
+      ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,headRefOid,files'],
+      cwd,
+    );
+  } catch {
+    // gh exits non-zero when the current branch has no associated PR (e.g. on
+    // main). Surface a clear, actionable message instead of the raw gh stderr.
+    throw new GhError(m().gh.noCurrentPr);
+  }
   let raw: {
     number: number;
     title: string;

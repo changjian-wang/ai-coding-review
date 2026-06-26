@@ -16,6 +16,7 @@ import {
 import type { Finding } from './ai/types';
 import { pickScope, buildFolderScope } from './scope/scopePicker';
 import { FileSystemScope } from './scope/scopes';
+import { currentBranch } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
@@ -30,6 +31,8 @@ import { m, onLanguageChange } from './i18n';
 let session: ReviewSession;
 const models = new ModelProvider();
 let workbenchSelected: string | undefined;
+/** Current git branch label for the active review, shown in the workbench HUD. */
+let currentBranchLabel: string | undefined;
 /** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
 let openFileGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
@@ -407,6 +410,7 @@ async function loadFolderAsReview(cwd: string): Promise<void> {
         const { scope: source, cwd: rootCwd } = picked;
         const reviewSet = await source.load(rootCwd);
         await session.start(reviewSet, rootCwd);
+        await refreshBranchLabel();
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
@@ -452,6 +456,7 @@ async function startReview(): Promise<void> {
       try {
         const reviewSet = await source.load(cwd);
         await session.start(reviewSet, cwd);
+        await refreshBranchLabel();
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
@@ -553,6 +558,60 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
   // actually opened (see openFileInPanel).
 }
 
+/**
+ * Switches the active git branch via VS Code's native checkout picker (same UI
+ * as the status-bar branch indicator), then refreshes the HUD branch label. The
+ * current review session/progress is left intact — to review the new branch's
+ * content, use the 'Switch scope' button.
+ */
+async function switchBranch(): Promise<void> {
+  const cwd = session.getCwd();
+  if (!cwd) {
+    return;
+  }
+  try {
+    await vscode.commands.executeCommand('git.checkout');
+  } catch (err) {
+    console.warn('[codereview] git.checkout failed:', err);
+    return;
+  }
+  await refreshBranchLabel();
+  WorkbenchPanel.rerenderIfOpen();
+}
+
+/**
+ * Switches which workspace folder (project) is under review. No-op in a
+ * single-root workspace. Picking another root reloads it as a whole-folder
+ * review (restoring that root's own saved progress, if any).
+ */
+async function switchProject(): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length <= 1) {
+    transientInfo(m().review.singleProject);
+    return;
+  }
+  const current = session.getCwd();
+  const pick = await vscode.window.showQuickPick(
+    folders.map((f) => ({
+      label: `$(folder) ${f.name}`,
+      description: f.uri.fsPath === current ? `${f.uri.fsPath} · ${m().model.current}` : f.uri.fsPath,
+      cwd: f.uri.fsPath,
+    })),
+    { title: m().review.pickProjectTitle, placeHolder: m().review.pickProjectPlaceholder },
+  );
+  if (!pick || pick.cwd === current) {
+    return;
+  }
+  preferredDefaultCwd = pick.cwd;
+  setStatusBarBusy(true);
+  try {
+    await loadFolderAsReview(pick.cwd);
+    await openWorkbench();
+  } finally {
+    setStatusBarBusy(false);
+  }
+}
+
 /** Builds the action callbacks the workbench webview dispatches to. */
 function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
   return {
@@ -568,6 +627,8 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     submit: () => void submitConclusion(),
     pickModel: () => void selectModel(),
     pickLanguage: () => void selectLanguage(),
+    pickBranch: () => void switchBranch(),
+    pickProject: () => void switchProject(),
     pickScope: () => void startReview(),
   };
 }
@@ -613,6 +674,7 @@ async function restoreLastScope(cwd: string): Promise<void> {
       const source = new FileSystemScope(descriptor.relPaths);
       const reviewSet = await source.load(descriptor.cwd);
       await session.start(reviewSet, descriptor.cwd);
+      await refreshBranchLabel();
       workbenchSelected = undefined;
       docRenderCache.clear();
       rehydrateAppliedFixes();
@@ -668,6 +730,23 @@ function changeBadge(status?: string, additions?: number, deletions?: number): W
 }
 
 /** Snapshots the current session into the serializable workbench state. */
+/**
+ * Refreshes the cached branch label for the active review's cwd. Best-effort: a
+ * non-git folder or any git failure simply clears it (the HUD then shows —).
+ */
+async function refreshBranchLabel(): Promise<void> {
+  const cwd = session.getCwd();
+  if (!cwd) {
+    currentBranchLabel = undefined;
+    return;
+  }
+  try {
+    currentBranchLabel = await currentBranch(cwd);
+  } catch {
+    currentBranchLabel = undefined;
+  }
+}
+
 function buildWorkbenchState(): WorkbenchState {
   const reviewSet = session.reviewSet;
   const files: WorkbenchFile[] = (reviewSet?.files ?? []).map((f) => {
@@ -718,6 +797,8 @@ function buildWorkbenchState(): WorkbenchState {
     globalDone: session.globalConfirmed,
     hasGlobalReport: !!session.globalReport,
     modelLabel: models.label,
+    repoName: session.getRepoName(),
+    branch: currentBranchLabel,
     tokenUsage: session.tokenUsage
       ? {
           input: session.tokenUsage.totalInput,
