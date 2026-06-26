@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ReviewSession } from './review/reviewSession';
 import { WorkspaceStateReviewStore, type Annotation } from './review/reviewStore';
-import { pickModel } from './ai/modelPicker';
+import { pickModel, listModels, type PickedModel } from './ai/modelPicker';
 import { ModelProvider } from './ai/modelProvider';
 import {
   analyzeFile,
@@ -16,7 +16,7 @@ import {
 import type { Finding } from './ai/types';
 import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePicker';
 import { FileSystemScope } from './scope/scopes';
-import { currentBranch } from './scope/gitClient';
+import { currentBranch, listBranches, switchBranchTo } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
@@ -33,6 +33,9 @@ const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
 let currentBranchLabel: string | undefined;
+
+/** Caches the last model picks so applyDynMenu can recover the live handle by id. */
+let dynModelCache = new Map<string, PickedModel>();
 /** Guards against re-entrant scope picking (rapid clicks on "switch scope"). */
 let scopePickInFlight = false;
 /** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
@@ -514,6 +517,61 @@ async function selectModel(): Promise<void> {
 }
 
 /**
+ * Serves the inline model/branch dropdowns: fetches the menu items asynchronously
+ * (Copilot models or local git branches) and pushes them to the workbench webview.
+ * Native quick-picks are invisible in the auxiliary workbench window, hence inline.
+ */
+async function openDynMenu(kind: string): Promise<void> {
+  if (kind === 'model') {
+    const picks = await listModels();
+    dynModelCache = new Map(picks.map((p) => [p.id, p]));
+    WorkbenchPanel.postDynMenu(
+      'model',
+      picks.map((p) => ({ id: p.id, label: p.label, current: p.id === models.id })),
+    );
+    return;
+  }
+  if (kind === 'branch') {
+    const cwd = session.getCwd();
+    if (!cwd) {
+      return;
+    }
+    const branches = await listBranches(cwd).catch(() => [] as string[]);
+    WorkbenchPanel.postDynMenu(
+      'branch',
+      branches.map((b) => ({ id: b, label: b, current: b === currentBranchLabel })),
+    );
+  }
+}
+
+/** Applies an inline model/branch choice dispatched from the workbench webview. */
+async function applyDynMenu(kind: string, id: string): Promise<void> {
+  if (kind === 'model') {
+    const choice = dynModelCache.get(id);
+    if (choice) {
+      models.set(choice);
+      WorkbenchPanel.refreshIfOpen();
+      transientInfo(m().model.switched(choice.label));
+    }
+    return;
+  }
+  if (kind === 'branch') {
+    const cwd = session.getCwd();
+    if (!cwd || id === currentBranchLabel) {
+      return;
+    }
+    try {
+      await withWorkbenchProgress(m().workbench.switchingBranch(id), () => switchBranchTo(cwd, id));
+    } catch (err) {
+      transientWarning(String((err as Error)?.message ?? err));
+      return;
+    }
+    await refreshBranchLabel();
+    WorkbenchPanel.rerenderIfOpen();
+  }
+}
+
+/**
  * Lets the user switch the whole-experience language (UI + LLM output) from
  * inside AI Coding Review, instead of digging through VS Code settings. Writes
  * `codereview.language`, which the config-change listener picks up to re-render
@@ -670,6 +728,8 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     pickScopeKind: (kind) => void startReview(kind),
     pickProjectCwd: (cwd) => void switchProjectTo(cwd),
     pickLanguageId: (id) => void applyLanguage(id),
+    openDynMenu: (kind) => void openDynMenu(kind),
+    applyDynMenu: (kind, id) => void applyDynMenu(kind, id),
   };
 }
 

@@ -11,6 +11,20 @@ export interface PickedModel {
   model?: vscode.LanguageModelChat;
 }
 
+/** Returns selectable models (Auto + Copilot models) without prompting. */
+export async function listModels(): Promise<PickedModel[]> {
+  let models: readonly vscode.LanguageModelChat[] = [];
+  try {
+    models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+  } catch {
+    models = [];
+  }
+  return [
+    { id: 'auto', label: 'Auto' },
+    ...models.map((mm) => ({ id: mm.id, label: mm.name, model: mm })),
+  ];
+}
+
 /** Lets the user choose among Copilot-authorised models (or Auto). */
 export async function pickModel(): Promise<PickedModel | undefined> {
   let models: readonly vscode.LanguageModelChat[] = [];

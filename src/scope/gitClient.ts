@@ -154,3 +154,14 @@ export async function currentBranch(cwd: string): Promise<string> {
   const sha = (await git(['rev-parse', '--short', 'HEAD'], cwd)).trim();
   return sha ? `@${sha}` : '';
 }
+
+/** Local branch names (for the inline branch switch menu). */
+export async function listBranches(cwd: string): Promise<string[]> {
+  const out = await git(['branch', '--format=%(refname:short)'], cwd);
+  return out.split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+/** Switches to an existing local branch via `git switch`. */
+export async function switchBranchTo(cwd: string, branch: string): Promise<void> {
+  await git(['switch', branch], cwd);
+}

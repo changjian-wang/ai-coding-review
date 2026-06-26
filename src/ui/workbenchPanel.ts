@@ -105,6 +105,10 @@ export interface WorkbenchActions {
   pickProjectCwd(cwd: string): void;
   /** Switches the UI/LLM language to the given id (inline menu). */
   pickLanguageId(id: string): void;
+  /** Requests async menu items (model / branch) for the inline dropdown. */
+  openDynMenu(kind: string): void;
+  /** Applies an async menu choice (model / branch). */
+  applyDynMenu(kind: string, id: string): void;
 }
 
 interface FilePatch {
@@ -161,6 +165,8 @@ type InboundMessage =
   | { type: 'pickScopeKind'; kind: string }
   | { type: 'pickProjectCwd'; cwd: string }
   | { type: 'pickLanguageId'; id: string }
+  | { type: 'openDynMenu'; kind: string }
+  | { type: 'applyDynMenu'; kind: string; id: string }
   | { type: 'toggleFolder'; path: string };
 
 /**
@@ -265,6 +271,14 @@ export class WorkbenchPanel {
     }
     inst.panel.reveal(undefined, /* preserveFocus */ false);
     void inst.panel.webview.postMessage({ type: 'focusTree' });
+  }
+
+  /** Pushes async dropdown items (model / branch) to the inline menu. */
+  static postDynMenu(
+    kind: string,
+    items: { id: string; label: string; detail?: string; current: boolean }[],
+  ): void {
+    void WorkbenchPanel.current?.panel.webview.postMessage({ type: 'dynMenu', kind, items });
   }
 
   /**
@@ -493,6 +507,12 @@ export class WorkbenchPanel {
       case 'pickLanguageId':
         this.actions.pickLanguageId(msg.id);
         break;
+      case 'openDynMenu':
+        this.actions.openDynMenu(msg.kind);
+        break;
+      case 'applyDynMenu':
+        this.actions.applyDynMenu(msg.kind, msg.id);
+        break;
       case 'toggleFolder':
         // The webview already toggled the `collapsed` CSS class optimistically,
         // so the visual change is instant. We only record the state here for
@@ -671,6 +691,11 @@ export class WorkbenchPanel {
   /* sidebar action toolbar */
   .toolbar { display:flex; flex-direction:column; gap:.4rem; padding:.55rem .7rem; border-top:1px solid var(--line); background:var(--elevated); }
   .toolbar .grp-label { font-size:.64rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:.2rem 0 -.05rem; }
+  .toolbar .grp-toggle { display:flex; align-items:center; gap:.35rem; width:100%; justify-content:flex-start; padding:.2rem .15rem; background:transparent; border:none; border-radius:4px; font-size:.64rem; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); cursor:pointer; }
+  .toolbar .grp-toggle:hover { color:var(--vscode-foreground); background:var(--vscode-toolbar-hoverBackground); }
+  .toolbar .grp-caret { font-size:.7rem; line-height:1; display:inline-block; min-width:.7rem; }
+  .toolbar-body { display:flex; flex-direction:column; gap:.4rem; }
+  .toolbar-body[hidden] { display:none; }
   .toolbar .row { display:flex; gap:.4rem; }
   .toolbar .row button { flex:1; }
   /* inline global-analysis progress */
@@ -715,8 +740,10 @@ export class WorkbenchPanel {
     border-color:var(--vscode-inputValidation-errorBorder, rgba(241,76,76,.4)); }
   .wb-busy { display:flex; flex-direction:column; gap:.32rem; padding:.5rem .7rem; border-bottom:1px solid var(--line); background:var(--elevated); }
   .wb-busy[hidden] { display:none; }
+  .wb-block { position:fixed; inset:0; z-index:90; cursor:progress; background:rgba(0,0,0,.04); }
+  .wb-block[hidden] { display:none; }
   .busy-msg { font-size:.74rem; color:var(--blue); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .scope-menu { background:var(--elevated); }
+  .scope-menu { background:var(--elevated); max-height:42vh; overflow-y:auto; }
   .scope-menu[hidden] { display:none; }
   .scope-menu .sk-item { padding:.5rem .7rem; cursor:pointer; border-top:1px solid var(--line); }
   .scope-menu .sk-item:hover { background:var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
@@ -725,6 +752,7 @@ export class WorkbenchPanel {
 </style>
 </head>
 <body>
+  <div class="wb-block" id="wbBlock" hidden></div>
   <div class="workbench">
     <div class="sidebar">
       <div class="sb-head">
@@ -744,7 +772,10 @@ export class WorkbenchPanel {
       </div>
       <div class="tree" id="tree"><div class="tree-sizer" id="treeSizer"></div></div>
       <div class="toolbar">
-        <div class="grp-label">${esc(t.overallReview)}</div>
+        <button class="grp-toggle collapsed" id="toolbarToggle" aria-expanded="false" title="${escAttr(t.overallReview)}">
+          <span class="grp-caret">&#9656;</span><span>${esc(t.overallReview)}</span>
+        </button>
+        <div class="toolbar-body" id="toolbarBody" hidden>
         <div class="row">
           <button id="global">${esc(t.globalAnalysis)}</button>
           <button id="showGlobal" ${state.hasGlobalReport ? '' : 'disabled'}>${esc(t.viewGlobal)}</button>
@@ -764,6 +795,7 @@ export class WorkbenchPanel {
           <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">${esc(t.modelPrefix)}<b>${esc(state.modelLabel)}</b></span>
           <button id="pickModel">${esc(t.switch)}</button>
         </div>
+        <div class="scope-menu" id="modelMenu" hidden></div>
         <div class="lang-row">
           <span class="lang-label" title="${escAttr(t.languageTitle)}">${esc(t.languagePrefix)}<b>${esc(languageLabel(t))}</b></span>
           <button id="pickLanguage">${esc(t.switch)}</button>
@@ -777,6 +809,8 @@ export class WorkbenchPanel {
         <div class="info-row">
           <span class="info-label" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
           <button id="pickBranch">${esc(t.switch)}</button>
+        </div>
+        <div class="scope-menu" id="branchMenu" hidden></div>
         </div>
       </div>
       <div class="hud">
@@ -1075,7 +1109,24 @@ export class WorkbenchPanel {
   byId('globalCancel')?.addEventListener('click', () => send({ type:'cancelGlobal' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('exportReport')?.addEventListener('click', () => send({ type:'exportReport' }));
-  byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
+  function bindDynMenu(id, kind) {
+    const menu = byId(id);
+    if (!menu) return;
+    menu.addEventListener('click', (e) => {
+      const item = e.target.closest('.sk-item');
+      if (!item) return;
+      menu.hidden = true;
+      send({ type:'applyDynMenu', kind, id: item.getAttribute('data-id') });
+    });
+  }
+  bindDynMenu('modelMenu', 'model');
+  bindDynMenu('branchMenu', 'branch');
+  function toggleDynMenu(kind) {
+    const menu = byId(kind + 'Menu');
+    if (menu && !menu.hidden) { menu.hidden = true; return; }
+    send({ type:'openDynMenu', kind });
+  }
+  byId('pickModel')?.addEventListener('click', (e) => { e.stopPropagation(); toggleDynMenu('model'); });
   const langMenu = byId('langMenu');
   if (langMenu) {
     langMenu.innerHTML = LANGUAGES.map((l) =>
@@ -1111,7 +1162,7 @@ export class WorkbenchPanel {
     e.stopPropagation();
     if (projMenu) projMenu.hidden = !projMenu.hidden;
   });
-  byId('pickBranch')?.addEventListener('click', () => send({ type:'pickBranch' }));
+  byId('pickBranch')?.addEventListener('click', (e) => { e.stopPropagation(); toggleDynMenu('branch'); });
   const scopeMenu = byId('scopeMenu');
   if (scopeMenu) {
     scopeMenu.innerHTML = SCOPE_KINDS.map((k) =>
@@ -1130,7 +1181,21 @@ export class WorkbenchPanel {
     e.stopPropagation();
     if (scopeMenu) scopeMenu.hidden = !scopeMenu.hidden;
   });
-  document.addEventListener('click', () => { if (scopeMenu) scopeMenu.hidden = true; if (projMenu) projMenu.hidden = true; if (langMenu) langMenu.hidden = true; });
+  document.addEventListener('click', () => { if (scopeMenu) scopeMenu.hidden = true; if (projMenu) projMenu.hidden = true; if (langMenu) langMenu.hidden = true; const mm = byId('modelMenu'); if (mm) mm.hidden = true; const bm = byId('branchMenu'); if (bm) bm.hidden = true; });
+  byId('toolbarToggle')?.addEventListener('click', () => {
+    const body = byId('toolbarBody');
+    const btn = byId('toolbarToggle');
+    if (!body || !btn) return;
+    const willCollapse = !body.hidden;
+    body.hidden = willCollapse;
+    btn.classList.toggle('collapsed', willCollapse);
+    btn.setAttribute('aria-expanded', String(!willCollapse));
+    const caret = btn.querySelector('.grp-caret');
+    if (caret) caret.textContent = willCollapse ? '\u25B8' : '\u25BE';
+    const s = vscode.getState() || {};
+    s.toolbarCollapsed = willCollapse;
+    vscode.setState(s);
+  });
   byId('submit')?.addEventListener('click', () => send({ type:'submit' }));
 
   function setGlobalProgress(active, message) {
@@ -1151,6 +1216,8 @@ export class WorkbenchPanel {
 
   function setBusy(active, message) {
     const wrap = byId('wbBusy');
+    const block = byId('wbBlock');
+    if (block) block.hidden = !active;
     if (!wrap) return;
     wrap.hidden = !active;
     if (active) { const m = byId('wbBusyMsg'); if (m) m.textContent = message || ''; }
@@ -1173,6 +1240,18 @@ export class WorkbenchPanel {
     const msg = e.data;
     if (msg && msg.type === 'globalProgress') { setGlobalProgress(msg.active, msg.message); return; }
     if (msg && msg.type === 'busy') { setBusy(msg.active, msg.message); return; }
+    if (msg && msg.type === 'dynMenu') {
+      const menu = byId(msg.kind + 'Menu');
+      if (menu) {
+        menu.innerHTML = (msg.items || []).map((it) =>
+          '<div class="sk-item" data-id="' + esc(it.id) + '">'
+          + '<div class="sk-label">' + esc(it.label) + (it.current ? ' \u2713' : '') + '</div>'
+          + (it.detail ? '<div class="sk-detail">' + esc(it.detail) + '</div>' : '') + '</div>'
+        ).join('');
+        menu.hidden = false;
+      }
+      return;
+    }
     if (msg && msg.type === 'focusTree') { treeEl.focus(); return; }
     if (msg && msg.type === 'notice') { flashNotice(msg.message, msg.kind); return; }
     if (!msg || msg.type !== 'patch') return;
@@ -1203,6 +1282,18 @@ export class WorkbenchPanel {
   if (typeof savedState.treeScroll === 'number') {
     treeEl.scrollTop = savedState.treeScroll;
     renderWindow();
+  }
+  // Restore the Overall-review section's collapse state (default: collapsed).
+  if (savedState.toolbarCollapsed === false) {
+    const tbBody = byId('toolbarBody');
+    const tbBtn = byId('toolbarToggle');
+    if (tbBody && tbBtn) {
+      tbBody.hidden = false;
+      tbBtn.classList.remove('collapsed');
+      tbBtn.setAttribute('aria-expanded', 'true');
+      const tbCaret = tbBtn.querySelector('.grp-caret');
+      if (tbCaret) tbCaret.textContent = '\u25BE';
+    }
   }
 </script>
 </body>

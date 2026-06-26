@@ -310,6 +310,7 @@ export const en = {
     langAuto: 'Auto',
     repoPrefix: 'Project: ',
     branchPrefix: 'Branch: ',
+    switchingBranch: (branch: string) => `Switching to ${branch}…`,
     lineCoverage: 'Line coverage',
     filesReady: 'Files ready',
     gatePass: 'Gate passed — you can submit the conclusion',

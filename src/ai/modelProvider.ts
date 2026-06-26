@@ -43,6 +43,11 @@ export class ModelProvider {
     return this.picked?.label ?? 'Auto';
   }
 
+  /** Current model id ('auto' when none explicitly picked). */
+  get id(): string {
+    return this.picked?.id ?? 'auto';
+  }
+
   /** Resolves a usable chat model, honouring an explicit pick or Auto. */
   async resolve(): Promise<vscode.LanguageModelChat | undefined> {
     if (this.picked && this.picked.id !== 'auto') {

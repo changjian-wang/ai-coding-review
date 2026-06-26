@@ -281,6 +281,7 @@ export const zh: Messages = {
     langAuto: '跟随系统',
     repoPrefix: '项目：',
     branchPrefix: '分支：',
+    switchingBranch: (branch: string) => `正在切换到 ${branch}…`,
     lineCoverage: '行覆盖',
     filesReady: '文件就绪',
     gatePass: '门禁已通过，可提交结论',
