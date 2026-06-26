@@ -20,17 +20,14 @@ export class PrScope implements ReviewScope {
     await ensureGhAvailable(cwd);
     await ensureAuth(cwd);
     const pr = await getCurrentPr(cwd);
-    let files = pr.files;
-    try {
-      files = await git.diffFiles(cwd, `origin/${pr.baseRefName}...HEAD`);
-    } catch {
-      // Fall back to gh's file list when the base ref is not available locally.
-    }
+    // Use gh's authoritative changed-file list, not a local `git diff` range:
+    // on a fork the local `origin/<base>` lags upstream, so the range would
+    // include thousands of unrelated files.
     return {
       scopeId: `pr-${pr.number}`,
       label: `PR #${pr.number} · ${pr.title}`,
       headSha: pr.headRefOid,
-      files,
+      files: pr.files,
     };
   }
 }
@@ -49,17 +46,14 @@ export class PrByNumberScope implements ReviewScope {
     // a chosen PR is usually not the branch currently checked out.
     await checkoutPr(cwd, this.number);
     const pr = await getPrByNumber(cwd, this.number);
-    let files = pr.files;
-    try {
-      files = await git.diffFiles(cwd, `origin/${pr.baseRefName}...HEAD`);
-    } catch {
-      // Fall back to gh's file list when the base ref is not available locally.
-    }
+    // Use gh's authoritative changed-file list, not a local `git diff` range:
+    // on a fork the local `origin/<base>` lags upstream, so the range would
+    // include thousands of unrelated files.
     return {
       scopeId: `pr-${pr.number}`,
       label: `PR #${pr.number} · ${pr.title}`,
       headSha: pr.headRefOid,
-      files,
+      files: pr.files,
     };
   }
 }

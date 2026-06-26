@@ -5,10 +5,12 @@ import type { PrSummary } from '../gh/types';
 
 /** Options for {@link pickPr}. */
 export interface PrPickerOptions {
-  /** Repo label shown in the header (e.g. the folder name). */
+  /** Base-repo slug shown in the header (upstream for a fork). */
   repoLabel: string;
-  /** Open + draft PRs to choose from. */
+  /** PRs to choose from (all states). */
   prs: PrSummary[];
+  /** Login of the current gh user, enabling the "Mine" filter. */
+  currentLogin?: string;
   /** Editor column to open in — anchor to the workbench's window. */
   viewColumn?: vscode.ViewColumn;
 }
@@ -61,6 +63,7 @@ function renderHtml(opts: PrPickerOptions): string {
   const data = JSON.stringify(opts.prs);
   const t = m().prPanel;
   const T = JSON.stringify(t);
+  const me = JSON.stringify(opts.currentLogin ?? '');
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -73,6 +76,8 @@ function renderHtml(opts: PrPickerOptions): string {
     --dim: var(--vscode-descriptionForeground, #999);
     --blue: var(--vscode-textLink-foreground, #569cd6);
     --green: var(--vscode-charts-green, #4ec9b0);
+    --purple: var(--vscode-charts-purple, #b180d7);
+    --red: var(--vscode-charts-red, #f14c4c);
   }
   * { box-sizing: border-box; }
   body { margin:0; height:100vh; display:flex; flex-direction:column;
@@ -101,6 +106,8 @@ function renderHtml(opts: PrPickerOptions): string {
   .badge { flex:none; font-size:10.5px; padding:1px 7px; border-radius:10px; }
   .badge.open { color:var(--green); border:1px solid var(--green); }
   .badge.draft { color:var(--dim); border:1px solid var(--dim); }
+  .badge.merged { color:var(--purple); border:1px solid var(--purple); }
+  .badge.closed { color:var(--red); border:1px solid var(--red); }
   .card-meta { margin-top:4px; font-size:11.5px; color:var(--dim); display:flex; gap:10px; flex-wrap:wrap; }
   .empty { padding:24px 16px; color:var(--dim); text-align:center; }
   .foot { display:flex; align-items:center; gap:12px; padding:10px 16px; border-top:1px solid var(--line);
@@ -121,9 +128,13 @@ function renderHtml(opts: PrPickerOptions): string {
   </div>
   <div class="toolbar">
     <div class="tabs">
-      <button class="tab active" data-tab="all">${esc(t.tabAll)}</button>
+      <button class="tab active" data-tab="active">${esc(t.tabActive)}</button>
+      <button class="tab" data-tab="mine">${esc(t.tabMine)}</button>
       <button class="tab" data-tab="open">${esc(t.tabOpen)}</button>
       <button class="tab" data-tab="draft">${esc(t.tabDraft)}</button>
+      <button class="tab" data-tab="merged">${esc(t.tabMerged)}</button>
+      <button class="tab" data-tab="closed">${esc(t.tabClosed)}</button>
+      <button class="tab" data-tab="all">${esc(t.tabAll)}</button>
     </div>
     <input id="filter" type="search" placeholder="${esc(t.filterPlaceholder)}" autocomplete="off" />
   </div>
@@ -138,12 +149,13 @@ function renderHtml(opts: PrPickerOptions): string {
   const vscode = acquireVsCodeApi();
   const PRS = ${data};
   const T = ${T};
+  const ME = ${me};
   const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i)] ?? '');
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   const listEl = $('list');
   const filterEl = $('filter');
-  let tab = 'all';
+  let tab = 'active';
   let selected = null;
 
   function timeAgo(iso) {
@@ -158,13 +170,27 @@ function renderHtml(opts: PrPickerOptions): string {
     return Math.floor(mo / 12) + 'y';
   }
 
+  function statusOf(p) {
+    if (p.state === 'MERGED') return 'merged';
+    if (p.state === 'CLOSED') return 'closed';
+    return p.isDraft ? 'draft' : 'open';
+  }
+
   function visible() {
     const q = (filterEl.value || '').trim().toLowerCase();
     return PRS.filter((p) => {
-      if (tab === 'open' && p.isDraft) return false;
-      if (tab === 'draft' && !p.isDraft) return false;
+      const st = statusOf(p);
+      if (tab === 'mine') {
+        if (!ME || p.author !== ME) return false;
+      } else {
+        if (tab === 'active' && st !== 'open' && st !== 'draft') return false;
+        if (tab === 'open' && st !== 'open') return false;
+        if (tab === 'draft' && st !== 'draft') return false;
+        if (tab === 'merged' && st !== 'merged') return false;
+        if (tab === 'closed' && st !== 'closed') return false;
+      }
       if (q) {
-        const hay = ('#' + p.number + ' ' + p.title).toLowerCase();
+        const hay = ('#' + p.number + ' ' + p.title + ' ' + (p.author || '') + ' ' + p.headRefName).toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -178,8 +204,9 @@ function renderHtml(opts: PrPickerOptions): string {
       return;
     }
     listEl.innerHTML = rows.map((p) => {
-      const badge = p.isDraft ? '<span class="badge draft">' + esc(T.badgeDraft) + '</span>'
-                              : '<span class="badge open">' + esc(T.badgeOpen) + '</span>';
+      const st = statusOf(p);
+      const badgeText = { open: T.badgeOpen, draft: T.badgeDraft, merged: T.badgeMerged, closed: T.badgeClosed }[st];
+      const badge = '<span class="badge ' + st + '">' + esc(badgeText) + '</span>';
       const refs = esc(p.headRefName) + ' &rarr; ' + esc(p.baseRefName);
       const changed = fmt(T.metaChanged, p.changedFiles);
       const churn = '+' + p.additions + ' \u2212' + p.deletions;

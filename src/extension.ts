@@ -14,14 +14,14 @@ import {
   type GlobalContextFile,
 } from './ai/analyzer';
 import type { Finding } from './ai/types';
-import { pickScope, buildFolderScope } from './scope/scopePicker';
+import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePicker';
 import { FileSystemScope } from './scope/scopes';
 import { currentBranch } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
-import { WorkbenchPanel, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
+import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
 import { DocumentPanel, type DocModel } from './ui/documentPanel';
 import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
@@ -33,6 +33,8 @@ const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
 let currentBranchLabel: string | undefined;
+/** Guards against re-entrant scope picking (rapid clicks on "switch scope"). */
+let scopePickInFlight = false;
 /** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
 let openFileGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
@@ -398,8 +400,8 @@ async function openInNewWindow(
 
 /** Loads the entire folder at `cwd` as the current review set. */
 async function loadFolderAsReview(cwd: string): Promise<void> {
-  await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: m().review.loadingProject },
+  await withWorkbenchProgress(
+    m().review.loadingProject,
     async () => {
       try {
         const picked = await buildFolderScope(cwd);
@@ -438,20 +440,29 @@ function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): stri
   return undefined;
 }
 
-async function startReview(): Promise<void> {
+async function startReview(kind?: string): Promise<void> {
   const defaultCwd = preferredDefaultCwd ?? workspaceFolderPath();
   if (!defaultCwd) {
     void vscode.window.showErrorMessage(m().review.noGitWorkspace);
     return;
   }
 
-  const picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn);
+  if (scopePickInFlight) {
+    return;
+  }
+  scopePickInFlight = true;
+  let picked: PickedScope | undefined;
+  try {
+    picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind);
+  } finally {
+    scopePickInFlight = false;
+  }
   if (!picked) {
     return;
   }
   const { scope: source, cwd } = picked;
-  await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: m().review.loadingSource },
+  await withWorkbenchProgress(
+    m().review.loadingSource,
     async () => {
       try {
         const reviewSet = await source.load(cwd);
@@ -508,6 +519,17 @@ async function selectModel(): Promise<void> {
  * `codereview.language`, which the config-change listener picks up to re-render
  * the status bar and any open webviews live.
  */
+/** Applies a language id chosen from the inline workbench menu. */
+async function applyLanguage(id: string): Promise<void> {
+  const cur = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
+  if (id === cur) {
+    return;
+  }
+  await vscode.workspace
+    .getConfiguration('codereview')
+    .update('language', id, vscode.ConfigurationTarget.Global);
+}
+
 async function selectLanguage(): Promise<void> {
   const current = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
   const t = m().model;
@@ -584,6 +606,21 @@ async function switchBranch(): Promise<void> {
  * single-root workspace. Picking another root reloads it as a whole-folder
  * review (restoring that root's own saved progress, if any).
  */
+/** Switches the review to the given workspace-folder cwd (from the inline menu). */
+async function switchProjectTo(cwd: string): Promise<void> {
+  if (cwd === session.getCwd()) {
+    return;
+  }
+  preferredDefaultCwd = cwd;
+  setStatusBarBusy(true);
+  try {
+    await loadFolderAsReview(cwd);
+    await openWorkbench();
+  } finally {
+    setStatusBarBusy(false);
+  }
+}
+
 async function switchProject(): Promise<void> {
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length <= 1) {
@@ -630,6 +667,9 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     pickBranch: () => void switchBranch(),
     pickProject: () => void switchProject(),
     pickScope: () => void startReview(),
+    pickScopeKind: (kind) => void startReview(kind),
+    pickProjectCwd: (cwd) => void switchProjectTo(cwd),
+    pickLanguageId: (id) => void applyLanguage(id),
   };
 }
 
@@ -799,6 +839,16 @@ function buildWorkbenchState(): WorkbenchState {
     modelLabel: models.label,
     repoName: session.getRepoName(),
     branch: currentBranchLabel,
+    projects: (vscode.workspace.workspaceFolders ?? []).map((f) => ({
+      cwd: f.uri.fsPath,
+      name: f.name,
+      current: f.uri.fsPath === session.getCwd(),
+    })),
+    languages: ((cur) => [
+      { id: 'en', label: m().workbench.langEn, current: cur === 'en' },
+      { id: 'zh-CN', label: m().workbench.langZh, current: cur === 'zh-CN' },
+      { id: 'auto', label: m().workbench.langAuto, current: cur === 'auto' },
+    ])(vscode.workspace.getConfiguration('codereview').get<string>('language', 'en')),
     tokenUsage: session.tokenUsage
       ? {
           input: session.tokenUsage.totalInput,

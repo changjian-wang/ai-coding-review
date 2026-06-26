@@ -6,7 +6,11 @@ import type { PullRequest, PrSummary } from './types';
 const pexec = promisify(execFile);
 
 /** Raised for any gh-related failure with a user-facing message. */
-export class GhError extends Error {}
+export class GhError extends Error {
+  constructor(message: string, readonly code?: 'not-found' | 'not-authed') {
+    super(message);
+  }
+}
 
 const MAX_BUFFER = 32 * 1024 * 1024;
 /** Hard ceiling so a hung gh process (network stall) can never freeze the UI. */
@@ -31,7 +35,7 @@ export async function ensureGhAvailable(cwd: string): Promise<void> {
   try {
     await pexec('gh', ['--version'], { cwd });
   } catch {
-    throw new GhError(m().gh.notFound);
+    throw new GhError(m().gh.notFound, 'not-found');
   }
 }
 
@@ -40,7 +44,7 @@ export async function ensureAuth(cwd: string): Promise<void> {
   try {
     await pexec('gh', ['auth', 'status'], { cwd });
   } catch {
-    throw new GhError(m().gh.notAuthed);
+    throw new GhError(m().gh.notAuthed, 'not-authed');
   }
 }
 
@@ -64,7 +68,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
     headRefName: string;
     baseRefName: string;
     headRefOid: string;
-    files?: { path: string; additions?: number; deletions?: number; status?: string }[];
+    files?: { path: string; additions?: number; deletions?: number; changeType?: string }[];
   };
   try {
     raw = JSON.parse(json);
@@ -82,7 +86,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
       path: f.path,
       additions: f.additions ?? 0,
       deletions: f.deletions ?? 0,
-      status: normaliseFileStatus(f.status),
+      status: normaliseFileStatus(f.changeType),
     })),
   };
 }
@@ -92,23 +96,25 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
  * repo, as lightweight summaries (no file lists) for the PR picker. Single gh
  * call; ordering is whatever gh returns (newest-updated first by default).
  */
-export async function listPrs(cwd: string): Promise<PrSummary[]> {
-  const json = await runGh(
-    [
-      'pr', 'list',
-      '--state', 'open',
-      '--limit', '50',
-      '--json',
-      'number,title,url,author,isDraft,headRefName,baseRefName,updatedAt,additions,deletions,changedFiles',
-    ],
-    cwd,
-  );
+export async function listPrs(cwd: string, opts?: { author?: string }): Promise<PrSummary[]> {
+  const args = [
+    'pr', 'list',
+    '--state', 'all',
+    '--limit', '100',
+    '--json',
+    'number,title,url,author,isDraft,state,headRefName,baseRefName,updatedAt,additions,deletions,changedFiles',
+  ];
+  if (opts?.author) {
+    args.push('--author', opts.author);
+  }
+  const json = await runGh(args, cwd);
   let raw: Array<{
     number: number;
     title: string;
     url: string;
     author?: { login?: string };
     isDraft?: boolean;
+    state?: string;
     headRefName: string;
     baseRefName: string;
     updatedAt: string;
@@ -127,6 +133,7 @@ export async function listPrs(cwd: string): Promise<PrSummary[]> {
     url: p.url,
     author: p.author?.login ?? '',
     isDraft: p.isDraft ?? false,
+    state: p.state ?? 'OPEN',
     headRefName: p.headRefName,
     baseRefName: p.baseRefName,
     updatedAt: p.updatedAt,
@@ -134,6 +141,29 @@ export async function listPrs(cwd: string): Promise<PrSummary[]> {
     deletions: p.deletions ?? 0,
     changedFiles: p.changedFiles ?? 0,
   }));
+}
+
+/** Merges PR summary lists, de-duplicating by number, newest-updated first. */
+export function mergePrsByNumber(...lists: PrSummary[][]): PrSummary[] {
+  const byNum = new Map<number, PrSummary>();
+  for (const list of lists) {
+    for (const p of list) {
+      byNum.set(p.number, p);
+    }
+  }
+  return [...byNum.values()].sort((a, b) =>
+    a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
+  );
+}
+
+/** Base-repo slug (OWNER/REPO) gh resolves for this clone (upstream for a fork). */
+export async function repoSlug(cwd: string): Promise<string> {
+  return (await runGh(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], cwd)).trim();
+}
+
+/** Login of the currently authenticated gh user (for the "Mine" PR filter). */
+export async function currentLogin(cwd: string): Promise<string> {
+  return (await runGh(['api', 'user', '--jq', '.login'], cwd)).trim();
 }
 
 /** Loads a specific PR by number — may be a branch we don't have checked out. */
@@ -149,7 +179,7 @@ export async function getPrByNumber(cwd: string, number: number): Promise<PullRe
     headRefName: string;
     baseRefName: string;
     headRefOid: string;
-    files?: { path: string; additions?: number; deletions?: number; status?: string }[];
+    files?: { path: string; additions?: number; deletions?: number; changeType?: string }[];
   };
   try {
     raw = JSON.parse(json);
@@ -167,7 +197,7 @@ export async function getPrByNumber(cwd: string, number: number): Promise<PullRe
       path: f.path,
       additions: f.additions ?? 0,
       deletions: f.deletions ?? 0,
-      status: normaliseFileStatus(f.status),
+      status: normaliseFileStatus(f.changeType),
     })),
   };
 }

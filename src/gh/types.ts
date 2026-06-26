@@ -25,6 +25,8 @@ export interface PrSummary {
   /** Author login (may be empty if gh omits it). */
   author: string;
   isDraft: boolean;
+  /** gh state: OPEN | MERGED | CLOSED. Draft is an OPEN sub-state via isDraft. */
+  state: string;
   headRefName: string;
   baseRefName: string;
   /** ISO timestamp of the last update, for "x ago" display. */

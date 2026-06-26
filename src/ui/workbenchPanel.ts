@@ -52,6 +52,10 @@ export interface WorkbenchState {
   repoName: string;
   /** Current git branch label (or short detached SHA); undefined if unknown. */
   branch?: string;
+  /** Workspace folders selectable for the inline project switch. */
+  projects: { cwd: string; name: string; current: boolean }[];
+  /** UI/LLM languages selectable inline (en / zh-CN / auto). */
+  languages: { id: string; label: string; current: boolean }[];
   /** Estimated LLM token usage for this review (approximate, not billed). */
   tokenUsage?: WorkbenchTokenUsage;
   conclusion?: {
@@ -95,6 +99,12 @@ export interface WorkbenchActions {
   pickProject(): void;
   /** Opens the scope picker (used both for first-time review and for switching). */
   pickScope(): void;
+  /** Picks a scope KIND inline in the workbench (skips the kind webview). */
+  pickScopeKind(kind: string): void;
+  /** Switches the review project to a workspace-folder cwd (inline menu). */
+  pickProjectCwd(cwd: string): void;
+  /** Switches the UI/LLM language to the given id (inline menu). */
+  pickLanguageId(id: string): void;
 }
 
 interface FilePatch {
@@ -148,6 +158,9 @@ type InboundMessage =
   | { type: 'pickBranch' }
   | { type: 'pickProject' }
   | { type: 'pickScope' }
+  | { type: 'pickScopeKind'; kind: string }
+  | { type: 'pickProjectCwd'; cwd: string }
+  | { type: 'pickLanguageId'; id: string }
   | { type: 'toggleFolder'; path: string };
 
 /**
@@ -272,6 +285,19 @@ export class WorkbenchPanel {
   static setGlobalProgress(active: boolean, message?: string): void {
     void WorkbenchPanel.current?.panel.webview.postMessage({
       type: 'globalProgress',
+      active,
+      message: message ?? '',
+    });
+  }
+
+  /**
+   * Drives a generic in-workbench busy bar (loading sources / project / PRs),
+   * shown instead of a parent-window notification that an auxiliary or
+   * full-screen workbench window would hide.
+   */
+  static setBusy(active: boolean, message?: string): void {
+    void WorkbenchPanel.current?.panel.webview.postMessage({
+      type: 'busy',
       active,
       message: message ?? '',
     });
@@ -458,6 +484,15 @@ export class WorkbenchPanel {
       case 'pickScope':
         this.actions.pickScope();
         break;
+      case 'pickScopeKind':
+        this.actions.pickScopeKind(msg.kind);
+        break;
+      case 'pickProjectCwd':
+        this.actions.pickProjectCwd(msg.cwd);
+        break;
+      case 'pickLanguageId':
+        this.actions.pickLanguageId(msg.id);
+        break;
       case 'toggleFolder':
         // The webview already toggled the `collapsed` CSS class optimistically,
         // so the visual change is instant. We only record the state here for
@@ -477,6 +512,12 @@ export class WorkbenchPanel {
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
     const t = m().workbench;
     const lang = resolveLanguage();
+    const stripIcon = (s: string) => s.replace(/\$\([^)]*\)\s*/g, '');
+    const scopeKinds = [
+      { id: 'files', label: stripIcon(m().scope.pickFilesLabel), detail: m().scope.pickFilesDetail },
+      { id: 'currentPr', label: stripIcon(m().scope.pickPrLabel), detail: m().scope.pickPrDetail },
+      { id: 'prList', label: stripIcon(m().scope.pickPrListLabel), detail: m().scope.pickPrListDetail },
+    ];
 
     if (!state.hasReviewSet) {
       return this.renderEmpty(nonce, csp);
@@ -672,6 +713,15 @@ export class WorkbenchPanel {
     background:var(--vscode-inputValidation-errorBackground, rgba(241,76,76,.14));
     color:var(--vscode-inputValidation-errorForeground, var(--red));
     border-color:var(--vscode-inputValidation-errorBorder, rgba(241,76,76,.4)); }
+  .wb-busy { display:flex; flex-direction:column; gap:.32rem; padding:.5rem .7rem; border-bottom:1px solid var(--line); background:var(--elevated); }
+  .wb-busy[hidden] { display:none; }
+  .busy-msg { font-size:.74rem; color:var(--blue); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .scope-menu { background:var(--elevated); }
+  .scope-menu[hidden] { display:none; }
+  .scope-menu .sk-item { padding:.5rem .7rem; cursor:pointer; border-top:1px solid var(--line); }
+  .scope-menu .sk-item:hover { background:var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
+  .scope-menu .sk-label { font-weight:600; font-size:.78rem; }
+  .scope-menu .sk-detail { margin-top:.15rem; font-size:.7rem; color:var(--dim); line-height:1.4; }
 </style>
 </head>
 <body>
@@ -683,6 +733,11 @@ export class WorkbenchPanel {
           <div class="sb-label" title="${escAttr(state.label)}">${esc(state.label)}</div>
           <button id="pickScope" class="sb-switch" title="${escAttr(t.switchScopeTitle)}">${esc(t.switchScope)}</button>
         </div>
+      </div>
+      <div class="scope-menu" id="scopeMenu" hidden></div>
+      <div class="wb-busy" id="wbBusy" hidden>
+        <div class="gp-bar"><div class="gp-fill"></div></div>
+        <span class="busy-msg" id="wbBusyMsg"></span>
       </div>
       <div class="filter-row">
         <input id="filter" type="search" placeholder="${escAttr(t.filterPlaceholder)}" autocomplete="off" />
@@ -713,10 +768,12 @@ export class WorkbenchPanel {
           <span class="lang-label" title="${escAttr(t.languageTitle)}">${esc(t.languagePrefix)}<b>${esc(languageLabel(t))}</b></span>
           <button id="pickLanguage">${esc(t.switch)}</button>
         </div>
+        <div class="scope-menu" id="langMenu" hidden></div>
         <div class="info-row">
           <span class="info-label" title="${escAttr(state.repoName)}">${esc(t.repoPrefix)}<b>${esc(state.repoName)}</b></span>
           <button id="pickProject">${esc(t.switch)}</button>
         </div>
+        <div class="scope-menu" id="projMenu" hidden></div>
         <div class="info-row">
           <span class="info-label" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
           <button id="pickBranch">${esc(t.switch)}</button>
@@ -745,6 +802,9 @@ export class WorkbenchPanel {
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const T = ${JSON.stringify(t)};
+  const SCOPE_KINDS = ${JSON.stringify(scopeKinds)};
+  const PROJECTS = ${JSON.stringify(state.projects)};
+  const LANGUAGES = ${JSON.stringify(state.languages)};
   const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i)] ?? '');
   const send = (m) => vscode.postMessage(m);
   const byId = (id) => document.getElementById(id);
@@ -1016,10 +1076,61 @@ export class WorkbenchPanel {
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('exportReport')?.addEventListener('click', () => send({ type:'exportReport' }));
   byId('pickModel')?.addEventListener('click', () => send({ type:'pickModel' }));
-  byId('pickLanguage')?.addEventListener('click', () => send({ type:'pickLanguage' }));
-  byId('pickProject')?.addEventListener('click', () => send({ type:'pickProject' }));
+  const langMenu = byId('langMenu');
+  if (langMenu) {
+    langMenu.innerHTML = LANGUAGES.map((l) =>
+      '<div class="sk-item" data-id="' + esc(l.id) + '">'
+      + '<div class="sk-label">' + esc(l.label) + (l.current ? ' \u2713' : '') + '</div></div>'
+    ).join('');
+    langMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.sk-item');
+      if (!item) return;
+      langMenu.hidden = true;
+      send({ type:'pickLanguageId', id: item.getAttribute('data-id') });
+    });
+  }
+  byId('pickLanguage')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (langMenu) langMenu.hidden = !langMenu.hidden;
+  });
+  const projMenu = byId('projMenu');
+  if (projMenu) {
+    projMenu.innerHTML = PROJECTS.map((p) =>
+      '<div class="sk-item" data-cwd="' + esc(p.cwd) + '">'
+      + '<div class="sk-label">' + esc(p.name) + (p.current ? ' \u2713' : '') + '</div>'
+      + '<div class="sk-detail">' + esc(p.cwd) + '</div></div>'
+    ).join('');
+    projMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.sk-item');
+      if (!item) return;
+      projMenu.hidden = true;
+      send({ type:'pickProjectCwd', cwd: item.getAttribute('data-cwd') });
+    });
+  }
+  byId('pickProject')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (projMenu) projMenu.hidden = !projMenu.hidden;
+  });
   byId('pickBranch')?.addEventListener('click', () => send({ type:'pickBranch' }));
-  byId('pickScope')?.addEventListener('click', () => send({ type:'pickScope' }));
+  const scopeMenu = byId('scopeMenu');
+  if (scopeMenu) {
+    scopeMenu.innerHTML = SCOPE_KINDS.map((k) =>
+      '<div class="sk-item" data-kind="' + esc(k.id) + '">'
+      + '<div class="sk-label">' + esc(k.label) + '</div>'
+      + '<div class="sk-detail">' + esc(k.detail) + '</div></div>'
+    ).join('');
+    scopeMenu.addEventListener('click', (e) => {
+      const item = e.target.closest('.sk-item');
+      if (!item) return;
+      scopeMenu.hidden = true;
+      send({ type:'pickScopeKind', kind: item.getAttribute('data-kind') });
+    });
+  }
+  byId('pickScope')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (scopeMenu) scopeMenu.hidden = !scopeMenu.hidden;
+  });
+  document.addEventListener('click', () => { if (scopeMenu) scopeMenu.hidden = true; if (projMenu) projMenu.hidden = true; if (langMenu) langMenu.hidden = true; });
   byId('submit')?.addEventListener('click', () => send({ type:'submit' }));
 
   function setGlobalProgress(active, message) {
@@ -1038,6 +1149,13 @@ export class WorkbenchPanel {
     if (active) { const m = byId('globalProgMsg'); if (m) m.textContent = message || ''; }
   }
 
+  function setBusy(active, message) {
+    const wrap = byId('wbBusy');
+    if (!wrap) return;
+    wrap.hidden = !active;
+    if (active) { const m = byId('wbBusyMsg'); if (m) m.textContent = message || ''; }
+  }
+
   // In-workbench notice (replaces parent-window notifications, which are
   // invisible when the workbench lives in its own auxiliary window).
   let noticeTimer = 0;
@@ -1054,6 +1172,7 @@ export class WorkbenchPanel {
   window.addEventListener('message', (e) => {
     const msg = e.data;
     if (msg && msg.type === 'globalProgress') { setGlobalProgress(msg.active, msg.message); return; }
+    if (msg && msg.type === 'busy') { setBusy(msg.active, msg.message); return; }
     if (msg && msg.type === 'focusTree') { treeEl.focus(); return; }
     if (msg && msg.type === 'notice') { flashNotice(msg.message, msg.kind); return; }
     if (!msg || msg.type !== 'patch') return;
@@ -1426,6 +1545,26 @@ function formatTime(ms: number): string {
   const d = new Date(ms);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * Runs `task` with progress shown INSIDE the workbench (so an auxiliary or
+ * full-screen workbench window never hides it). Falls back to a notification
+ * when the workbench is not open yet (e.g. the very first review load).
+ */
+export async function withWorkbenchProgress<T>(title: string, task: () => Promise<T>): Promise<T> {
+  if (WorkbenchPanel.isOpen) {
+    WorkbenchPanel.setBusy(true, title);
+    try {
+      return await task();
+    } finally {
+      WorkbenchPanel.setBusy(false);
+    }
+  }
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title },
+    () => task(),
+  );
 }
 
 /** Display name for the current `codereview.language` setting, e.g. "中文 (zh-CN)". */
