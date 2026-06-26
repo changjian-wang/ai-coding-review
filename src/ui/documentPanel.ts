@@ -242,15 +242,22 @@ export class DocumentPanel {
   }
 
   private handle(m: Inbound): void {
+    // `ready` means the webview script has loaded and can receive postMessage.
+    // It MUST be handled before the `!path` guard below: if the webview loads
+    // fast enough that `ready` arrives before `show()` has assigned `this.model`,
+    // the guard would drop it, `this.ready` would never flip true, and the panel
+    // (a reused singleton) would stay blank forever — for this file and every
+    // file opened afterwards.
+    if (m.type === 'ready') {
+      this.ready = true;
+      this.post();
+      return;
+    }
     const path = this.model?.path;
     if (!path) {
       return;
     }
     switch (m.type) {
-      case 'ready':
-        this.ready = true;
-        this.post();
-        break;
       case 'seen':
         this.actions.seen(path, m.lines);
         break;
