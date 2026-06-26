@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { m } from '../i18n';
-import type { PullRequest } from './types';
+import type { PullRequest, PrSummary } from './types';
 
 const pexec = promisify(execFile);
 
@@ -85,6 +85,100 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
       status: normaliseFileStatus(f.status),
     })),
   };
+}
+
+/**
+ * Lists OPEN pull requests (drafts included — a draft is an open PR) for the
+ * repo, as lightweight summaries (no file lists) for the PR picker. Single gh
+ * call; ordering is whatever gh returns (newest-updated first by default).
+ */
+export async function listPrs(cwd: string): Promise<PrSummary[]> {
+  const json = await runGh(
+    [
+      'pr', 'list',
+      '--state', 'open',
+      '--limit', '50',
+      '--json',
+      'number,title,url,author,isDraft,headRefName,baseRefName,updatedAt,additions,deletions,changedFiles',
+    ],
+    cwd,
+  );
+  let raw: Array<{
+    number: number;
+    title: string;
+    url: string;
+    author?: { login?: string };
+    isDraft?: boolean;
+    headRefName: string;
+    baseRefName: string;
+    updatedAt: string;
+    additions?: number;
+    deletions?: number;
+    changedFiles?: number;
+  }>;
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    throw new GhError(m().gh.prListParseFailed);
+  }
+  return raw.map((p) => ({
+    number: p.number,
+    title: p.title,
+    url: p.url,
+    author: p.author?.login ?? '',
+    isDraft: p.isDraft ?? false,
+    headRefName: p.headRefName,
+    baseRefName: p.baseRefName,
+    updatedAt: p.updatedAt,
+    additions: p.additions ?? 0,
+    deletions: p.deletions ?? 0,
+    changedFiles: p.changedFiles ?? 0,
+  }));
+}
+
+/** Loads a specific PR by number — may be a branch we don't have checked out. */
+export async function getPrByNumber(cwd: string, number: number): Promise<PullRequest> {
+  const json = await runGh(
+    ['pr', 'view', String(number), '--json', 'number,title,url,headRefName,baseRefName,headRefOid,files'],
+    cwd,
+  );
+  let raw: {
+    number: number;
+    title: string;
+    url: string;
+    headRefName: string;
+    baseRefName: string;
+    headRefOid: string;
+    files?: { path: string; additions?: number; deletions?: number; status?: string }[];
+  };
+  try {
+    raw = JSON.parse(json);
+  } catch {
+    throw new GhError(m().gh.prParseFailed);
+  }
+  return {
+    number: raw.number,
+    title: raw.title,
+    url: raw.url,
+    headRefName: raw.headRefName,
+    baseRefName: raw.baseRefName,
+    headRefOid: raw.headRefOid,
+    files: (raw.files ?? []).map((f) => ({
+      path: f.path,
+      additions: f.additions ?? 0,
+      deletions: f.deletions ?? 0,
+      status: normaliseFileStatus(f.status),
+    })),
+  };
+}
+
+/** Checks out the PR's head branch locally so the working tree matches the PR. */
+export async function checkoutPr(cwd: string, number: number): Promise<void> {
+  try {
+    await runGh(['pr', 'checkout', String(number)], cwd);
+  } catch {
+    throw new GhError(m().gh.checkoutFailed);
+  }
 }
 
 function normaliseFileStatus(status: string | undefined): PullRequest['files'][number]['status'] {

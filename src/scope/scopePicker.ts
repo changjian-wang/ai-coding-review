@@ -1,8 +1,10 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
-import { FileSystemScope, PrScope } from './scopes';
+import { FileSystemScope, PrScope, PrByNumberScope } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
+import { pickPr } from './prPickerPanel';
+import { ensureAuth, ensureGhAvailable, listPrs } from '../gh/ghClient';
 import type { ReviewScope } from './types';
 import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
@@ -37,6 +39,12 @@ export async function pickScope(
       detail: m().scope.pickPrDetail,
       build: async () => ({ scope: new PrScope(), cwd: defaultCwd }),
     },
+    {
+      label: m().scope.pickPrListLabel,
+      description: 'gh pr list',
+      detail: m().scope.pickPrListDetail,
+      build: buildPrListScope,
+    },
   ];
 
   const choice = await vscode.window.showQuickPick(items, {
@@ -68,6 +76,28 @@ export async function pickScope(
       return undefined;
     }
     return { scope: new FileSystemScope(picked), cwd: defaultCwd };
+  }
+
+  async function buildPrListScope(): Promise<PickedScope | undefined> {
+    await ensureGhAvailable(defaultCwd);
+    await ensureAuth(defaultCwd);
+    const prs = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: m().scope.loadingPrs },
+      () => listPrs(defaultCwd),
+    );
+    if (prs.length === 0) {
+      transientWarning(m().scope.noPrs);
+      return undefined;
+    }
+    const number = await pickPr({
+      repoLabel: path.basename(defaultCwd) || defaultCwd,
+      prs,
+      viewColumn,
+    });
+    if (number === undefined) {
+      return undefined;
+    }
+    return { scope: new PrByNumberScope(number), cwd: defaultCwd };
   }
 }
 

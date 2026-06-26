@@ -1,5 +1,5 @@
 import * as git from './gitClient';
-import { ensureAuth, ensureGhAvailable, getCurrentPr } from '../gh/ghClient';
+import { checkoutPr, ensureAuth, ensureGhAvailable, getCurrentPr, getPrByNumber } from '../gh/ghClient';
 import { m } from '../i18n';
 import type { ReviewFile, ReviewScope, ReviewSet } from './types';
 
@@ -20,6 +20,35 @@ export class PrScope implements ReviewScope {
     await ensureGhAvailable(cwd);
     await ensureAuth(cwd);
     const pr = await getCurrentPr(cwd);
+    let files = pr.files;
+    try {
+      files = await git.diffFiles(cwd, `origin/${pr.baseRefName}...HEAD`);
+    } catch {
+      // Fall back to gh's file list when the base ref is not available locally.
+    }
+    return {
+      scopeId: `pr-${pr.number}`,
+      label: `PR #${pr.number} · ${pr.title}`,
+      headSha: pr.headRefOid,
+      files,
+    };
+  }
+}
+
+/**
+ * A specific PR chosen from the picker — may live on a branch we don't have
+ * checked out, so the file list comes straight from gh (no local git range).
+ */
+export class PrByNumberScope implements ReviewScope {
+  constructor(private readonly number: number) {}
+
+  async load(cwd: string): Promise<ReviewSet> {
+    await ensureGhAvailable(cwd);
+    await ensureAuth(cwd);
+    // Check out the PR's branch so the working tree matches the PR under review;
+    // a chosen PR is usually not the branch currently checked out.
+    await checkoutPr(cwd, this.number);
+    const pr = await getPrByNumber(cwd, this.number);
     let files = pr.files;
     try {
       files = await git.diffFiles(cwd, `origin/${pr.baseRefName}...HEAD`);

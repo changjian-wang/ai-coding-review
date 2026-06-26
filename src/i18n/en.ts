@@ -217,6 +217,10 @@ export const en = {
       'Directly pick the source files or directories to review, independent of any diff',
     pickPrLabel: '$(git-pull-request) PR of the current branch',
     pickPrDetail: 'Include the source files touched by the PR (requires gh login)',
+    pickPrListLabel: '$(list-unordered) Select a PR…',
+    pickPrListDetail: 'Pick from the repo open / draft PRs (requires gh login)',
+    loadingPrs: 'AI Coding Review: loading PRs…',
+    noPrs: 'No open or draft PRs in this repository.',
     pickTitle: 'AI Coding Review · Select review scope',
     pickPlaceholder:
       'Pick the sources to review (local files/folders or the current branch PR)',
@@ -250,7 +254,23 @@ export const en = {
     confirm: 'Include in review',
     noMatch: 'No matching files',
   },
-
+  // ── Webview: PR picker panel ───────────────────────────────────
+  prPanel: {
+    title: 'AI Coding Review · Select a PR',
+    heading: 'Select a pull request',
+    repoLabel: 'Repository: ',
+    filterPlaceholder: 'Filter by #number / title…',
+    tabAll: 'All',
+    tabOpen: 'Open',
+    tabDraft: 'Draft',
+    badgeOpen: 'Open',
+    badgeDraft: 'Draft',
+    metaChanged: '{0} file(s)',
+    cancel: 'Cancel',
+    confirm: 'Review selected PR',
+    noMatch: 'No matching PRs',
+    empty: 'No open or draft PRs',
+  },
   // ── Webview: workbench panel ─────────────────────────────────────────────────
   workbench: {
     title: 'AI Coding Review · Workbench',
@@ -470,9 +490,11 @@ export const en = {
     notFound: 'GitHub CLI (gh) not found. Please install gh and run `gh auth login`.',
     notAuthed: 'GitHub CLI is not logged in. Please run `gh auth login`.',
     prParseFailed: 'Could not parse the PR data returned by gh.',
+    prListParseFailed: 'Could not parse the PR list returned by gh.',
     repoViewParseFailed: 'Could not parse the gh repo view response.',
     commentParseFailed: 'The PR comment was sent but the response could not be parsed.',
     noCurrentPr: 'The current branch has no associated PR. Switch to a branch that has one, or use "Pick source files/folders".',
+    checkoutFailed: 'Failed to check out the PR branch. Commit or stash your current changes first, then retry.',
   },
 
   git: {

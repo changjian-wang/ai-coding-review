@@ -193,6 +193,10 @@ export const zh: Messages = {
     pickFilesDetail: '直接挑选要审查的源文件或目录，不依赖任何 diff',
     pickPrLabel: '$(git-pull-request) 当前分支的 PR',
     pickPrDetail: '把 PR 涉及的源文件纳入审查（需要 gh 已登录）',
+    pickPrListLabel: '$(list-unordered) 选择一个 PR…',
+    pickPrListDetail: '从仓库的 Open / Draft PR 中挑选（需要 gh 已登录）',
+    loadingPrs: 'AI Coding Review：加载 PR 列表…',
+    noPrs: '仓库中没有 Open 或 Draft 的 PR。',
     pickTitle: 'AI Coding Review · 选择审查范围',
     pickPlaceholder: '挑选要纳入审查的源码（本地文件/文件夹 或 当前分支的 PR）',
     scanning: 'AI Coding Review：正在扫描项目文件…',
@@ -222,6 +226,23 @@ export const zh: Messages = {
     cancel: '取消',
     confirm: '纳入审查',
     noMatch: '没有匹配的文件',
+  },
+
+  prPanel: {
+    title: 'AI Coding Review · 选择一个 PR',
+    heading: '选择一个 Pull Request',
+    repoLabel: '仓库：',
+    filterPlaceholder: '按 #编号 / 标题筛选…',
+    tabAll: '全部',
+    tabOpen: 'Open',
+    tabDraft: 'Draft',
+    badgeOpen: 'Open',
+    badgeDraft: '草稿',
+    metaChanged: '{0} 个文件',
+    cancel: '取消',
+    confirm: '审查所选 PR',
+    noMatch: '没有匹配的 PR',
+    empty: '没有 Open 或 Draft 的 PR',
   },
 
   workbench: {
@@ -426,9 +447,11 @@ export const zh: Messages = {
     notFound: '未找到 GitHub CLI（gh）。请先安装 gh 并执行 `gh auth login`。',
     notAuthed: 'GitHub CLI 未登录。请先执行 `gh auth login`。',
     prParseFailed: '无法解析 gh 返回的 PR 数据。',
+    prListParseFailed: '无法解析 gh 返回的 PR 列表。',
     repoViewParseFailed: '无法解析 gh repo view 返回。',
     commentParseFailed: 'PR 评论已发送但响应解析失败。',
     noCurrentPr: '当前分支没有关联的 PR。请切换到有 PR 的分支，或改用「选择源码文件/文件夹」。',
+    checkoutFailed: '切换到 PR 分支失败。请先提交或暂存当前改动，然后重试。',
   },
 
   git: {
