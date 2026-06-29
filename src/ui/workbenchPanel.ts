@@ -743,7 +743,10 @@ export class WorkbenchPanel {
   .wb-block { position:fixed; inset:0; z-index:90; cursor:progress; background:rgba(0,0,0,.04); }
   .wb-block[hidden] { display:none; }
   .busy-msg { font-size:.74rem; color:var(--blue); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .scope-menu { background:var(--elevated); max-height:42vh; overflow-y:auto; }
+  .sb-head, .model-row, .lang-row, .info-row { position:relative; }
+  .scope-menu { position:absolute; left:0; right:0; z-index:50; max-height:50vh; overflow-y:auto; background:var(--elevated); border:1px solid var(--line); border-radius:6px; box-shadow:0 6px 18px rgba(0,0,0,.4); }
+  #scopeMenu { top:100%; margin-top:3px; }
+  #modelMenu, #langMenu, #projMenu, #branchMenu { bottom:100%; margin-bottom:3px; }
   .scope-menu[hidden] { display:none; }
   .scope-menu .sk-item { padding:.5rem .7rem; cursor:pointer; border-top:1px solid var(--line); }
   .scope-menu .sk-item:hover { background:var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
@@ -761,8 +764,8 @@ export class WorkbenchPanel {
           <div class="sb-label" title="${escAttr(state.label)}">${esc(state.label)}</div>
           <button id="pickScope" class="sb-switch" title="${escAttr(t.switchScopeTitle)}">${esc(t.switchScope)}</button>
         </div>
+        <div class="scope-menu" id="scopeMenu" hidden></div>
       </div>
-      <div class="scope-menu" id="scopeMenu" hidden></div>
       <div class="wb-busy" id="wbBusy" hidden>
         <div class="gp-bar"><div class="gp-fill"></div></div>
         <span class="busy-msg" id="wbBusyMsg"></span>
@@ -794,23 +797,23 @@ export class WorkbenchPanel {
         <div class="model-row">
           <span id="modelLabel" class="model-label" title="${escAttr(state.modelLabel)}">${esc(t.modelPrefix)}<b>${esc(state.modelLabel)}</b></span>
           <button id="pickModel">${esc(t.switch)}</button>
+          <div class="scope-menu" id="modelMenu" hidden></div>
         </div>
-        <div class="scope-menu" id="modelMenu" hidden></div>
         <div class="lang-row">
           <span class="lang-label" title="${escAttr(t.languageTitle)}">${esc(t.languagePrefix)}<b>${esc(languageLabel(t))}</b></span>
           <button id="pickLanguage">${esc(t.switch)}</button>
+          <div class="scope-menu" id="langMenu" hidden></div>
         </div>
-        <div class="scope-menu" id="langMenu" hidden></div>
         <div class="info-row">
           <span class="info-label" title="${escAttr(state.repoName)}">${esc(t.repoPrefix)}<b>${esc(state.repoName)}</b></span>
           <button id="pickProject">${esc(t.switch)}</button>
+          <div class="scope-menu" id="projMenu" hidden></div>
         </div>
-        <div class="scope-menu" id="projMenu" hidden></div>
         <div class="info-row">
           <span class="info-label" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
           <button id="pickBranch">${esc(t.switch)}</button>
+          <div class="scope-menu" id="branchMenu" hidden></div>
         </div>
-        <div class="scope-menu" id="branchMenu" hidden></div>
         </div>
       </div>
       <div class="hud">
