@@ -283,6 +283,7 @@ export const zh: Messages = {
     branchPrefix: '分支：',
     switchingBranch: (branch: string) => `正在切换到 ${branch}…`,
     branchSwitchFailed: (branch: string) => `切换到 ${branch} 失败`,
+    branchStashed: '切换前已自动暂存本地改动（git stash pop 恢复）',
     openingFile: '正在打开文件…',
     lineCoverage: '行覆盖',
     filesReady: '文件就绪',

@@ -560,14 +560,18 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
     if (!cwd || id === currentBranchLabel) {
       return;
     }
+    let result: { stashed: boolean };
     try {
-      await withWorkbenchProgress(m().workbench.switchingBranch(id), () => switchBranchTo(cwd, id));
+      result = await withWorkbenchProgress(m().workbench.switchingBranch(id), () => switchBranchTo(cwd, id));
     } catch (err) {
       WorkbenchPanel.flashNotice(m().workbench.branchSwitchFailed(id) + ': ' + String((err as Error)?.message ?? err), 'error');
       return;
     }
     await refreshBranchLabel();
     WorkbenchPanel.rerenderIfOpen();
+    if (result.stashed) {
+      WorkbenchPanel.flashNotice(m().workbench.branchStashed, 'warn');
+    }
   }
 }
 
@@ -631,11 +635,15 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
     // Beside column; drop it so the next file opens beside the relocated panel.
     DocumentPanel.closeIfOpen();
   }
-  // Intentionally do NOT open the first review file and do NOT pre-create an
-  // empty editor group beside the workbench: an empty group shows only the VS
-  // Code watermark and, in an auxiliary window, keeps that window alive as a
-  // blank husk. The split ratio is applied lazily the first time a file is
-  // actually opened (see openFileInPanel).
+  // Pre-warm the document panel: create its webview now (cold-start + shell load
+  // happen here) and apply the split, so the first file opens instantly instead
+  // of paying the webview boot cost on click. A pre-warmed panel shows its own
+  // loading shell, not the empty-group watermark husk.
+  DocumentPanel.prewarm(docActions());
+  if (!layoutAppliedForCurrentReview) {
+    layoutAppliedForCurrentReview = true;
+    await applyWorkbenchLayout();
+  }
 }
 
 /**

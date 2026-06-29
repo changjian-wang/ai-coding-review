@@ -161,7 +161,22 @@ export async function listBranches(cwd: string): Promise<string[]> {
   return out.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
-/** Switches to an existing local branch via `git switch`. */
-export async function switchBranchTo(cwd: string, branch: string): Promise<void> {
+/** True when the working tree or index has uncommitted changes. */
+export async function hasUncommittedChanges(cwd: string): Promise<boolean> {
+  const out = await git(['status', '--porcelain'], cwd);
+  return out.trim().length > 0;
+}
+
+/**
+ * Switches to an existing local branch. If the working tree is dirty, auto-stashes
+ * (including untracked files) first so the checkout always succeeds; returns whether
+ * a stash was created so the caller can tell the user how to restore it.
+ */
+export async function switchBranchTo(cwd: string, branch: string): Promise<{ stashed: boolean }> {
+  const stashed = await hasUncommittedChanges(cwd);
+  if (stashed) {
+    await git(['stash', 'push', '-u', '-m', `ai-coding-review: auto-stash before switch to ${branch}`], cwd);
+  }
   await git(['switch', branch], cwd);
+  return { stashed };
 }

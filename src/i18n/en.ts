@@ -312,6 +312,7 @@ export const en = {
     branchPrefix: 'Branch: ',
     switchingBranch: (branch: string) => `Switching to ${branch}…`,
     branchSwitchFailed: (branch: string) => `Switch to ${branch} failed`,
+    branchStashed: 'Local changes were auto-stashed before switching (git stash pop to restore)',
     openingFile: 'Opening file…',
     lineCoverage: 'Line coverage',
     filesReady: 'Files ready',

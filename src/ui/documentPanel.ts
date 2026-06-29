@@ -112,18 +112,8 @@ export class DocumentPanel {
   }
 
   static show(model: DocModel, actions: DocActions): void {
-    if (!DocumentPanel.current) {
-      const panel = vscode.window.createWebviewPanel(
-        'codereview.document',
-        m().documentPanel.title,
-        // Open beside the active group (the workbench), so it lands in the same
-        // window the workbench currently lives in — including a popped-out window.
-        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-        { enableScripts: true, retainContextWhenHidden: true },
-      );
-      DocumentPanel.current = new DocumentPanel(panel, actions);
-    }
-    const inst = DocumentPanel.current;
+    DocumentPanel.prewarm(actions);
+    const inst = DocumentPanel.current!;
     inst.actions = actions;
     inst.model = model;
     inst.panel.title = `📄 ${model.name}`;
@@ -131,6 +121,24 @@ export class DocumentPanel {
     if (inst.ready) {
       inst.post();
     }
+  }
+
+  /**
+   * Creates the document webview ahead of the first file open so the cold start
+   * (webview boot + shell load) happens during workbench setup, not on the first
+   * click. No-op if a panel already exists.
+   */
+  static prewarm(actions: DocActions): void {
+    if (DocumentPanel.current) {
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      'codereview.document',
+      m().documentPanel.title,
+      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    DocumentPanel.current = new DocumentPanel(panel, actions);
   }
 
   /** Pushes an updated model (e.g. after an annotation changes) into the panel. */
