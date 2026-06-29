@@ -311,6 +311,8 @@ export const en = {
     repoPrefix: 'Project: ',
     branchPrefix: 'Branch: ',
     switchingBranch: (branch: string) => `Switching to ${branch}…`,
+    branchSwitchFailed: (branch: string) => `Switch to ${branch} failed`,
+    openingFile: 'Opening file…',
     lineCoverage: 'Line coverage',
     filesReady: 'Files ready',
     gatePass: 'Gate passed — you can submit the conclusion',

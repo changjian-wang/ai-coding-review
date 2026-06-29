@@ -282,6 +282,8 @@ export const zh: Messages = {
     repoPrefix: '项目：',
     branchPrefix: '分支：',
     switchingBranch: (branch: string) => `正在切换到 ${branch}…`,
+    branchSwitchFailed: (branch: string) => `切换到 ${branch} 失败`,
+    openingFile: '正在打开文件…',
     lineCoverage: '行覆盖',
     filesReady: '文件就绪',
     gatePass: '门禁已通过，可提交结论',

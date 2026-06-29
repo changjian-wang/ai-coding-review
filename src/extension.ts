@@ -563,7 +563,7 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
     try {
       await withWorkbenchProgress(m().workbench.switchingBranch(id), () => switchBranchTo(cwd, id));
     } catch (err) {
-      transientWarning(String((err as Error)?.message ?? err));
+      WorkbenchPanel.flashNotice(m().workbench.branchSwitchFailed(id) + ': ' + String((err as Error)?.message ?? err), 'error');
       return;
     }
     await refreshBranchLabel();
@@ -943,6 +943,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
   // already-superseded open overwrite the panel. Each call claims a token; after
   // every await we bail if a newer click has taken over.
   const myGeneration = ++openFileGeneration;
+  const firstOpen = !layoutAppliedForCurrentReview;
+  if (firstOpen) {
+    WorkbenchPanel.setBusy(true, m().workbench.openingFile);
+  }
+  try {
   const text = await readReviewFileText(relPath);
   if (myGeneration !== openFileGeneration) {
     return; // a newer click superseded us — skip the expensive render + show.
@@ -966,6 +971,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
     await applyWorkbenchLayout();
   }
   WorkbenchPanel.refreshIfOpen();
+  } finally {
+    if (firstOpen) {
+      WorkbenchPanel.setBusy(false);
+    }
+  }
 }
 
 /** Renders (and caches) the highlighted/markdown content for a file. */
