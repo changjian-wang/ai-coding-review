@@ -259,6 +259,11 @@ export class WorkbenchPanel {
     return WorkbenchPanel.current?.panel.viewColumn;
   }
 
+  /** Reveals (and focuses) the workbench so its window becomes the active group. */
+  static reveal(): void {
+    WorkbenchPanel.current?.panel.reveal(undefined, false);
+  }
+
   /** Re-renders the panel from current session state, if open. */
   static refreshIfOpen(): void {
     WorkbenchPanel.current?.scheduleRefresh();

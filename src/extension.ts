@@ -639,9 +639,12 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
   // happen here) and apply the split, so the first file opens instantly instead
   // of paying the webview boot cost on click. A pre-warmed panel shows its own
   // loading shell, not the empty-group watermark husk.
-  DocumentPanel.prewarm(docActions());
+  // First open of a review: reveal/focus the workbench so its window is active,
+  // pre-warm the document beside it (cold start up front), and set the 3:7 split.
   if (!layoutAppliedForCurrentReview) {
     layoutAppliedForCurrentReview = true;
+    WorkbenchPanel.reveal();
+    DocumentPanel.prewarm(docActions());
     await applyWorkbenchLayout();
   }
 }
@@ -807,7 +810,7 @@ async function applyWorkbenchLayout(): Promise<void> {
   try {
     await vscode.commands.executeCommand('vscode.setEditorLayout', {
       orientation: 0,
-      groups: [{ size: 0.2 }, { size: 0.8 }],
+      groups: [{ size: 0.3 }, { size: 0.7 }],
     });
   } catch {
     // Older VS Code versions or missing second group — ignore.
