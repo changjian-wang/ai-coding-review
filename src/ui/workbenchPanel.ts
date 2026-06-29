@@ -142,6 +142,7 @@ interface WorkbenchPatchSnapshot {
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
+  branch?: string;
   tokenUsage?: WorkbenchState['tokenUsage'];
   conclusion?: WorkbenchState['conclusion'];
 }
@@ -403,6 +404,7 @@ export class WorkbenchPanel {
     globalDone: boolean;
     hasGlobalReport: boolean;
     modelLabel: string;
+    branch?: string;
     tokenUsage?: WorkbenchState['tokenUsage'];
     conclusion?: WorkbenchState['conclusion'];
   } {
@@ -419,6 +421,7 @@ export class WorkbenchPanel {
         globalDone: next.globalDone,
         hasGlobalReport: next.hasGlobalReport,
         modelLabel: next.modelLabel,
+        branch: next.branch,
         tokenUsage: next.tokenUsage,
         conclusion: next.conclusion,
       };
@@ -446,6 +449,7 @@ export class WorkbenchPanel {
       globalDone: next.globalDone,
       hasGlobalReport: next.hasGlobalReport,
       modelLabel: next.modelLabel,
+      branch: next.branch,
       tokenUsage: next.tokenUsage,
       conclusion: next.conclusion,
     };
@@ -810,7 +814,7 @@ export class WorkbenchPanel {
           <div class="scope-menu" id="projMenu" hidden></div>
         </div>
         <div class="info-row">
-          <span class="info-label" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
+          <span class="info-label" id="branchLabel" title="${escAttr(state.branch ?? '')}">${esc(t.branchPrefix)}<b>${esc(state.branch ?? '—')}</b></span>
           <button id="pickBranch">${esc(t.switch)}</button>
           <div class="scope-menu" id="branchMenu" hidden></div>
         </div>
@@ -977,6 +981,7 @@ export class WorkbenchPanel {
     const showGlobal = byId('showGlobal'); if (showGlobal) showGlobal.disabled = !msg.hasGlobalReport;
     const modelLabel = byId('modelLabel');
     if (modelLabel) { modelLabel.title = msg.modelLabel; modelLabel.innerHTML = T.modelPrefix + '<b>' + esc(msg.modelLabel) + '</b>'; }
+    if (typeof msg.branch === 'string') { const bl = byId('branchLabel'); if (bl) { bl.title = msg.branch; bl.innerHTML = T.branchPrefix + '<b>' + esc(msg.branch) + '</b>'; } }
     updateTokenRow(msg.tokenUsage);
     const conclusionWrap = byId('conclusionWrap'); if (conclusionWrap) conclusionWrap.innerHTML = renderConclusion(msg.conclusion);
   }
@@ -1560,6 +1565,7 @@ function snapshotFor(state: WorkbenchState): WorkbenchPatchSnapshot {
     globalDone: state.globalDone,
     hasGlobalReport: state.hasGlobalReport,
     modelLabel: state.modelLabel,
+    branch: state.branch,
     tokenUsage: state.tokenUsage,
     conclusion: state.conclusion,
   };

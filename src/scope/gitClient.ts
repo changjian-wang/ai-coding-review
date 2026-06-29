@@ -173,10 +173,18 @@ export async function hasUncommittedChanges(cwd: string): Promise<boolean> {
  * a stash was created so the caller can tell the user how to restore it.
  */
 export async function switchBranchTo(cwd: string, branch: string): Promise<{ stashed: boolean }> {
-  const stashed = await hasUncommittedChanges(cwd);
-  if (stashed) {
+  // Fast path: try switch with NO upfront `git status` (full-tree scans are slow
+  // in large repos). Only when switch is refused — typically a dirty tree — do
+  // we pay the status check and auto-stash, then retry.
+  try {
+    await git(['switch', branch], cwd);
+    return { stashed: false };
+  } catch (err) {
+    if (!(await hasUncommittedChanges(cwd))) {
+      throw err;
+    }
     await git(['stash', 'push', '-u', '-m', `ai-coding-review: auto-stash before switch to ${branch}`], cwd);
+    await git(['switch', branch], cwd);
+    return { stashed: true };
   }
-  await git(['switch', branch], cwd);
-  return { stashed };
 }

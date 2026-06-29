@@ -568,7 +568,7 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
       return;
     }
     await refreshBranchLabel();
-    WorkbenchPanel.rerenderIfOpen();
+    WorkbenchPanel.refreshIfOpen();
     if (result.stashed) {
       WorkbenchPanel.flashNotice(m().workbench.branchStashed, 'warn');
     }
