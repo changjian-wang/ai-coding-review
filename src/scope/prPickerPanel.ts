@@ -234,6 +234,12 @@ function renderHtml(opts: PrPickerOptions): string {
     selected = Number(card.getAttribute('data-n'));
     render(); updateFoot();
   });
+  // Double-click a card to review it immediately (select + confirm in one).
+  listEl.addEventListener('dblclick', (e) => {
+    const card = e.target.closest('.card');
+    if (!card) return;
+    vscode.postMessage({ type: 'confirm', number: Number(card.getAttribute('data-n')) });
+  });
   filterEl.addEventListener('input', () => render());
   for (const tb of document.querySelectorAll('.tab')) {
     tb.addEventListener('click', () => {
