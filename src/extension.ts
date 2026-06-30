@@ -954,8 +954,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
   // already-superseded open overwrite the panel. Each call claims a token; after
   // every await we bail if a newer click has taken over.
   const myGeneration = ++openFileGeneration;
-  const firstOpen = !layoutAppliedForCurrentReview;
-  if (firstOpen) {
+  // Reapply the 3:7 split not just on the very first open, but whenever the
+  // document panel was closed and is being recreated as a fresh 50/50 group.
+  const docWasOpen = DocumentPanel.isOpen;
+  const needLayout = !layoutAppliedForCurrentReview || !docWasOpen;
+  if (needLayout) {
     WorkbenchPanel.setBusy(true, m().workbench.openingFile);
   }
   try {
@@ -977,13 +980,13 @@ async function openFileInPanel(relPath: string): Promise<void> {
   // group. Apply the narrow-workbench / wide-document split once per review now
   // that there is real content to size — rather than pre-creating an empty group
   // when the workbench opens (which would linger as a blank watermark frame).
-  if (!layoutAppliedForCurrentReview) {
+  if (needLayout) {
     layoutAppliedForCurrentReview = true;
     await applyWorkbenchLayout();
   }
   WorkbenchPanel.refreshIfOpen();
   } finally {
-    if (firstOpen) {
+    if (needLayout) {
       WorkbenchPanel.setBusy(false);
     }
   }
