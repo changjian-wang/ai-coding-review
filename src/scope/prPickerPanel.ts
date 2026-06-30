@@ -87,12 +87,12 @@ function renderHtml(opts: PrPickerOptions): string {
   .head h2 { margin:0 0 4px; font-size:14px; }
   .repo-line { font-size:12px; color:var(--dim); }
   .repo-line b { color:var(--blue); font-weight:600; }
-  .toolbar { display:flex; align-items:center; gap:8px; padding:8px 16px; border-bottom:1px solid var(--line); }
-  .tabs { display:flex; gap:4px; }
+  .toolbar { display:flex; flex-direction:column; align-items:stretch; gap:8px; padding:8px 12px; border-bottom:1px solid var(--line); }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; }
   .tab { font-size:11.5px; padding:4px 10px; cursor:pointer; border:1px solid var(--line); border-radius:5px;
     background:var(--vscode-button-secondaryBackground); color:var(--vscode-button-secondaryForeground); }
   .tab.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
-  .toolbar input[type=search] { flex:1; font-family:inherit; font-size:12px; padding:5px 9px;
+  .toolbar input[type=search] { flex:none; width:100%; font-family:inherit; font-size:12px; padding:5px 9px;
     color:var(--vscode-input-foreground); background:var(--vscode-input-background);
     border:1px solid var(--vscode-input-border, var(--line)); border-radius:5px; outline:none; }
   .toolbar input[type=search]:focus { border-color:var(--vscode-focusBorder, var(--blue)); }
@@ -108,7 +108,7 @@ function renderHtml(opts: PrPickerOptions): string {
   .badge.draft { color:var(--dim); border:1px solid var(--dim); }
   .badge.merged { color:var(--purple); border:1px solid var(--purple); }
   .badge.closed { color:var(--red); border:1px solid var(--red); }
-  .card-meta { margin-top:4px; font-size:11.5px; color:var(--dim); display:flex; gap:10px; flex-wrap:wrap; }
+  .card-meta { margin-top:4px; font-size:11px; color:var(--dim); display:flex; gap:8px; flex-wrap:wrap; }
   .empty { padding:24px 16px; color:var(--dim); text-align:center; }
   .foot { display:flex; align-items:center; gap:12px; padding:10px 16px; border-top:1px solid var(--line);
     background:var(--vscode-editorWidget-background, transparent); }
