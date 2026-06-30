@@ -232,7 +232,13 @@ function renderHtml(opts: PrPickerOptions): string {
     const card = e.target.closest('.card');
     if (!card) return;
     selected = Number(card.getAttribute('data-n'));
-    render(); updateFoot();
+    // Update the selection highlight in place (NOT a full render): rebuilding the
+    // list DOM here would make the second click of a double-click land on a brand
+    // new element, so the browser never fires 'dblclick'.
+    for (const c of listEl.querySelectorAll('.card')) {
+      c.classList.toggle('sel', Number(c.getAttribute('data-n')) === selected);
+    }
+    updateFoot();
   });
   // Double-click a card to review it immediately (select + confirm in one).
   listEl.addEventListener('dblclick', (e) => {
