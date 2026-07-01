@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { setGhTokenResolver } from './gh/ghClient';
+import { initAccountResolver, resolveGhTokenForRepo } from './gh/accountResolver';
 import { ReviewSession } from './review/reviewSession';
 import { WorkspaceStateReviewStore, type Annotation } from './review/reviewStore';
 import { pickModel, listModels, type PickedModel } from './ai/modelPicker';
@@ -186,6 +188,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // keep working after a window reload (they rely on the saved newText).
   hydrateAppliedFixes(context.workspaceState);
   workspaceMemento = context.workspaceState;
+
+  // Auto-pick the gh account that can access each repo (by owner) so reviewing
+  // repos owned by different accounts (personal vs enterprise) just works,
+  // without manually switching the global active gh account.
+  initAccountResolver(context.globalState);
+  setGhTokenResolver(resolveGhTokenForRepo);
 
   // Older versions hid the activity bar globally and didn't always restore it.
   // If the global setting is still `hidden`, reset it once so the user gets

@@ -18,5 +18,7 @@
   "config.language.zh": "Always use Simplified Chinese",
   "config.language.en": "Always use English",
   "config.language.description": "Language for the whole AI Coding Review experience — both the extension UI (status bar, prompts, panels) and all LLM output (findings, fix proposals, explanations, global conclusions). Command titles in the Command Palette follow the VS Code display language.",
-  "config.focusedWorkbench.description": "When opening the AI Coding Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed."
+  "config.focusedWorkbench.description": "When opening the AI Coding Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed.",
+  "config.autoAccount.description": "Automatically use the GitHub CLI account that can access the current repository (matched by its owner) for that repo's GitHub calls, without changing your global active gh account. Turn this off to always use the active gh account.",
+  "config.accountByOwner.description": "Optional override mapping a repository owner (organization or user) to a specific GitHub CLI account login, for example `{ \"my-org\": \"work-account\" }`. Takes precedence over automatic detection."
 }

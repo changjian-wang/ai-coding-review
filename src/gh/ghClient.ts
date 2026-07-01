@@ -16,9 +16,30 @@ const MAX_BUFFER = 32 * 1024 * 1024;
 /** Hard ceiling so a hung gh process (network stall) can never freeze the UI. */
 const GH_TIMEOUT_MS = 60_000;
 
+/**
+ * Optional hook returning a gh token to use for a given repo `cwd`, so the
+ * account is selected per repository. Injected from activate() to keep this
+ * module free of vscode dependencies. Returns undefined to use gh's default
+ * (global active) account.
+ */
+type GhTokenResolver = (cwd: string) => Promise<string | undefined>;
+let tokenResolver: GhTokenResolver | undefined;
+
+/** Registers the per-repo gh token resolver (see GhTokenResolver). */
+export function setGhTokenResolver(fn: GhTokenResolver): void {
+  tokenResolver = fn;
+}
+
 async function runGh(args: string[], cwd: string): Promise<string> {
+  let env: NodeJS.ProcessEnv | undefined;
+  if (tokenResolver) {
+    const token = await tokenResolver(cwd).catch(() => undefined);
+    if (token) {
+      env = { ...process.env, GH_TOKEN: token };
+    }
+  }
   try {
-    const { stdout } = await pexec('gh', args, { cwd, maxBuffer: MAX_BUFFER, timeout: GH_TIMEOUT_MS });
+    const { stdout } = await pexec('gh', args, { cwd, env, maxBuffer: MAX_BUFFER, timeout: GH_TIMEOUT_MS });
     return stdout;
   } catch (err) {
     const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string };
