@@ -49,12 +49,16 @@ export interface DocModel {
   annotations: DocAnnotation[];
   /** True while this file is currently being analyzed (drives the topbar button). */
   analyzing: boolean;
+  /** Persisted whole-document translation (rendered reading HTML) for the side-by-side view. */
+  translationHtml?: string;
 }
 
 /** Actions the document panel triggers in the extension host. */
 export interface DocActions {
   seen(path: string, lines: number[]): void;
   translate(path: string, startLine: number, endLine: number, text: string): void;
+  /** Translates the whole doc for the side-by-side view; the rendered HTML comes back once. */
+  translateWhole(path: string): void;
   explain(path: string, startLine: number, endLine: number, text: string): void;
   note(path: string, startLine: number, endLine: number, text: string): void;
   removeAnnotation(path: string, id: string): void;
@@ -78,6 +82,7 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'seen'; lines: number[] }
   | { type: 'translate'; startLine: number; endLine: number; text: string }
+  | { type: 'translateWhole' }
   | { type: 'explain'; startLine: number; endLine: number; text: string }
   | { type: 'note'; startLine: number; endLine: number; text: string }
   | { type: 'removeAnnotation'; id: string }
@@ -243,6 +248,16 @@ export class DocumentPanel {
     }
   }
 
+  /** Sends the whole-document translation to the side-by-side view. `done`=false
+   * streams the accumulating translated Markdown as text; `done`=true sends the
+   * final rendered HTML. */
+  static postWholeTranslation(path: string, content: string, done: boolean): void {
+    const inst = DocumentPanel.current;
+    if (inst?.ready && inst.model?.path === path) {
+      void inst.panel.webview.postMessage({ type: 'wholeTranslation', content, done });
+    }
+  }
+
   private post(): void {
     if (this.model) {
       void this.panel.webview.postMessage({ type: 'load', model: this.model });
@@ -271,6 +286,9 @@ export class DocumentPanel {
         break;
       case 'translate':
         this.actions.translate(path, m.startLine, m.endLine, m.text);
+        break;
+      case 'translateWhole':
+        this.actions.translateWhole(path);
         break;
       case 'explain':
         this.actions.explain(path, m.startLine, m.endLine, m.text);
@@ -501,6 +519,18 @@ export class DocumentPanel {
   .reading table { border-collapse:collapse; }
   .reading th,.reading td { border:1px solid var(--line); padding:4px 8px; }
   .reading blockquote { border-left:3px solid var(--purple); margin:0; padding-left:12px; color:var(--dim); }
+  /* Side-by-side bilingual columns */
+  .reading-cols { display:flex; align-items:flex-start; }
+  .reading-cols .reading { flex:1; min-width:0; }
+  .reading-cols.bi .reading { max-width:none; margin:0; }
+  .reading-tr { display:none; border-left:1px solid var(--line); }
+  .reading-cols.bi .reading-tr { display:block; }
+  .reading-tr .tr-empty { color:var(--dim); font-style:italic; }
+  .reading-tr.streaming { white-space:pre-wrap; font-family:var(--vscode-editor-font-family, monospace); font-size:.85em; color:var(--dim); }
+  #m-bi.on { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
+  #m-bi { position:relative; }
+  #m-bi.busy { cursor:progress; padding-right:24px; }
+  #m-bi.busy::after { content:''; position:absolute; right:8px; top:50%; margin-top:-6px; width:11px; height:11px; border-radius:50%; border:2px solid color-mix(in srgb, var(--vscode-foreground, #ccc) 30%, transparent); border-top-color:var(--vscode-foreground, #ccc); animation:popSpin .7s linear infinite; }
 
   /* Annotation card */
   .anno {
@@ -601,6 +631,7 @@ export class DocumentPanel {
       <button id="m-read" class="on">${t.readView}</button>
       <button id="m-src">${t.sourceView}</button>
     </span>
+    <button id="m-bi" title="${t.bilingualTitle}" style="display:none">${t.bilingual}</button>
     <button id="act-jump"><span class="ico">⤵</span>${t.jumpNextUnseen}</button>
     <button id="act-analyze"><span class="ico">🔬</span><span class="btn-label">${t.analyzeFile}</span><span class="kbd">A</span></button>
   </div>
@@ -635,6 +666,29 @@ let locatedRange = null;
 
 const $ = (id) => document.getElementById(id);
 const contentEl = $('content');
+
+let bilingual = false;
+let docTrHtml = '';
+let biBusyTimer = 0;
+function setBiBusy(on) {
+  const btn = $('m-bi');
+  if (!btn) return;
+  btn.classList.toggle('busy', on);
+  if (biBusyTimer) { clearTimeout(biBusyTimer); biBusyTimer = 0; }
+  if (on) biBusyTimer = setTimeout(() => { btn.classList.remove('busy'); biBusyTimer = 0; }, 60000);
+}
+// Side-by-side bilingual: the whole doc is translated once and rendered into the
+// right column; the left column is the untouched original. No per-block work.
+function fillTrColumn(html) {
+  const col = document.getElementById('readingTr');
+  if (col) col.innerHTML = html || ('<div class="tr-empty">' + T.translatingDoc + '</div>');
+}
+function ensureWholeTranslation() {
+  if (docTrHtml) { fillTrColumn(docTrHtml); return; }
+  setBiBusy(true);
+  fillTrColumn('');
+  vscode.postMessage({ type: 'translateWhole' });
+}
 
 function rawText() { return (model.raw || []).join('\\n'); }
 
@@ -906,13 +960,19 @@ function ensureSrcRenderedThrough(line) {
 function renderReading() {
   mode = 'reading';
   if (io) { io.disconnect(); visible.clear(); }
+  const cols = document.createElement('div');
+  cols.className = 'reading-cols' + (bilingual ? ' bi' : '');
   const wrap = document.createElement('div');
   wrap.className = 'reading';
   wrap.innerHTML = model.readingHtml || '';
+  cols.appendChild(wrap);
+  const trCol = document.createElement('div');
+  trCol.className = 'reading reading-tr';
+  trCol.id = 'readingTr';
+  cols.appendChild(trCol);
   contentEl.innerHTML = '';
-  contentEl.appendChild(wrap);
+  contentEl.appendChild(cols);
 
-  // Anchor annotations after the block whose text contains the selection.
   const blocks = Array.from(wrap.children);
   const placed = new Set();
   for (const a of model.annotations) {
@@ -936,10 +996,6 @@ function renderReading() {
     wrap.appendChild(foot);
   }
 
-  // Coverage in reading mode: rendered markdown blocks have no per-line rows,
-  // so map source lines proportionally onto the top-level blocks and mark a
-  // block's slice seen once it scrolls into view. Reaching the bottom marks the
-  // whole file read, matching how a reviewer reads the rendered doc top-down.
   const total = model.sourceLines.length;
   const N = blocks.length;
   if (N && total) {
@@ -958,6 +1014,7 @@ function renderReading() {
     }, { root: contentEl, threshold: 0.3 });
     for (const b of blocks) io.observe(b);
   }
+  if (bilingual) ensureWholeTranslation();
 }
 
 function flushSeen() {
@@ -987,6 +1044,10 @@ function render() {
   seen.clear();
   for (const l of model.seen) seen.add(l);
   renderFindbar();
+  // Restore the persisted bilingual preference (Markdown only).
+  bilingual = !!model.isMarkdown && !!(vscode.getState() || {}).bilingual;
+  const biBtn0 = $('m-bi');
+  if (biBtn0) biBtn0.classList.toggle('on', bilingual);
   if (model.isMarkdown && mode !== 'source') { setMode('reading', isNewFile); }
   else { setMode('source', isNewFile); }
 }
@@ -1021,6 +1082,8 @@ function renderFindbar() {
 function setMode(m, resetScroll) {
   $('m-read').classList.toggle('on', m === 'reading');
   $('m-src').classList.toggle('on', m === 'source');
+  const biBtn = $('m-bi');
+  if (biBtn) biBtn.style.display = (model && model.isMarkdown && m === 'reading') ? '' : 'none';
   // Preserve scroll position when merely toggling the view mode; jump to the
   // top when loading a different file (resetScroll).
   const top = resetScroll ? 0 : contentEl.scrollTop;
@@ -1101,6 +1164,13 @@ function hideAiBusy() { popBusy.style.display = 'none'; }
 // Toolbar -----------------------------------------------------------------
 $('m-read').addEventListener('click', () => setMode('reading'));
 $('m-src').addEventListener('click', () => setMode('source'));
+$('m-bi').addEventListener('click', () => {
+  bilingual = !bilingual;
+  $('m-bi').classList.toggle('on', bilingual);
+  const st = vscode.getState() || {}; st.bilingual = bilingual; vscode.setState(st);
+  if (mode !== 'reading') { setMode('reading'); return; }
+  renderReading();
+});
 $('act-analyze').addEventListener('click', () => { setAnalyzing(true); vscode.postMessage({ type:'analyze' }); });
 $('act-jump').addEventListener('click', () => vscode.postMessage({ type:'jumpNext' }));
 $('findbar-toggle').addEventListener('click', () => $('findbar').classList.toggle('collapsed'));
@@ -1151,7 +1221,25 @@ function flashDocNotice(message, kind, ms) {
 
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
-  if (msg.type === 'load') { hideAiBusy(); model = msg.model; render(); }
+  if (msg.type === 'load') {
+    hideAiBusy();
+    model = msg.model;
+    // Seed the cached whole-doc translation so re-opening shows it instantly.
+    docTrHtml = model.translationHtml || '';
+    render();
+  }
+  else if (msg.type === 'wholeTranslation') {
+    const col = document.getElementById('readingTr');
+    if (msg.done) {
+      docTrHtml = msg.content || '';
+      setBiBusy(false);
+      if (col) { col.classList.remove('streaming'); col.innerHTML = docTrHtml; }
+    } else if (bilingual && col) {
+      // Live streaming: show the accumulating translated Markdown as plain text.
+      col.classList.add('streaming');
+      col.textContent = msg.content || '';
+    }
+  }
   else if (msg.type === 'aiBusy') { if (!msg.on) hideAiBusy(); }
   else if (msg.type === 'docNotice') { flashDocNotice(msg.message, msg.kind, msg.ms); }
   else if (msg.type === 'focusContent') { contentEl.setAttribute('tabindex', '-1'); contentEl.focus(); }

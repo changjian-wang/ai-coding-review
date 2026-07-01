@@ -10,6 +10,7 @@ import {
   analyzeGlobal,
   generateFixProposals,
   translateSelection,
+  translateMarkdown,
   explainCode,
   AnalysisError,
   setTokenUsageSink,
@@ -643,18 +644,10 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
     // Beside column; drop it so the next file opens beside the relocated panel.
     DocumentPanel.closeIfOpen();
   }
-  // Pre-warm the document panel: create its webview now (cold-start + shell load
-  // happen here) and apply the split, so the first file opens instantly instead
-  // of paying the webview boot cost on click. A pre-warmed panel shows its own
-  // loading shell, not the empty-group watermark husk.
-  // First open of a review: reveal/focus the workbench so its window is active,
-  // pre-warm the document beside it (cold start up front), and set the 3:7 split.
-  if (!layoutAppliedForCurrentReview) {
-    layoutAppliedForCurrentReview = true;
-    WorkbenchPanel.reveal();
-    DocumentPanel.prewarm(docActions());
-    await applyWorkbenchLayout();
-  }
+  // The document panel is created lazily on the first file open (openFileInPanel),
+  // which also applies the 3:7 split. Pre-creating it here spawned an extra window:
+  // an empty document webview (no model yet) renders as a blank/black window in the
+  // auxiliary-window layout. So we do NOT pre-warm.
 }
 
 /**
@@ -1077,6 +1070,7 @@ function buildDocModel(
       content: a.content,
     })),
     analyzing: analyzingPaths.has(relPath),
+    translationHtml: workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY)?.[relPath],
   };
 }
 
@@ -1278,6 +1272,7 @@ function docActions() {
     seen: (path: string, lines: number[]) => session.markSeen(path, lines),
     translate: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithTranslation(path, startLine, endLine, text),
+    translateWhole: (path: string) => void translateWholeDoc(path),
     explain: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithExplanation(path, startLine, endLine, text),
     note: (path: string, startLine: number, endLine: number, text: string) =>
@@ -1312,7 +1307,54 @@ function newAnnotationId(): string {
   return `anno-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Persisted cache of whole-document translations for the side-by-side view (path → translated reading HTML). */
+const DOC_TR_KEY = 'codereview.docTranslation.v3';
+
+/**
+ * Translates a whole Markdown document once and renders it to reading HTML for
+ * the RIGHT column of the side-by-side bilingual view. The original (left column)
+ * is never touched. Persisted per path so re-opening is instant. No per-block
+ * alignment — the whole doc is translated as one Markdown document.
+ */
+async function translateWholeDoc(path: string): Promise<void> {
+  const model = await models.resolve();
+  if (!model) {
+    DocumentPanel.flashNotice(path, m().model.noModel, 'error');
+    return;
+  }
+  const store = workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY) ?? {};
+  if (store[path]) {
+    DocumentPanel.postWholeTranslation(path, store[path], true);
+    return;
+  }
+  const text = await readReviewFileText(path);
+  if (!text.trim()) {
+    return;
+  }
+  const src = new vscode.CancellationTokenSource();
+  try {
+    let lastPost = 0;
+    const translated = await translateMarkdown(model, text, src.token, (acc) => {
+      // Stream the accumulating translation to the right column (throttled).
+      const now = Date.now();
+      if (now - lastPost > 120) {
+        lastPost = now;
+        DocumentPanel.postWholeTranslation(path, acc, false);
+      }
+    });
+    const html = renderDocument(translated, 'markdown', path.split('/').pop() ?? path).readingHtml ?? '';
+    store[path] = html;
+    void workspaceMemento?.update(DOC_TR_KEY, store);
+    DocumentPanel.postWholeTranslation(path, html, true);
+  } catch (err) {
+    DocumentPanel.flashNotice(path, String((err as Error)?.message ?? err), 'error');
+  } finally {
+    src.dispose();
+  }
+}
+
 /** Translates the selected text and stores it as a persisted annotation. */
+
 async function annotateWithTranslation(
   path: string,
   startLine: number,
