@@ -520,6 +520,9 @@ export class DocumentPanel {
   /* Bilingual translation shown beneath each block */
   .reading .doc-bilingual { margin:6px 0 16px; padding:2px 0 2px 14px; border-left:2px solid var(--purple); color:var(--dim); line-height:1.7; white-space:pre-wrap; font-size:.95em; }
   #m-bi.on { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
+  #m-bi { position:relative; }
+  #m-bi.busy { cursor:progress; padding-right:24px; }
+  #m-bi.busy::after { content:''; position:absolute; right:8px; top:50%; margin-top:-6px; width:11px; height:11px; border-radius:50%; border:2px solid color-mix(in srgb, var(--vscode-foreground, #ccc) 30%, transparent); border-top-color:var(--vscode-foreground, #ccc); animation:popSpin .7s linear infinite; }
 
   /* Annotation card */
   .anno {
@@ -658,6 +661,15 @@ const contentEl = $('content');
 
 let bilingual = false;
 const blockTr = new Map();
+let biPending = 0;
+let biBusyTimer = 0;
+function setBiBusy(on) {
+  const btn = $('m-bi');
+  if (!btn) return;
+  btn.classList.toggle('busy', on);
+  if (biBusyTimer) { clearTimeout(biBusyTimer); biBusyTimer = 0; }
+  if (on) biBusyTimer = setTimeout(() => { btn.classList.remove('busy'); biPending = 0; biBusyTimer = 0; }, 30000);
+}
 function trKey(s) {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
@@ -682,7 +694,7 @@ function applyBilingual() {
     if (cached !== undefined) { insertBiUnder(b, cached); continue; }
     need.push({ key: key, text: (b.textContent || '').trim() });
   }
-  if (need.length) vscode.postMessage({ type: 'translateDoc', items: need });
+  if (need.length) { biPending += need.length; setBiBusy(true); vscode.postMessage({ type: 'translateDoc', items: need }); }
 }
 
 function rawText() { return (model.raw || []).join('\\n'); }
@@ -1231,6 +1243,7 @@ window.addEventListener('message', (ev) => {
   }
   else if (msg.type === 'blockTranslation') {
     blockTr.set(msg.key, msg.content);
+    if (biPending > 0) { biPending--; if (biPending === 0) setBiBusy(false); }
     if (bilingual) {
       const sel = (window.CSS && CSS.escape) ? CSS.escape(msg.key) : msg.key;
       const b = contentEl.querySelector('[data-tr-key="' + sel + '"]');
