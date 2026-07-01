@@ -1270,6 +1270,8 @@ function docActions() {
     seen: (path: string, lines: number[]) => session.markSeen(path, lines),
     translate: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithTranslation(path, startLine, endLine, text),
+    translateDoc: (path: string, items: { key: string; text: string }[]) =>
+      void translateDocBlocks(path, items),
     explain: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithExplanation(path, startLine, endLine, text),
     note: (path: string, startLine: number, endLine: number, text: string) =>
@@ -1305,6 +1307,46 @@ function newAnnotationId(): string {
 }
 
 /** Translates the selected text and stores it as a persisted annotation. */
+/** In-memory cache of block translations for the bilingual reading view (path → key → content). */
+const docTrCache = new Map<string, Map<string, string>>();
+
+/**
+ * Translates Markdown blocks for the bilingual reading view, streaming each
+ * result back as it completes. Cached per (path, block key) so re-toggling the
+ * bilingual view is instant and never re-spends tokens on unchanged blocks.
+ */
+async function translateDocBlocks(path: string, items: { key: string; text: string }[]): Promise<void> {
+  const model = await models.resolve();
+  if (!model) {
+    DocumentPanel.flashNotice(path, m().model.noModel, 'error');
+    return;
+  }
+  let cache = docTrCache.get(path);
+  if (!cache) {
+    cache = new Map();
+    docTrCache.set(path, cache);
+  }
+  const src = new vscode.CancellationTokenSource();
+  try {
+    for (const it of items) {
+      const cached = cache.get(it.key);
+      if (cached !== undefined) {
+        DocumentPanel.postBlockTranslation(path, it.key, cached);
+        continue;
+      }
+      try {
+        const content = await translateSelection(model, it.text, src.token);
+        cache.set(it.key, content);
+        DocumentPanel.postBlockTranslation(path, it.key, content);
+      } catch (err) {
+        console.warn('[codereview] translateDoc block failed:', err);
+      }
+    }
+  } finally {
+    src.dispose();
+  }
+}
+
 async function annotateWithTranslation(
   path: string,
   startLine: number,

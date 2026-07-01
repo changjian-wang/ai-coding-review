@@ -55,6 +55,8 @@ export interface DocModel {
 export interface DocActions {
   seen(path: string, lines: number[]): void;
   translate(path: string, startLine: number, endLine: number, text: string): void;
+  /** Translates whole Markdown blocks for the bilingual view; results stream back per block. */
+  translateDoc(path: string, items: { key: string; text: string }[]): void;
   explain(path: string, startLine: number, endLine: number, text: string): void;
   note(path: string, startLine: number, endLine: number, text: string): void;
   removeAnnotation(path: string, id: string): void;
@@ -78,6 +80,7 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'seen'; lines: number[] }
   | { type: 'translate'; startLine: number; endLine: number; text: string }
+  | { type: 'translateDoc'; items: { key: string; text: string }[] }
   | { type: 'explain'; startLine: number; endLine: number; text: string }
   | { type: 'note'; startLine: number; endLine: number; text: string }
   | { type: 'removeAnnotation'; id: string }
@@ -243,6 +246,14 @@ export class DocumentPanel {
     }
   }
 
+  /** Streams one translated block back to the bilingual reading view. */
+  static postBlockTranslation(path: string, key: string, content: string): void {
+    const inst = DocumentPanel.current;
+    if (inst?.ready && inst.model?.path === path) {
+      void inst.panel.webview.postMessage({ type: 'blockTranslation', key, content });
+    }
+  }
+
   private post(): void {
     if (this.model) {
       void this.panel.webview.postMessage({ type: 'load', model: this.model });
@@ -271,6 +282,9 @@ export class DocumentPanel {
         break;
       case 'translate':
         this.actions.translate(path, m.startLine, m.endLine, m.text);
+        break;
+      case 'translateDoc':
+        this.actions.translateDoc(path, m.items);
         break;
       case 'explain':
         this.actions.explain(path, m.startLine, m.endLine, m.text);
@@ -501,6 +515,9 @@ export class DocumentPanel {
   .reading table { border-collapse:collapse; }
   .reading th,.reading td { border:1px solid var(--line); padding:4px 8px; }
   .reading blockquote { border-left:3px solid var(--purple); margin:0; padding-left:12px; color:var(--dim); }
+  /* Bilingual translation shown beneath each block */
+  .reading .doc-bilingual { margin:6px 0 16px; padding:2px 0 2px 14px; border-left:2px solid var(--purple); color:var(--dim); line-height:1.7; white-space:pre-wrap; font-size:.95em; }
+  #m-bi.on { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
 
   /* Annotation card */
   .anno {
@@ -601,6 +618,7 @@ export class DocumentPanel {
       <button id="m-read" class="on">${t.readView}</button>
       <button id="m-src">${t.sourceView}</button>
     </span>
+    <button id="m-bi" title="${t.bilingualTitle}" style="display:none">${t.bilingual}</button>
     <button id="act-jump"><span class="ico">⤵</span>${t.jumpNextUnseen}</button>
     <button id="act-analyze"><span class="ico">🔬</span><span class="btn-label">${t.analyzeFile}</span><span class="kbd">A</span></button>
   </div>
@@ -635,6 +653,35 @@ let locatedRange = null;
 
 const $ = (id) => document.getElementById(id);
 const contentEl = $('content');
+
+let bilingual = false;
+const blockTr = new Map();
+function trKey(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return 'b' + h.toString(36) + '-' + s.length;
+}
+function insertBiUnder(block, content) {
+  const nx = block.nextElementSibling;
+  if (nx && nx.classList.contains('doc-bilingual')) { nx.textContent = content; return; }
+  const d = document.createElement('div');
+  d.className = 'doc-bilingual';
+  d.textContent = content;
+  block.after(d);
+}
+function clearBilingual() {
+  for (const d of contentEl.querySelectorAll('.doc-bilingual')) d.remove();
+}
+function applyBilingual() {
+  const need = [];
+  for (const b of contentEl.querySelectorAll('[data-tr-key]')) {
+    const key = b.dataset.trKey;
+    const cached = blockTr.get(key);
+    if (cached !== undefined) { insertBiUnder(b, cached); continue; }
+    need.push({ key: key, text: (b.textContent || '').trim() });
+  }
+  if (need.length) vscode.postMessage({ type: 'translateDoc', items: need });
+}
 
 function rawText() { return (model.raw || []).join('\\n'); }
 
@@ -912,8 +959,15 @@ function renderReading() {
   contentEl.innerHTML = '';
   contentEl.appendChild(wrap);
 
-  // Anchor annotations after the block whose text contains the selection.
+  // Tag translatable blocks (paragraphs, headings, quotes) with a content-hash
+  // key for the bilingual view; code blocks are skipped. Keys are content-stable.
+  const TR_TAGS = { P:1, H1:1, H2:1, H3:1, H4:1, H5:1, H6:1, BLOCKQUOTE:1 };
   const blocks = Array.from(wrap.children);
+  for (const b of blocks) {
+    if (!TR_TAGS[b.tagName]) continue;
+    const txt = (b.textContent || '').trim();
+    if (txt) b.dataset.trKey = trKey(txt);
+  }
   const placed = new Set();
   for (const a of model.annotations) {
     const needle = (a.sourceText || '').trim().slice(0, 40);
@@ -958,6 +1012,7 @@ function renderReading() {
     }, { root: contentEl, threshold: 0.3 });
     for (const b of blocks) io.observe(b);
   }
+  if (bilingual) applyBilingual();
 }
 
 function flushSeen() {
@@ -1021,6 +1076,8 @@ function renderFindbar() {
 function setMode(m, resetScroll) {
   $('m-read').classList.toggle('on', m === 'reading');
   $('m-src').classList.toggle('on', m === 'source');
+  const biBtn = $('m-bi');
+  if (biBtn) biBtn.style.display = (model && model.isMarkdown && m === 'reading') ? '' : 'none';
   // Preserve scroll position when merely toggling the view mode; jump to the
   // top when loading a different file (resetScroll).
   const top = resetScroll ? 0 : contentEl.scrollTop;
@@ -1101,6 +1158,12 @@ function hideAiBusy() { popBusy.style.display = 'none'; }
 // Toolbar -----------------------------------------------------------------
 $('m-read').addEventListener('click', () => setMode('reading'));
 $('m-src').addEventListener('click', () => setMode('source'));
+$('m-bi').addEventListener('click', () => {
+  bilingual = !bilingual;
+  $('m-bi').classList.toggle('on', bilingual);
+  if (mode !== 'reading') { setMode('reading'); return; }
+  if (bilingual) applyBilingual(); else clearBilingual();
+});
 $('act-analyze').addEventListener('click', () => { setAnalyzing(true); vscode.postMessage({ type:'analyze' }); });
 $('act-jump').addEventListener('click', () => vscode.postMessage({ type:'jumpNext' }));
 $('findbar-toggle').addEventListener('click', () => $('findbar').classList.toggle('collapsed'));
@@ -1152,6 +1215,14 @@ function flashDocNotice(message, kind, ms) {
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
   if (msg.type === 'load') { hideAiBusy(); model = msg.model; render(); }
+  else if (msg.type === 'blockTranslation') {
+    blockTr.set(msg.key, msg.content);
+    if (bilingual) {
+      const sel = (window.CSS && CSS.escape) ? CSS.escape(msg.key) : msg.key;
+      const b = contentEl.querySelector('[data-tr-key="' + sel + '"]');
+      if (b) insertBiUnder(b, msg.content);
+    }
+  }
   else if (msg.type === 'aiBusy') { if (!msg.on) hideAiBusy(); }
   else if (msg.type === 'docNotice') { flashDocNotice(msg.message, msg.kind, msg.ms); }
   else if (msg.type === 'focusContent') { contentEl.setAttribute('tabindex', '-1'); contentEl.focus(); }
