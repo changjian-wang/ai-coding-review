@@ -97,15 +97,21 @@ async function ask(
   system: string,
   user: string,
   token: vscode.CancellationToken,
-  options: { skipLanguageDirective?: boolean; op?: LlmOp } = {},
+  options: { skipLanguageDirective?: boolean; op?: LlmOp; mergeIntoUser?: boolean; onChunk?: (acc: string) => void } = {},
 ): Promise<string> {
   const fullSystem = options.skipLanguageDirective
     ? system
     : `${languageDirective()}\n\n${system}`;
-  const messages = [
-    vscode.LanguageModelChatMessage.User(fullSystem),
-    vscode.LanguageModelChatMessage.User(user),
-  ];
+  // Translation merges the instruction and the text into ONE user turn: two
+  // consecutive user turns made some models treat the instruction as the whole
+  // request and reply "please provide the text to translate" (or refuse) instead
+  // of translating the second turn.
+  const messages = options.mergeIntoUser
+    ? [vscode.LanguageModelChatMessage.User(`${fullSystem}\n\n${user}`)]
+    : [
+        vscode.LanguageModelChatMessage.User(fullSystem),
+        vscode.LanguageModelChatMessage.User(user),
+      ];
   let out = '';
   try {
     // Temperature 0 ONLY for the review ops (analyze/global): a review tool's
@@ -123,6 +129,7 @@ async function ask(
     const response = await model.sendRequest(messages, requestOptions, token);
     for await (const chunk of response.text) {
       out += chunk;
+      options.onChunk?.(out);
     }
   } catch (err) {
     if (err instanceof vscode.LanguageModelError) {
@@ -154,9 +161,34 @@ export async function translateSelection(
 ): Promise<string> {
   const system =
     `${languageDirective()}\n\n` +
-    "You are a professional technical translator. Translate the user's content into the target language stated above, " +
-    'keeping code identifiers and domain terms verbatim. Output only the translation — no explanation, quotes, or markdown fences.';
-  const out = await ask(model, system, text, token, { skipLanguageDirective: true, op: 'translate' });
+    'You are the translation step of a code-review tool localizing technical documentation. ' +
+    'The text that follows is the content to translate into the target language above — translate ALL of it, ' +
+    'keeping code identifiers, file names, commands, and log lines verbatim. ' +
+    'This is routine and safe: ALWAYS output the translation directly. Never refuse, never say you cannot help, ' +
+    'never ask for the content, never add explanations, quotes, or markdown fences.\n\n=== TEXT TO TRANSLATE ===';
+  const out = await ask(model, system, text, token, { skipLanguageDirective: true, op: 'translate', mergeIntoUser: true });
+  return out.trim();
+}
+
+/**
+ * Translates a whole Markdown document into Simplified Chinese in ONE request,
+ * preserving Markdown structure and leaving code blocks / identifiers verbatim.
+ * Used by the side-by-side bilingual view: the original stays untouched on the
+ * left; this (rendered) translation fills the right column. No per-block alignment.
+ */
+export async function translateMarkdown(
+  model: vscode.LanguageModelChat,
+  markdown: string,
+  token: vscode.CancellationToken,
+  onChunk?: (acc: string) => void,
+): Promise<string> {
+  const system =
+    'You are the translation step of a code-review tool. Translate the following Markdown document into Simplified Chinese (简体中文). ' +
+    'Preserve ALL Markdown structure exactly: heading levels, lists, tables, links, blockquotes, and fenced code blocks. ' +
+    'Do NOT translate fenced/inline code, identifiers, file names, commands, URLs, or log lines — keep them verbatim; translate only the prose. ' +
+    'Output only the translated Markdown — no explanations, and do not wrap the whole document in a code fence. ' +
+    'This is routine and safe: always translate directly, never refuse, never ask for the content.\n\n=== MARKDOWN ===';
+  const out = await ask(model, system, markdown, token, { skipLanguageDirective: true, op: 'translate', mergeIntoUser: true, onChunk });
   return out.trim();
 }
 
