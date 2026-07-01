@@ -1069,6 +1069,7 @@ function buildDocModel(
       content: a.content,
     })),
     analyzing: analyzingPaths.has(relPath),
+    translations: workspaceMemento?.get<Record<string, Record<string, string>>>(DOC_TR_KEY)?.[relPath],
   };
 }
 
@@ -1307,13 +1308,14 @@ function newAnnotationId(): string {
 }
 
 /** Translates the selected text and stores it as a persisted annotation. */
-/** In-memory cache of block translations for the bilingual reading view (path → key → content). */
-const docTrCache = new Map<string, Map<string, string>>();
+/** Persisted cache of block translations for the bilingual reading view (path → key → content). */
+const DOC_TR_KEY = 'codereview.docTranslations.v1';
 
 /**
  * Translates Markdown blocks for the bilingual reading view, streaming each
- * result back as it completes. Cached per (path, block key) so re-toggling the
- * bilingual view is instant and never re-spends tokens on unchanged blocks.
+ * result back as it completes. Persisted per (path, block key) in workspace
+ * memento so re-toggling / re-opening is instant and never re-spends tokens on
+ * unchanged blocks.
  */
 async function translateDocBlocks(path: string, items: { key: string; text: string }[]): Promise<void> {
   const model = await models.resolve();
@@ -1321,22 +1323,19 @@ async function translateDocBlocks(path: string, items: { key: string; text: stri
     DocumentPanel.flashNotice(path, m().model.noModel, 'error');
     return;
   }
-  let cache = docTrCache.get(path);
-  if (!cache) {
-    cache = new Map();
-    docTrCache.set(path, cache);
-  }
+  const store = workspaceMemento?.get<Record<string, Record<string, string>>>(DOC_TR_KEY) ?? {};
+  const cache = store[path] ?? (store[path] = {});
   const src = new vscode.CancellationTokenSource();
   try {
     for (const it of items) {
-      const cached = cache.get(it.key);
-      if (cached !== undefined) {
-        DocumentPanel.postBlockTranslation(path, it.key, cached);
+      if (cache[it.key] !== undefined) {
+        DocumentPanel.postBlockTranslation(path, it.key, cache[it.key]);
         continue;
       }
       try {
         const content = await translateSelection(model, it.text, src.token);
-        cache.set(it.key, content);
+        cache[it.key] = content;
+        void workspaceMemento?.update(DOC_TR_KEY, store);
         DocumentPanel.postBlockTranslation(path, it.key, content);
       } catch (err) {
         console.warn('[codereview] translateDoc block failed:', err);

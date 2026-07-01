@@ -49,6 +49,8 @@ export interface DocModel {
   annotations: DocAnnotation[];
   /** True while this file is currently being analyzed (drives the topbar button). */
   analyzing: boolean;
+  /** Persisted block translations for the bilingual view: block key → translated text. */
+  translations?: Record<string, string>;
 }
 
 /** Actions the document panel triggers in the extension host. */
@@ -1042,6 +1044,10 @@ function render() {
   seen.clear();
   for (const l of model.seen) seen.add(l);
   renderFindbar();
+  // Restore the persisted bilingual preference (Markdown only).
+  bilingual = !!model.isMarkdown && !!(vscode.getState() || {}).bilingual;
+  const biBtn0 = $('m-bi');
+  if (biBtn0) biBtn0.classList.toggle('on', bilingual);
   if (model.isMarkdown && mode !== 'source') { setMode('reading', isNewFile); }
   else { setMode('source', isNewFile); }
 }
@@ -1161,6 +1167,7 @@ $('m-src').addEventListener('click', () => setMode('source'));
 $('m-bi').addEventListener('click', () => {
   bilingual = !bilingual;
   $('m-bi').classList.toggle('on', bilingual);
+  const st = vscode.getState() || {}; st.bilingual = bilingual; vscode.setState(st);
   if (mode !== 'reading') { setMode('reading'); return; }
   if (bilingual) applyBilingual(); else clearBilingual();
 });
@@ -1214,7 +1221,14 @@ function flashDocNotice(message, kind, ms) {
 
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
-  if (msg.type === 'load') { hideAiBusy(); model = msg.model; render(); }
+  if (msg.type === 'load') {
+    hideAiBusy();
+    model = msg.model;
+    // Seed cached translations so re-opening a doc renders bilingual instantly.
+    blockTr.clear();
+    if (model.translations) { for (const k in model.translations) blockTr.set(k, model.translations[k]); }
+    render();
+  }
   else if (msg.type === 'blockTranslation') {
     blockTr.set(msg.key, msg.content);
     if (bilingual) {
