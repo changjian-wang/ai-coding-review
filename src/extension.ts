@@ -57,6 +57,9 @@ const analyzingPaths = new Set<string>();
 let globalAnalysisInFlight = false;
 /** Cancellation source for the in-flight global analysis, if any. */
 let globalAnalysisCts: vscode.CancellationTokenSource | undefined;
+/** In-flight whole-document (bilingual) translation, so it can be de-duped per
+ *  file and cancelled when the reviewer switches to another file. */
+let activeDocTranslation: { path: string; cts: vscode.CancellationTokenSource } | undefined;
 
 function isReviewPath(relPath: string): boolean {
   return !!session.reviewSet?.files.some((f) => f.path === relPath);
@@ -949,6 +952,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
   // (it's scoped to one finding in the file we're leaving).
   if (workbenchSelected !== relPath) {
     FixProposalPanel.closeIfOpen();
+    // Cancel the leaving file's in-flight bilingual translation so it doesn't
+    // keep running (and piling up) after we navigate away.
+    if (activeDocTranslation && activeDocTranslation.path !== relPath) {
+      activeDocTranslation.cts.cancel();
+    }
   }
   workbenchSelected = relPath;
   // Race guard: rapid clicks must not pile up heavy renders or let a slow,
@@ -1327,14 +1335,28 @@ async function translateWholeDoc(path: string): Promise<void> {
     DocumentPanel.postWholeTranslation(path, store[path], true);
     return;
   }
-  const text = await readReviewFileText(path);
-  if (!text.trim()) {
+  // De-dupe: a translation for THIS file is already running (e.g. the reviewer
+  // toggled reading/source repeatedly before it finished). Don't start another.
+  if (activeDocTranslation?.path === path) {
     return;
   }
-  const src = new vscode.CancellationTokenSource();
+  // Switching files: cancel the previous file's in-flight translation so stale
+  // translations don't pile up and compete for the model.
+  activeDocTranslation?.cts.cancel();
+  activeDocTranslation?.cts.dispose();
+  const text = await readReviewFileText(path);
+  if (!text.trim()) {
+    activeDocTranslation = undefined;
+    return;
+  }
+  const cts = new vscode.CancellationTokenSource();
+  activeDocTranslation = { path, cts };
   try {
     let lastPost = 0;
-    const translated = await translateMarkdown(model, text, src.token, (acc) => {
+    const translated = await translateMarkdown(model, text, cts.token, (acc) => {
+      if (cts.token.isCancellationRequested) {
+        return;
+      }
       // Stream the accumulating translation to the right column (throttled).
       const now = Date.now();
       if (now - lastPost > 120) {
@@ -1342,14 +1364,22 @@ async function translateWholeDoc(path: string): Promise<void> {
         DocumentPanel.postWholeTranslation(path, acc, false);
       }
     });
+    if (cts.token.isCancellationRequested) {
+      return;
+    }
     const html = renderDocument(translated, 'markdown', path.split('/').pop() ?? path).readingHtml ?? '';
     store[path] = html;
     void workspaceMemento?.update(DOC_TR_KEY, store);
     DocumentPanel.postWholeTranslation(path, html, true);
   } catch (err) {
-    DocumentPanel.flashNotice(path, String((err as Error)?.message ?? err), 'error');
+    if (!cts.token.isCancellationRequested) {
+      DocumentPanel.flashNotice(path, String((err as Error)?.message ?? err), 'error');
+    }
   } finally {
-    src.dispose();
+    if (activeDocTranslation?.cts === cts) {
+      activeDocTranslation = undefined;
+    }
+    cts.dispose();
   }
 }
 

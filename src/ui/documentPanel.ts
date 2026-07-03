@@ -959,6 +959,13 @@ function ensureSrcRenderedThrough(line) {
 
 function renderReading() {
   mode = 'reading';
+  // Cancel any in-flight incremental source render. renderSource() streams large
+  // files across requestAnimationFrame; without cancelling here, a leaked source
+  // RAF kept running after switching to reading — appending to a now-detached
+  // wrap and observing stale rows with the NEW IntersectionObserver — which
+  // corrupted state and froze file switching after repeated source/reading
+  // toggling (only a panel close/reopen recovered).
+  if (srcCtx && srcCtx.raf) { cancelAnimationFrame(srcCtx.raf); srcCtx.raf = 0; }
   if (io) { io.disconnect(); visible.clear(); }
   const cols = document.createElement('div');
   cols.className = 'reading-cols' + (bilingual ? ' bi' : '');
