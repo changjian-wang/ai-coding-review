@@ -12,6 +12,7 @@ import {
   translateSelection,
   translateMarkdown,
   explainCode,
+  draftReviewComment,
   AnalysisError,
   setTokenUsageSink,
   type GlobalContextFile,
@@ -1319,7 +1320,7 @@ async function addPrComment(
   relPath: string,
   startLine: number,
   endLine: number,
-  _selectedText: string,
+  selectedText: string,
 ): Promise<void> {
   if (!session.reviewSet) {
     transientWarning(m().review.notStartedWarn);
@@ -1330,14 +1331,62 @@ async function addPrComment(
     return;
   }
   const loc = endLine > startLine ? `${relPath}:${startLine}-${endLine}` : `${relPath}:${startLine}`;
-  const body = await vscode.window.showInputBox({
-    title: loc,
-    prompt: m().documentPanel.commentPrompt,
-    placeHolder: m().documentPanel.commentPlaceholder,
-    ignoreFocusOut: true,
-    validateInput: (v) => (v.trim().length > 0 ? null : m().documentPanel.commentEmpty),
+  const input = vscode.window.createInputBox();
+  input.title = loc;
+  input.prompt = m().documentPanel.commentPrompt;
+  input.placeholder = m().documentPanel.commentPlaceholder;
+  input.ignoreFocusOut = true;
+  const aiButton: vscode.QuickInputButton = {
+    iconPath: new vscode.ThemeIcon('sparkle'),
+    tooltip: m().documentPanel.commentAiExpand,
+  };
+  input.buttons = [aiButton];
+  const cts = new vscode.CancellationTokenSource();
+  const body = await new Promise<string | undefined>((resolve) => {
+    input.onDidTriggerButton(async (btn) => {
+      if (btn !== aiButton) {
+        return;
+      }
+      const point = input.value.trim();
+      if (!point) {
+        input.validationMessage = m().documentPanel.commentAiNeedsPoint;
+        return;
+      }
+      const model = await models.resolve();
+      if (!model) {
+        input.validationMessage = m().model.noModel;
+        return;
+      }
+      input.validationMessage = undefined;
+      input.busy = true;
+      input.enabled = false;
+      try {
+        const expanded = (await draftReviewComment(model, selectedText, point, cts.token)).trim();
+        if (expanded) {
+          input.value = expanded;
+        }
+      } catch (err) {
+        input.validationMessage = String((err as Error)?.message ?? err);
+      } finally {
+        input.busy = false;
+        input.enabled = true;
+      }
+    });
+    input.onDidAccept(() => {
+      if (input.value.trim()) {
+        resolve(input.value.trim());
+        input.hide();
+      } else {
+        input.validationMessage = m().documentPanel.commentEmpty;
+      }
+    });
+    input.onDidHide(() => resolve(undefined));
+    input.show();
   });
-  if (!body || !body.trim()) {
+  cts.cancel();
+  cts.dispose();
+  input.dispose();
+  if (!body) {
     return;
   }
   session.addPendingComment({
@@ -1345,7 +1394,7 @@ async function addPrComment(
     path: relPath,
     startLine,
     endLine,
-    body: body.trim(),
+    body,
     source: 'manual',
     createdAt: Date.now(),
   });

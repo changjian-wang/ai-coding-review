@@ -205,6 +205,29 @@ export async function explainCode(
   return out.trim();
 }
 
+/**
+ * Expands a reviewer's brief point into a polished, professional, courteous PR
+ * review comment about the selected code. The reviewer supplies the intent; the
+ * model phrases it as one clear review comment in the configured language.
+ */
+export async function draftReviewComment(
+  model: vscode.LanguageModelChat,
+  code: string,
+  point: string,
+  token: vscode.CancellationToken,
+): Promise<string> {
+  const system =
+    'You are helping a code reviewer phrase a pull-request review comment. ' +
+    "Given the code under review and the reviewer's brief point, write ONE clear, professional, courteous review comment in the target language. " +
+    'Be concise and specific; refer to the code where useful and keep code identifiers, file names, and commands verbatim. ' +
+    'Output ONLY the comment text \u2014 no preamble, no quotes, no markdown fences.\n\n' +
+    '=== CODE UNDER REVIEW ===\n' +
+    code +
+    '\n\n=== REVIEWER POINT ===';
+  const out = await ask(model, system, point, token, { op: 'explain', mergeIntoUser: true });
+  return out.trim();
+}
+
 function extractBalancedObject(text: string, start: number): string | undefined {
   let depth = 0;
   let inString = false;
