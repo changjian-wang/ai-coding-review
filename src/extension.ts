@@ -21,7 +21,7 @@ import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePick
 import { FileSystemScope } from './scope/scopes';
 import { currentBranch, listBranches, switchBranchTo } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
-import { submitPrReview, postPrLineComment, postPrComment } from './gh/ghClient';
+import { submitPrReview, submitPrReviewWithComments, postPrLineComment, postPrComment } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
@@ -214,6 +214,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codereview.globalAnalysis', runGlobalAnalysis),
     vscode.commands.registerCommand('codereview.showGlobalReport', showGlobalReport),
     vscode.commands.registerCommand('codereview.submitConclusion', submitConclusion),
+    vscode.commands.registerCommand('codereview.viewPendingComments', viewPendingComments),
     vscode.commands.registerCommand('codereview.locateFinding', locateInFile),
     vscode.commands.registerCommand('codereview.jumpToNextUnseen', jumpToNextUnseenCurrent),
     createStatusBarEntry(),
@@ -1277,6 +1278,8 @@ function docActions() {
       void annotateWithExplanation(path, startLine, endLine, text),
     note: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithNote(path, startLine, endLine, text),
+    comment: (path: string, startLine: number, endLine: number, text: string) =>
+      void addPrComment(path, startLine, endLine, text),
     removeAnnotation: (path: string, id: string) => {
       session.removeAnnotation(path, id);
       refreshDocPanel(path);
@@ -1305,6 +1308,48 @@ function docActions() {
 
 function newAnnotationId(): string {
   return `anno-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Adds a manual PR review comment as a local draft (pending-review model). The
+ * comment is not posted immediately; it is accumulated and submitted together
+ * with the conclusion. Only available while reviewing a PR.
+ */
+async function addPrComment(
+  relPath: string,
+  startLine: number,
+  endLine: number,
+  _selectedText: string,
+): Promise<void> {
+  if (!session.reviewSet) {
+    transientWarning(m().review.notStartedWarn);
+    return;
+  }
+  if (!/^pr-\d+$/.test(session.reviewSet.scopeId)) {
+    transientWarning(m().documentPanel.commentNotPr);
+    return;
+  }
+  const loc = endLine > startLine ? `${relPath}:${startLine}-${endLine}` : `${relPath}:${startLine}`;
+  const body = await vscode.window.showInputBox({
+    title: loc,
+    prompt: m().documentPanel.commentPrompt,
+    placeHolder: m().documentPanel.commentPlaceholder,
+    ignoreFocusOut: true,
+    validateInput: (v) => (v.trim().length > 0 ? null : m().documentPanel.commentEmpty),
+  });
+  if (!body || !body.trim()) {
+    return;
+  }
+  session.addPendingComment({
+    id: `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    path: relPath,
+    startLine,
+    endLine,
+    body: body.trim(),
+    source: 'manual',
+    createdAt: Date.now(),
+  });
+  transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
 }
 
 /** Persisted cache of whole-document translations for the side-by-side view (path → translated reading HTML). */
@@ -2545,8 +2590,26 @@ async function submitConclusion(): Promise<void> {
     }
     const c = session.totalCoverage();
     const body = m().conclusion.prBody(c.filesReady, c.filesTotal);
+    const pending = session.pendingComments;
     try {
-      await submitPrReview(cwd, prNumber, conclusionVerdict, body);
+      if (pending.length > 0) {
+        await submitPrReviewWithComments(
+          cwd,
+          prNumber,
+          session.reviewSet.headSha,
+          conclusionVerdict,
+          body,
+          pending.map((pc) => ({
+            path: pc.path,
+            startLine: pc.startLine,
+            endLine: pc.endLine,
+            body: pc.body,
+          })),
+        );
+        session.clearPendingComments();
+      } else {
+        await submitPrReview(cwd, prNumber, conclusionVerdict, body);
+      }
       session.setConclusion({
         verdict: conclusionVerdict,
         label: cleanLabel,
@@ -2568,6 +2631,60 @@ async function submitConclusion(): Promise<void> {
     submittedAt: Date.now(),
   });
   transientInfo(m().conclusion.recordedLocal(cleanLabel));
+}
+
+/**
+ * Lists the pending (draft) PR review comments in a quick pick. Selecting one
+ * jumps to its location; the trash button removes it. They are submitted
+ * together with the conclusion (pending-review model), not individually.
+ */
+async function viewPendingComments(): Promise<void> {
+  if (session.pendingComments.length === 0) {
+    transientInfo(m().documentPanel.commentNonePending);
+    return;
+  }
+  const trash: vscode.QuickInputButton = {
+    iconPath: new vscode.ThemeIcon('trash'),
+    tooltip: m().documentPanel.commentDelete,
+  };
+  const qp = vscode.window.createQuickPick<vscode.QuickPickItem & { id: string }>();
+  const build = () =>
+    session.pendingComments.map((pc) => ({
+      label:
+        pc.startLine === pc.endLine
+          ? `${pc.path}:${pc.startLine}`
+          : `${pc.path}:${pc.startLine}-${pc.endLine}`,
+      detail: pc.body,
+      buttons: [trash],
+      id: pc.id,
+    }));
+  const retitle = () => {
+    qp.title = `${m().documentPanel.pendingTitle} (${session.pendingComments.length})`;
+  };
+  qp.placeholder = m().documentPanel.pendingPlaceholder;
+  qp.items = build();
+  retitle();
+  qp.onDidTriggerItemButton((e) => {
+    session.removePendingComment(e.item.id);
+    if (session.pendingComments.length === 0) {
+      qp.hide();
+      return;
+    }
+    qp.items = build();
+    retitle();
+  });
+  qp.onDidAccept(() => {
+    const sel = qp.selectedItems[0];
+    qp.hide();
+    if (sel) {
+      const pc = session.pendingComments.find((p) => p.id === sel.id);
+      if (pc) {
+        void locateInFile(pc.path, pc.startLine, pc.endLine);
+      }
+    }
+  });
+  qp.onDidHide(() => qp.dispose());
+  qp.show();
 }
 
 function reportError(err: unknown): void {

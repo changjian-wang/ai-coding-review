@@ -10,6 +10,7 @@
   "cmd.globalAnalysis": "AI Coding Review: Run Global Analysis",
   "cmd.showGlobalReport": "AI Coding Review: Show Global Report",
   "cmd.submitConclusion": "AI Coding Review: Submit Conclusion",
+  "cmd.viewPendingComments": "AI Coding Review: View Pending Comments",
   "cmd.locateFinding": "AI Coding Review: Locate Finding",
   "cmd.jumpToNextUnseen": "AI Coding Review: Jump to Next Unseen Line",
   "view.launcher.name": "Review",

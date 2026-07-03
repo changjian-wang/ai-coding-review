@@ -90,6 +90,11 @@
         "icon": "$(check-all)"
       },
       {
+        "command": "codereview.viewPendingComments",
+        "title": "%cmd.viewPendingComments%",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "codereview.locateFinding",
         "title": "%cmd.locateFinding%"
       },

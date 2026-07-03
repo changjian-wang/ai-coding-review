@@ -10,6 +10,7 @@
   "cmd.globalAnalysis": "AI Coding Review：运行全局分析",
   "cmd.showGlobalReport": "AI Coding Review：查看全局报告",
   "cmd.submitConclusion": "AI Coding Review：提交审查结论",
+  "cmd.viewPendingComments": "AI Coding Review：查看待提交评论",
   "cmd.locateFinding": "AI Coding Review：定位发现",
   "cmd.jumpToNextUnseen": "AI Coding Review：跳到下一处未看的行",
   "view.launcher.name": "审查",
