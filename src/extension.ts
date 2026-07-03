@@ -22,7 +22,7 @@ import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePick
 import { FileSystemScope } from './scope/scopes';
 import { currentBranch, listBranches, switchBranchTo } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
-import { submitPrReview, submitPrReviewWithComments, postPrLineComment, postPrComment } from './gh/ghClient';
+import { submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
@@ -1866,9 +1866,14 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     // intuitive meaning of "undo Copilot fix" from the document panel.
     if (kind === 'fixed') {
       await revertAppliedFix(rel, findingId);
-    } else if (kind === 'commented' && current.ref && !/^pr-\d+$/.test(reviewSet.scopeId)) {
-      // Local comment was stored as an inline note; remove it on toggle-off.
-      session.removeAnnotation(rel, current.ref);
+    } else if (kind === 'commented' && current.ref) {
+      if (/^pr-\d+$/.test(reviewSet.scopeId)) {
+        // Draft PR comment lives in the pending review; drop it on toggle-off.
+        session.removePendingComment(current.ref);
+      } else {
+        // Local comment was stored as an inline note; remove it on toggle-off.
+        session.removeAnnotation(rel, current.ref);
+      }
     }
     session.setFindingDisposition(rel, findingId, null);
     transientInfo(m().finding.dispositionReverted(rel));
@@ -1893,39 +1898,24 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
     const body = composeCommentBody(finding);
     if (prMatch) {
-      const prNumber = Number(prMatch[1]);
-      try {
-        const result = await postPrLineComment(
-          cwd,
-          prNumber,
-          reviewSet.headSha,
-          rel,
-          finding.line,
-          body,
-        );
-        session.setFindingDisposition(rel, findingId, {
-          kind: 'commented',
-          ref: String(result.id),
-          at: Date.now(),
-        });
-        transientInfo(m().finding.postedLineComment(prNumber));
-      } catch (err) {
-        try {
-          const fallbackBody = `**${rel}:${finding.line}**\n\n${body}`;
-          await postPrComment(cwd, prNumber, fallbackBody);
-          session.setFindingDisposition(rel, findingId, {
-            kind: 'commented',
-            ref: `pr-${prNumber}:comment`,
-            at: Date.now(),
-          });
-          transientInfo(m().finding.postedFallbackComment(prNumber));
-        } catch (fallbackErr) {
-          void vscode.window.showErrorMessage(
-            m().finding.postCommentFailed((fallbackErr as Error).message || (err as Error).message),
-          );
-          return;
-        }
-      }
+      // Accumulate into the pending review (posted together on conclusion),
+      // instead of firing an immediate standalone comment.
+      const commentId = `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      session.addPendingComment({
+        id: commentId,
+        path: rel,
+        startLine: finding.line,
+        endLine: finding.endLine && finding.endLine > finding.line ? finding.endLine : finding.line,
+        body,
+        source: 'finding',
+        createdAt: Date.now(),
+      });
+      session.setFindingDisposition(rel, findingId, {
+        kind: 'commented',
+        ref: commentId,
+        at: Date.now(),
+      });
+      transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
     } else {
       const annotationId = recordLocalCommentNote(rel, finding);
       session.setFindingDisposition(rel, findingId, {
@@ -2288,32 +2278,23 @@ async function disposeGlobalFix(
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
     const body = composeCommentBody(findingLike);
     if (prMatch) {
-      const prNumber = Number(prMatch[1]);
-      try {
-        const result = await postPrLineComment(cwd, prNumber, reviewSet.headSha, file, spot.line, body);
-        session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
-          kind: 'commented',
-          ref: String(result.id),
-          at: Date.now(),
-        });
-        transientInfo(m().finding.postedLineComment(prNumber));
-      } catch (err) {
-        try {
-          const fallbackBody = `**${file}:${spot.line}**\n\n${body}`;
-          await postPrComment(cwd, prNumber, fallbackBody);
-          session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
-            kind: 'commented',
-            ref: `pr-${prNumber}:comment`,
-            at: Date.now(),
-          });
-          transientInfo(m().finding.postedFallbackComment(prNumber));
-        } catch (fallbackErr) {
-          void vscode.window.showErrorMessage(
-            m().finding.postCommentFailed((fallbackErr as Error).message || (err as Error).message),
-          );
-          return;
-        }
-      }
+      // Accumulate into the pending review, posted together on conclusion.
+      const commentId = `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      session.addPendingComment({
+        id: commentId,
+        path: file,
+        startLine: spot.line,
+        endLine: spot.endLine && spot.endLine > spot.line ? spot.endLine : spot.line,
+        body,
+        source: 'finding',
+        createdAt: Date.now(),
+      });
+      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
+        kind: 'commented',
+        ref: commentId,
+        at: Date.now(),
+      });
+      transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
     } else {
       const annotationId = recordLocalCommentNote(file, {
         line: spot.line,
@@ -2369,13 +2350,14 @@ async function revertGlobalFix(spotId: string, file: string, _line: number): Pro
   if (current?.kind === 'fixed') {
     await revertAppliedFix(file, spotId);
     deleteAppliedFix(fixKey(file, spotId));
-  } else if (
-    current?.kind === 'commented' &&
-    current.ref &&
-    !/^pr-\d+$/.test(session.reviewSet?.scopeId ?? '')
-  ) {
-    // Local comment was stored as an inline note; remove it on revert.
-    session.removeAnnotation(file, current.ref);
+  } else if (current?.kind === 'commented' && current.ref) {
+    if (/^pr-\d+$/.test(session.reviewSet?.scopeId ?? '')) {
+      // Draft PR comment lives in the pending review; drop it on revert.
+      session.removePendingComment(current.ref);
+    } else {
+      // Local comment was stored as an inline note; remove it on revert.
+      session.removeAnnotation(file, current.ref);
+    }
   }
   if (spot) {
     session.setGlobalFixDisposition(spotId, file, spot.line, anchor, null);
