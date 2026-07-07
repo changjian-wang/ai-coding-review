@@ -11,13 +11,14 @@ import {
   generateFixProposals,
   translateSelection,
   translateMarkdown,
+  translateTextBatch,
   explainCode,
   draftReviewComment,
   AnalysisError,
   setTokenUsageSink,
   type GlobalContextFile,
 } from './ai/analyzer';
-import type { Finding } from './ai/types';
+import type { Finding, GlobalReport } from './ai/types';
 import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePicker';
 import { FileSystemScope } from './scope/scopes';
 import { currentBranch, listBranches, switchBranchTo } from './scope/gitClient';
@@ -30,7 +31,7 @@ import { DocumentPanel, type DocModel } from './ui/documentPanel';
 import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
 import { transientInfo, transientWarning } from './ui/toast';
-import { m, onLanguageChange } from './i18n';
+import { m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 
 let session: ReviewSession;
 const models = new ModelProvider();
@@ -112,6 +113,317 @@ type PersistedScope =
   | { kind: 'files'; cwd: string; relPaths: string[] };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
+
+/** Memento key for localized text cache (stable key -> translated text). */
+const LOCALIZED_TEXT_MEMENTO_KEY = 'codereview.localizedText.v1';
+/** In-memory mirror of localized text cache; lazily hydrated from workspace state. */
+let localizedTextCache: Record<string, string> | undefined;
+/** De-dupes per-file localization jobs: `${relPath}::${lang}`. */
+const inFlightDocLocalization = new Set<string>();
+/** De-dupes global-report localization jobs: `${scopeKey}::${lang}`. */
+const inFlightGlobalLocalization = new Set<string>();
+/** Single cache key prefix for pending-comment localization jobs. */
+const pendingCommentLocalizationKey = 'pending-comments';
+
+function ensureLocalizedTextCache(): Record<string, string> {
+  if (!localizedTextCache) {
+    localizedTextCache = workspaceMemento?.get<Record<string, string>>(LOCALIZED_TEXT_MEMENTO_KEY) ?? {};
+  }
+  return localizedTextCache;
+}
+
+function flushLocalizedTextCache(): void {
+  if (!workspaceMemento || !localizedTextCache) {
+    return;
+  }
+  void workspaceMemento.update(LOCALIZED_TEXT_MEMENTO_KEY, localizedTextCache);
+}
+
+function detectTextLanguage(text: string): Language | undefined {
+  const t = text.trim();
+  if (!t) {
+    return undefined;
+  }
+  const letters = (t.match(/[A-Za-z]/g) ?? []).length;
+  const han = (t.match(/[\u3400-\u9FFF]/g) ?? []).length;
+  if (han >= 2 && han > letters * 0.2) {
+    return 'zh-CN';
+  }
+  if (letters >= 4 && letters >= han * 2) {
+    return 'en';
+  }
+  return undefined;
+}
+
+function shouldTranslateText(text: string, target: Language): boolean {
+  const src = detectTextLanguage(text);
+  return !!src && src !== target;
+}
+
+function localizedText(cacheKey: string, fallback: string): string {
+  return ensureLocalizedTextCache()[cacheKey] ?? fallback;
+}
+
+function reviewScopeKey(): string {
+  const rs = session.reviewSet;
+  if (!rs) {
+    return `${session.getRepoName()}::none::none`;
+  }
+  return `${session.getRepoName()}::${rs.scopeId}::${rs.headSha}`;
+}
+
+function findingTextCacheKey(
+  relPath: string,
+  findingId: string,
+  field: 'title' | 'detail' | 'suggestion',
+  target: Language,
+  text: string,
+): string {
+  return [
+    'finding',
+    session.getRepoName(),
+    relPath,
+    findingId,
+    field,
+    target,
+    hashString(text),
+  ].join('::');
+}
+
+function annotationTextCacheKey(
+  relPath: string,
+  annotationId: string,
+  target: Language,
+  text: string,
+): string {
+  return [
+    'annotation',
+    session.getRepoName(),
+    relPath,
+    annotationId,
+    target,
+    hashString(text),
+  ].join('::');
+}
+
+function pendingCommentTextCacheKey(
+  commentId: string,
+  target: Language,
+  text: string,
+): string {
+  return ['pending', reviewScopeKey(), commentId, target, hashString(text)].join('::');
+}
+
+function globalTextCacheKey(
+  section: 'conclusion' | 'evidence' | 'verdictTitle' | 'verdictBefore' | 'verdictAfter' | 'spotTitle' | 'spotDetail' | 'spotSuggestion',
+  id: string,
+  target: Language,
+  text: string,
+): string {
+  return ['global', reviewScopeKey(), section, id, target, hashString(text)].join('::');
+}
+
+async function ensureLocalizedTexts(
+  target: Language,
+  items: Array<{ cacheKey: string; text: string }>,
+): Promise<boolean> {
+  const cache = ensureLocalizedTextCache();
+  const missing = items.filter((it) => it.text.trim() && shouldTranslateText(it.text, target) && !cache[it.cacheKey]);
+  if (missing.length === 0) {
+    return false;
+  }
+  const model = await models.resolve();
+  if (!model) {
+    return false;
+  }
+  const token = new vscode.CancellationTokenSource();
+  try {
+    const chunkSize = 80;
+    for (let i = 0; i < missing.length; i += chunkSize) {
+      const chunk = missing.slice(i, i + chunkSize);
+      const translated = await translateTextBatch(
+        model,
+        chunk.map((x) => x.text),
+        target,
+        token.token,
+      );
+      for (let j = 0; j < chunk.length; j++) {
+        cache[chunk[j].cacheKey] = translated[j] ?? chunk[j].text;
+      }
+    }
+    flushLocalizedTextCache();
+    return true;
+  } finally {
+    token.dispose();
+  }
+}
+
+function localizeFindingsNow(relPath: string, findings: Finding[], target: Language): Finding[] {
+  return findings.map((f) => {
+    const titleKey = findingTextCacheKey(relPath, f.id, 'title', target, f.title);
+    const detailKey = findingTextCacheKey(relPath, f.id, 'detail', target, f.detail);
+    const suggestionKey = f.suggestion
+      ? findingTextCacheKey(relPath, f.id, 'suggestion', target, f.suggestion)
+      : undefined;
+    return {
+      ...f,
+      title: localizedText(titleKey, f.title),
+      detail: localizedText(detailKey, f.detail),
+      suggestion: suggestionKey ? localizedText(suggestionKey, f.suggestion ?? '') : undefined,
+    };
+  });
+}
+
+function localizeAnnotationsNow(
+  relPath: string,
+  annotations: Annotation[],
+  target: Language,
+): Annotation[] {
+  return annotations.map((a) => {
+    const key = annotationTextCacheKey(relPath, a.id, target, a.content);
+    return { ...a, content: localizedText(key, a.content) };
+  });
+}
+
+function localizePendingCommentBodyNow(comment: { id: string; body: string }, target: Language): string {
+  const key = pendingCommentTextCacheKey(comment.id, target, comment.body);
+  return localizedText(key, comment.body);
+}
+
+function localizeGlobalReportNow(report: GlobalReport, target: Language): GlobalReport {
+  return {
+    ...report,
+    conclusion: localizedText(globalTextCacheKey('conclusion', 'main', target, report.conclusion), report.conclusion),
+    evidence: report.evidence.map((e, i) =>
+      localizedText(globalTextCacheKey('evidence', String(i), target, e), e),
+    ),
+    verdicts: report.verdicts.map((v, i) => ({
+      ...v,
+      title: localizedText(globalTextCacheKey('verdictTitle', `${i}:${v.kind}`, target, v.title), v.title),
+      before: localizedText(globalTextCacheKey('verdictBefore', `${i}:${v.kind}`, target, v.before), v.before),
+      after: localizedText(globalTextCacheKey('verdictAfter', `${i}:${v.kind}`, target, v.after), v.after),
+      // Keep technical evidence verbatim by design.
+      evidence: v.evidence,
+    })),
+    fixSpots: report.fixSpots.map((sp, i) => ({
+      ...sp,
+      title: localizedText(globalTextCacheKey('spotTitle', `${i}:${sp.id}`, target, sp.title), sp.title),
+      detail: localizedText(globalTextCacheKey('spotDetail', `${i}:${sp.id}`, target, sp.detail), sp.detail),
+      suggestion: sp.suggestion
+        ? localizedText(globalTextCacheKey('spotSuggestion', `${i}:${sp.id}`, target, sp.suggestion), sp.suggestion)
+        : undefined,
+    })),
+  };
+}
+
+async function ensureDocLocalized(path: string): Promise<void> {
+  const target = resolveLanguage();
+  const key = `${path}::${target}`;
+  if (inFlightDocLocalization.has(key)) {
+    return;
+  }
+  inFlightDocLocalization.add(key);
+  try {
+    const findings = session.findings(path);
+    const annotations = session.annotations(path);
+    const items: Array<{ cacheKey: string; text: string }> = [];
+    for (const f of findings) {
+      items.push({ cacheKey: findingTextCacheKey(path, f.id, 'title', target, f.title), text: f.title });
+      items.push({ cacheKey: findingTextCacheKey(path, f.id, 'detail', target, f.detail), text: f.detail });
+      if (f.suggestion) {
+        items.push({
+          cacheKey: findingTextCacheKey(path, f.id, 'suggestion', target, f.suggestion),
+          text: f.suggestion,
+        });
+      }
+    }
+    for (const a of annotations) {
+      items.push({ cacheKey: annotationTextCacheKey(path, a.id, target, a.content), text: a.content });
+    }
+    const changed = await ensureLocalizedTexts(target, items);
+    if (changed && DocumentPanel.currentPath === path) {
+      await refreshDocPanel(path);
+    }
+  } finally {
+    inFlightDocLocalization.delete(key);
+  }
+}
+
+async function ensureGlobalReportLocalized(report: GlobalReport): Promise<void> {
+  const target = resolveLanguage();
+  const key = `${reviewScopeKey()}::${target}`;
+  if (inFlightGlobalLocalization.has(key)) {
+    return;
+  }
+  inFlightGlobalLocalization.add(key);
+  try {
+    const items: Array<{ cacheKey: string; text: string }> = [
+      { cacheKey: globalTextCacheKey('conclusion', 'main', target, report.conclusion), text: report.conclusion },
+    ];
+    for (let i = 0; i < report.evidence.length; i++) {
+      items.push({
+        cacheKey: globalTextCacheKey('evidence', String(i), target, report.evidence[i]),
+        text: report.evidence[i],
+      });
+    }
+    for (let i = 0; i < report.verdicts.length; i++) {
+      const v = report.verdicts[i];
+      items.push({
+        cacheKey: globalTextCacheKey('verdictTitle', `${i}:${v.kind}`, target, v.title),
+        text: v.title,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('verdictBefore', `${i}:${v.kind}`, target, v.before),
+        text: v.before,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('verdictAfter', `${i}:${v.kind}`, target, v.after),
+        text: v.after,
+      });
+    }
+    for (let i = 0; i < report.fixSpots.length; i++) {
+      const sp = report.fixSpots[i];
+      items.push({
+        cacheKey: globalTextCacheKey('spotTitle', `${i}:${sp.id}`, target, sp.title),
+        text: sp.title,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('spotDetail', `${i}:${sp.id}`, target, sp.detail),
+        text: sp.detail,
+      });
+      if (sp.suggestion) {
+        items.push({
+          cacheKey: globalTextCacheKey('spotSuggestion', `${i}:${sp.id}`, target, sp.suggestion),
+          text: sp.suggestion,
+        });
+      }
+    }
+    const changed = await ensureLocalizedTexts(target, items);
+    if (changed && session.globalReport) {
+      showGlobalReport();
+    }
+  } finally {
+    inFlightGlobalLocalization.delete(key);
+  }
+}
+
+async function ensurePendingCommentsLocalized(): Promise<boolean> {
+  const target = resolveLanguage();
+  const key = `${pendingCommentLocalizationKey}::${reviewScopeKey()}::${target}`;
+  if (inFlightDocLocalization.has(key)) {
+    return false;
+  }
+  inFlightDocLocalization.add(key);
+  try {
+    const items = session.pendingComments.map((pc) => ({
+      cacheKey: pendingCommentTextCacheKey(pc.id, target, pc.body),
+      text: pc.body,
+    }));
+    return await ensureLocalizedTexts(target, items);
+  } finally {
+    inFlightDocLocalization.delete(key);
+  }
+}
 
 /** Hydrates appliedFixes from workspaceState so revert/locate survive window reloads. */
 function hydrateAppliedFixes(memento: vscode.Memento): void {
@@ -234,9 +546,18 @@ export function activate(context: vscode.ExtensionContext): void {
     onLanguageChange(() => {
       refreshStatusBarText();
       WorkbenchPanel.rerenderIfOpen();
-      DocumentPanel.refreshIfOpen();
+      const currentPath = DocumentPanel.currentPath;
+      if (currentPath) {
+        void refreshDocPanel(currentPath);
+      } else {
+        DocumentPanel.refreshIfOpen();
+      }
       FixProposalPanel.refreshIfOpen();
-      GlobalReportPanel.refreshIfOpen();
+      if (session.globalReport) {
+        showGlobalReport();
+      } else {
+        GlobalReportPanel.refreshIfOpen();
+      }
     }),
   );
 
@@ -987,6 +1308,7 @@ async function openFileInPanel(relPath: string): Promise<void> {
     return; // anchoring may have yielded; bail before overwriting the panel.
   }
   DocumentPanel.show(buildDocModel(relPath, render, anchors), docActions());
+  void ensureDocLocalized(relPath);
   // Showing the document beside the workbench just created the second editor
   // group. Apply the narrow-workbench / wide-document split once per review now
   // that there is real content to size — rather than pre-creating an empty group
@@ -1037,6 +1359,9 @@ function buildDocModel(
 ): DocModel {
   const state = session.fileState(relPath);
   const rawLines = deHighlight(render.sourceLines);
+  const lang = resolveLanguage();
+  const findings = localizeFindingsNow(relPath, session.findings(relPath), lang);
+  const annotations = localizeAnnotationsNow(relPath, session.annotations(relPath), lang);
   return {
     path: relPath,
     name: relPath.split('/').pop() ?? relPath,
@@ -1045,7 +1370,7 @@ function buildDocModel(
     sourceLines: render.sourceLines,
     raw: rawLines,
     seen: state?.seenLines ?? [],
-    findings: session.findings(relPath).map((f) => {
+    findings: findings.map((f) => {
       const d = session.findingDisposition(relPath, f.id);
       // If a Copilot fix was applied, the finding's snapshot line is stale — the
       // edit shifted the file. Re-anchor the inline card to the fix's current
@@ -1071,7 +1396,7 @@ function buildDocModel(
         estimatedLine: !!f.anchor && !a,
       };
     }),
-    annotations: session.annotations(relPath).map((a) => ({
+    annotations: annotations.map((a) => ({
       id: a.id,
       kind: a.kind,
       startLine: a.startLine,
@@ -1202,6 +1527,7 @@ async function refreshDocPanel(relPath: string): Promise<void> {
       return;
     }
     DocumentPanel.update(buildDocModel(relPath, render, anchors));
+    void ensureDocLocalized(relPath);
   }
 }
 
@@ -1228,6 +1554,7 @@ async function reloadDocPanel(relPath: string): Promise<void> {
     return;
   }
   DocumentPanel.update(buildDocModel(relPath, render, anchors));
+  void ensureDocLocalized(relPath);
 }
 
 /**
@@ -1782,6 +2109,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
   if (!cwd) {
     return;
   }
+  const [displayFinding] = localizeFindingsNow(rel, [finding], resolveLanguage());
   const findingId = finding.id;
   // Opening the fix panel must NOT move the document — the reviewer is reading a
   // specific spot and only the explicit 「定位」 button should scroll. Resolve the
@@ -1796,9 +2124,9 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
     finding: {
       id: finding.id,
       line: liveLine,
-      title: finding.title,
-      detail: finding.detail,
-      suggestion: finding.suggestion,
+      title: displayFinding.title,
+      detail: displayFinding.detail,
+      suggestion: displayFinding.suggestion,
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();
@@ -1915,6 +2243,7 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
   if (!finding) {
     return;
   }
+  const [displayFinding] = localizeFindingsNow(rel, [finding], resolveLanguage());
 
   const cwd = activeCwd();
   if (!cwd) {
@@ -1926,7 +2255,7 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     return;
   } else if (kind === 'commented') {
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
-    const body = composeCommentBody(finding);
+    const body = composeCommentBody(displayFinding);
     if (prMatch) {
       // Accumulate into the pending review (posted together on conclusion),
       // instead of firing an immediate standalone comment.
@@ -1957,7 +2286,7 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     }
   } else if (kind === 'ignored') {
     const reason = await vscode.window.showInputBox({
-      title: m().finding.ignoreTitle(finding.title),
+      title: m().finding.ignoreTitle(displayFinding.title),
       prompt: m().finding.ignorePrompt,
       placeHolder: m().finding.ignorePlaceholder,
       ignoreFocusOut: true,
@@ -2166,12 +2495,13 @@ function showGlobalReport(): void {
     transientInfo(m().global.noReport);
     return;
   }
+  const localizedReport = localizeGlobalReportNow(report, resolveLanguage());
   const cov = session.totalCoverage();
   const reviewSet = session.reviewSet;
   const findingsCount = reviewSet
     ? reviewSet.files.reduce((sum, f) => sum + session.findings(f.path).length, 0)
     : 0;
-  GlobalReportPanel.show(report, session.globalConfirmed, {
+  GlobalReportPanel.show(localizedReport, session.globalConfirmed, {
     onLocate: locateInFile,
     onConfirm: () => session.confirmGlobal(),
     onGlobalFix: (spotId, file, line) => void openGlobalFix(spotId, file, line),
@@ -2190,6 +2520,7 @@ function showGlobalReport(): void {
       gatePassed: session.gatePassed(),
     },
   });
+  void ensureGlobalReportLocalized(report);
 }
 
 /** Looks up a global fix spot's anchor snippet by id, for disposition resolution. */
@@ -2207,10 +2538,14 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   if (!ensureReviewPath(file, m().actions.analyze)) {
     return;
   }
-  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
+  const baseReport = session.globalReport;
+  const spot = baseReport?.fixSpots.find((s) => s.id === spotId);
   if (!spot) {
     return;
   }
+  const localizedSpot = baseReport
+    ? localizeGlobalReportNow(baseReport, resolveLanguage()).fixSpots.find((s) => s.id === spotId) ?? spot
+    : spot;
   const cwd = activeCwd();
   if (!cwd) {
     return;
@@ -2237,9 +2572,9 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
     finding: {
       id: spotId,
       line: liveLine,
-      title: spot.title,
-      detail: spot.detail,
-      suggestion: spot.suggestion,
+      title: localizedSpot.title,
+      detail: localizedSpot.detail,
+      suggestion: localizedSpot.suggestion,
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();
@@ -2294,15 +2629,23 @@ async function disposeGlobalFix(
   if (!ensureReviewPath(file, m().actions.disposeFinding)) {
     return;
   }
-  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
+  const baseReport = session.globalReport;
+  const spot = baseReport?.fixSpots.find((s) => s.id === spotId);
   if (!spot) {
     return;
   }
+  const localizedSpot = baseReport
+    ? localizeGlobalReportNow(baseReport, resolveLanguage()).fixSpots.find((s) => s.id === spotId) ?? spot
+    : spot;
   const cwd = activeCwd();
   if (!cwd) {
     return;
   }
-  const findingLike = { title: spot.title, detail: spot.detail, suggestion: spot.suggestion };
+  const findingLike = {
+    title: localizedSpot.title,
+    detail: localizedSpot.detail,
+    suggestion: localizedSpot.suggestion,
+  };
 
   if (kind === 'commented') {
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
@@ -2343,7 +2686,7 @@ async function disposeGlobalFix(
     }
   } else {
     const reason = await vscode.window.showInputBox({
-      title: m().finding.ignoreTitle(spot.title),
+      title: m().finding.ignoreTitle(localizedSpot.title),
       prompt: m().finding.ignorePrompt,
       placeHolder: m().finding.ignorePlaceholder,
       ignoreFocusOut: true,
@@ -2403,6 +2746,91 @@ async function revertGlobalFix(spotId: string, file: string, _line: number): Pro
   }
 }
 
+async function localizeReportData(data: ReportData, target: Language): Promise<ReportData> {
+  const items: Array<{ cacheKey: string; text: string }> = [];
+  for (const f of data.files) {
+    for (const finding of f.findings) {
+      items.push({
+        cacheKey: findingTextCacheKey(f.path, finding.id, 'title', target, finding.title),
+        text: finding.title,
+      });
+      items.push({
+        cacheKey: findingTextCacheKey(f.path, finding.id, 'detail', target, finding.detail),
+        text: finding.detail,
+      });
+      if (finding.suggestion) {
+        items.push({
+          cacheKey: findingTextCacheKey(f.path, finding.id, 'suggestion', target, finding.suggestion),
+          text: finding.suggestion,
+        });
+      }
+    }
+    for (const a of f.annotations) {
+      items.push({
+        cacheKey: annotationTextCacheKey(f.path, a.id, target, a.content),
+        text: a.content,
+      });
+    }
+  }
+  if (data.globalReport) {
+    const g = data.globalReport;
+    items.push({
+      cacheKey: globalTextCacheKey('conclusion', 'main', target, g.conclusion),
+      text: g.conclusion,
+    });
+    for (let i = 0; i < g.evidence.length; i++) {
+      items.push({
+        cacheKey: globalTextCacheKey('evidence', String(i), target, g.evidence[i]),
+        text: g.evidence[i],
+      });
+    }
+    for (let i = 0; i < g.verdicts.length; i++) {
+      const v = g.verdicts[i];
+      items.push({
+        cacheKey: globalTextCacheKey('verdictTitle', `${i}:${v.kind}`, target, v.title),
+        text: v.title,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('verdictBefore', `${i}:${v.kind}`, target, v.before),
+        text: v.before,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('verdictAfter', `${i}:${v.kind}`, target, v.after),
+        text: v.after,
+      });
+    }
+    for (let i = 0; i < g.fixSpots.length; i++) {
+      const sp = g.fixSpots[i];
+      items.push({
+        cacheKey: globalTextCacheKey('spotTitle', `${i}:${sp.id}`, target, sp.title),
+        text: sp.title,
+      });
+      items.push({
+        cacheKey: globalTextCacheKey('spotDetail', `${i}:${sp.id}`, target, sp.detail),
+        text: sp.detail,
+      });
+      if (sp.suggestion) {
+        items.push({
+          cacheKey: globalTextCacheKey('spotSuggestion', `${i}:${sp.id}`, target, sp.suggestion),
+          text: sp.suggestion,
+        });
+      }
+    }
+  }
+
+  await ensureLocalizedTexts(target, items);
+
+  return {
+    ...data,
+    files: data.files.map((f) => ({
+      ...f,
+      findings: localizeFindingsNow(f.path, f.findings, target),
+      annotations: localizeAnnotationsNow(f.path, f.annotations, target),
+    })),
+    globalReport: data.globalReport ? localizeGlobalReportNow(data.globalReport, target) : undefined,
+  };
+}
+
 /** Builds a Markdown review report from the session and opens it as a new document. */
 async function exportReviewReport(): Promise<void> {
   const reviewSet = session.reviewSet;
@@ -2430,7 +2858,8 @@ async function exportReviewReport(): Promise<void> {
     globalReport: session.globalReport,
     conclusion: session.conclusion,
   };
-  const markdown = buildReviewReportMarkdown(data, m().report);
+  const localized = await localizeReportData(data, resolveLanguage());
+  const markdown = buildReviewReportMarkdown(localized, m().report);
   const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: markdown });
   await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
   transientInfo(m().report.exported);
@@ -2704,18 +3133,20 @@ async function viewPendingComments(): Promise<void> {
     transientInfo(m().documentPanel.commentNonePending);
     return;
   }
+  const targetLang = resolveLanguage();
   const trash: vscode.QuickInputButton = {
     iconPath: new vscode.ThemeIcon('trash'),
     tooltip: m().documentPanel.commentDelete,
   };
   const qp = vscode.window.createQuickPick<vscode.QuickPickItem & { id: string }>();
+  let hidden = false;
   const build = () =>
     session.pendingComments.map((pc) => ({
       label:
         pc.startLine === pc.endLine
           ? `${pc.path}:${pc.startLine}`
           : `${pc.path}:${pc.startLine}-${pc.endLine}`,
-      detail: pc.body,
+      detail: localizePendingCommentBodyNow(pc, targetLang),
       buttons: [trash],
       id: pc.id,
     }));
@@ -2744,8 +3175,18 @@ async function viewPendingComments(): Promise<void> {
       }
     }
   });
-  qp.onDidHide(() => qp.dispose());
   qp.show();
+  void ensurePendingCommentsLocalized().then((changed) => {
+    if (!changed || hidden) {
+      return;
+    }
+    qp.items = build();
+    retitle();
+  });
+  qp.onDidHide(() => {
+    hidden = true;
+    qp.dispose();
+  });
 }
 
 function reportError(err: unknown): void {

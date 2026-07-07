@@ -491,6 +491,8 @@ export const zh: Messages = {
     modelCallFailed: (msg) => `模型调用失败：${msg}`,
     jsonParseFailed: (preview, truncated) =>
       `无法解析模型返回的 JSON。返回预览：${preview}${truncated ? '…' : ''}`,
+    batchTranslateShapeMismatch: (expected, actual) =>
+      `批量翻译返回 ${actual} 项，预期 ${expected} 项。`,
     untitledFinding: '未命名问题',
     untitledVerdict: '未命名判断',
     noCrossFileIssues: '无重大跨文件问题。',

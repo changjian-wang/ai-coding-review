@@ -536,6 +536,8 @@ export const en = {
     modelCallFailed: (msg: string) => `Model call failed: ${msg}`,
     jsonParseFailed: (preview: string, truncated: boolean) =>
       `Could not parse the JSON returned by the model. Preview: ${preview}${truncated ? '…' : ''}`,
+    batchTranslateShapeMismatch: (expected: number, actual: number) =>
+      `Batch translation returned ${actual} item(s), expected ${expected}.`,
     untitledFinding: 'Untitled finding',
     untitledVerdict: 'Untitled verdict',
     noCrossFileIssues: 'No significant cross-file issues.',
