@@ -57,6 +57,25 @@ export interface ReviewConclusion {
   submittedAt: number;
 }
 
+/**
+ * A draft PR review comment the reviewer has written but not yet submitted.
+ * Accumulated locally and posted together as one GitHub review (pending-review
+ * model) when the conclusion is submitted.
+ */
+export interface PendingComment {
+  id: string;
+  /** Review-set relative path of the commented file. */
+  path: string;
+  /** 1-based line range the comment anchors to (startLine === endLine for a single line). */
+  startLine: number;
+  endLine: number;
+  /** The comment body (Markdown). */
+  body: string;
+  /** Where the comment came from: a manual selection or a finding disposition. */
+  source: 'manual' | 'finding';
+  createdAt: number;
+}
+
 /** A complete, persistable snapshot of one review. */
 export interface ReviewSnapshot {
   repo: string;
@@ -77,6 +96,8 @@ export interface ReviewSnapshot {
   globalFixDispositions?: Record<string, FindingDisposition>;
   /** The reviewer's final verdict, once submitted. */
   conclusion?: ReviewConclusion;
+  /** Draft PR review comments awaiting submission (pending-review model). */
+  pendingComments?: PendingComment[];
   /** Estimated LLM token usage accumulated over this review (approximate). */
   tokenUsage?: TokenAccount;
   updatedAt: number;

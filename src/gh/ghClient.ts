@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { m } from '../i18n';
 import type { PullRequest, PrSummary } from './types';
 
@@ -315,5 +318,68 @@ export async function postPrLineComment(
     return { id: parsed.id, url: parsed.html_url };
   } catch {
     throw new GhError(m().gh.commentParseFailed);
+  }
+}
+
+/**
+ * Submits ONE PR review carrying any number of line-anchored comments in a
+ * single request (the pending-review model): all draft comments post together
+ * with the verdict, instead of appearing as separate standalone comments.
+ * Multi-line comments use `start_line`..`line`. The payload is a nested array
+ * gh api cannot express with `-f` flags, so it is sent via a temp JSON file
+ * through `--input`; `runGh` still applies the per-repo account token.
+ */
+export async function submitPrReviewWithComments(
+  cwd: string,
+  prNumber: number,
+  commitSha: string,
+  verdict: 'approve' | 'request-changes' | 'comment',
+  body: string,
+  comments: { path: string; startLine: number; endLine: number; body: string }[],
+): Promise<void> {
+  const repoJson = await runGh(['repo', 'view', '--json', 'owner,name'], cwd);
+  let repo: { owner: { login: string }; name: string };
+  try {
+    repo = JSON.parse(repoJson);
+  } catch {
+    throw new GhError(m().gh.repoViewParseFailed);
+  }
+  const slug = `${repo.owner.login}/${repo.name}`;
+  const event =
+    verdict === 'approve' ? 'APPROVE' : verdict === 'request-changes' ? 'REQUEST_CHANGES' : 'COMMENT';
+  const payload = {
+    commit_id: commitSha,
+    body,
+    event,
+    comments: comments.map((c) => {
+      const entry: {
+        path: string;
+        side: string;
+        line: number;
+        body: string;
+        start_line?: number;
+        start_side?: string;
+      } = { path: c.path, side: 'RIGHT', line: c.endLine, body: c.body };
+      if (c.endLine > c.startLine) {
+        entry.start_line = c.startLine;
+        entry.start_side = 'RIGHT';
+      }
+      return entry;
+    }),
+  };
+  const tmp = path.join(
+    os.tmpdir(),
+    `codereview-review-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+  );
+  await fs.writeFile(tmp, JSON.stringify(payload), 'utf8');
+  try {
+    await runGh(
+      ['api', `repos/${slug}/pulls/${prNumber}/reviews`, '-X', 'POST', '--input', tmp],
+      cwd,
+    );
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => {
+      /* temp file cleanup is best-effort */
+    });
   }
 }

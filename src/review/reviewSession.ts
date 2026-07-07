@@ -4,7 +4,7 @@ import { m } from '../i18n';
 import type { ReviewSet } from '../scope/types';
 import type { Finding, GlobalReport } from '../ai/types';
 import type { TokenUsage } from '../ai/analyzer';
-import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, TokenAccount } from './reviewStore';
+import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
 
 /**
@@ -105,6 +105,7 @@ export class ReviewSession {
       globalDone: scopeSnap?.globalDone ?? false,
       globalFixDispositions: scopeSnap?.globalFixDispositions,
       conclusion: scopeSnap?.conclusion,
+      pendingComments: scopeSnap?.pendingComments,
       tokenUsage: scopeSnap?.tokenUsage,
       updatedAt: Date.now(),
     };
@@ -518,6 +519,40 @@ export class ReviewSession {
 
   get conclusion(): ReviewConclusion | undefined {
     return this.snapshot?.conclusion;
+  }
+
+  /** Draft PR review comments awaiting submission (pending-review model). */
+  get pendingComments(): PendingComment[] {
+    return this.snapshot?.pendingComments ?? [];
+  }
+
+  /** Adds a draft PR review comment to the pending review. */
+  addPendingComment(comment: PendingComment): void {
+    if (!this.snapshot) {
+      return;
+    }
+    (this.snapshot.pendingComments ??= []).push(comment);
+    this.persistScope();
+  }
+
+  /** Removes a pending comment by id. */
+  removePendingComment(id: string): void {
+    if (!this.snapshot?.pendingComments) {
+      return;
+    }
+    const next = this.snapshot.pendingComments.filter((c) => c.id !== id);
+    if (next.length !== this.snapshot.pendingComments.length) {
+      this.snapshot.pendingComments = next;
+      this.persistScope();
+    }
+  }
+
+  /** Clears all pending comments (e.g. after they have been submitted). */
+  clearPendingComments(): void {
+    if (this.snapshot?.pendingComments?.length) {
+      this.snapshot.pendingComments = [];
+      this.persistScope();
+    }
   }
 
   /**

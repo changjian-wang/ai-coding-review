@@ -61,6 +61,8 @@ export interface DocActions {
   translateWhole(path: string): void;
   explain(path: string, startLine: number, endLine: number, text: string): void;
   note(path: string, startLine: number, endLine: number, text: string): void;
+  /** Adds a manual PR review comment (draft) anchored to the selected line range. */
+  comment(path: string, startLine: number, endLine: number, text: string): void;
   removeAnnotation(path: string, id: string): void;
   /** Re-runs the model for an AI annotation (translate/explain), replacing it. */
   regenerateAnnotation(path: string, id: string): void;
@@ -85,6 +87,7 @@ type Inbound =
   | { type: 'translateWhole' }
   | { type: 'explain'; startLine: number; endLine: number; text: string }
   | { type: 'note'; startLine: number; endLine: number; text: string }
+  | { type: 'comment'; startLine: number; endLine: number; text: string }
   | { type: 'removeAnnotation'; id: string }
   | { type: 'regenerateAnnotation'; id: string }
   | { type: 'convertToNote'; id: string }
@@ -295,6 +298,9 @@ export class DocumentPanel {
         break;
       case 'note':
         this.actions.note(path, m.startLine, m.endLine, m.text);
+        break;
+      case 'comment':
+        this.actions.comment(path, m.startLine, m.endLine, m.text);
         break;
       case 'removeAnnotation':
         this.actions.removeAnnotation(path, m.id);
@@ -645,6 +651,7 @@ export class DocumentPanel {
     <button id="pop-tr">${t.translate}</button>
     <button id="pop-explain">${t.explain}</button>
     <button id="pop-note">${t.note}</button>
+    <button id="pop-comment">${t.comment}</button>
   </div>
   <div class="pop-busy" id="pop-busy"><span class="spin"></span><span id="pop-busy-label"></span></div>
 <script nonce="${nonce}">
@@ -1154,6 +1161,7 @@ contentEl.addEventListener('mouseup', () => setTimeout(captureSelection, 0));
 $('pop-tr').addEventListener('click', () => { if (pendingSel) { showAiBusy(T.translatingInline); vscode.postMessage({ type:'translate', startLine:pendingSel.startLine, endLine:pendingSel.endLine, text:pendingSel.text }); pop.style.display='none'; } });
 $('pop-explain').addEventListener('click', () => { if (pendingSel) { showAiBusy(T.explainingInline); vscode.postMessage({ type:'explain', startLine:pendingSel.startLine, endLine:pendingSel.endLine, text:pendingSel.text }); pop.style.display='none'; } });
 $('pop-note').addEventListener('click', () => { if (pendingSel) { vscode.postMessage({ type:'note', startLine:pendingSel.startLine, endLine:pendingSel.endLine, text:pendingSel.text }); pop.style.display='none'; } });
+$('pop-comment').addEventListener('click', () => { if (pendingSel) { vscode.postMessage({ type:'comment', startLine:pendingSel.startLine, endLine:pendingSel.endLine, text:pendingSel.text }); pop.style.display='none'; } });
 
 // In-place "calling the model" feedback for translate / explain, anchored where
 // the selection popover was, so the user sees work is happening without hunting
