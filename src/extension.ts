@@ -241,14 +241,28 @@ async function ensureLocalizedTexts(
     const chunkSize = 80;
     for (let i = 0; i < missing.length; i += chunkSize) {
       const chunk = missing.slice(i, i + chunkSize);
-      const translated = await translateTextBatch(
-        model,
-        chunk.map((x) => x.text),
-        target,
-        token.token,
-      );
-      for (let j = 0; j < chunk.length; j++) {
-        cache[chunk[j].cacheKey] = translated[j] ?? chunk[j].text;
+      try {
+        const translated = await translateTextBatch(
+          model,
+          chunk.map((x) => x.text),
+          target,
+          token.token,
+        );
+        for (let j = 0; j < chunk.length; j++) {
+          cache[chunk[j].cacheKey] = translated[j] ?? chunk[j].text;
+        }
+      } catch (err) {
+        // Some models occasionally violate strict JSON shape in batch mode.
+        // Fallback to per-item translation so localization still completes.
+        console.warn('[codereview] translateTextBatch failed; fallback to per-item translation:', err);
+        for (const it of chunk) {
+          try {
+            cache[it.cacheKey] = await translateSelection(model, it.text, token.token);
+          } catch {
+            // Preserve original text when translation fails for an item.
+            cache[it.cacheKey] = it.text;
+          }
+        }
       }
     }
     flushLocalizedTextCache();
@@ -326,23 +340,45 @@ async function ensureDocLocalized(path: string): Promise<void> {
   try {
     const findings = session.findings(path);
     const annotations = session.annotations(path);
-    const items: Array<{ cacheKey: string; text: string }> = [];
+    const titleItems: Array<{ cacheKey: string; text: string }> = [];
+    const restItems: Array<{ cacheKey: string; text: string }> = [];
     for (const f of findings) {
-      items.push({ cacheKey: findingTextCacheKey(path, f.id, 'title', target, f.title), text: f.title });
-      items.push({ cacheKey: findingTextCacheKey(path, f.id, 'detail', target, f.detail), text: f.detail });
+      titleItems.push({ cacheKey: findingTextCacheKey(path, f.id, 'title', target, f.title), text: f.title });
+      restItems.push({ cacheKey: findingTextCacheKey(path, f.id, 'detail', target, f.detail), text: f.detail });
       if (f.suggestion) {
-        items.push({
+        restItems.push({
           cacheKey: findingTextCacheKey(path, f.id, 'suggestion', target, f.suggestion),
           text: f.suggestion,
         });
       }
     }
     for (const a of annotations) {
-      items.push({ cacheKey: annotationTextCacheKey(path, a.id, target, a.content), text: a.content });
+      restItems.push({ cacheKey: annotationTextCacheKey(path, a.id, target, a.content), text: a.content });
     }
-    const changed = await ensureLocalizedTexts(target, items);
-    if (changed && DocumentPanel.currentPath === path) {
-      await refreshDocPanel(path);
+
+    const cache = ensureLocalizedTextCache();
+    const hasMissing = (items: Array<{ cacheKey: string; text: string }>) =>
+      items.some((it) => it.text.trim() && shouldTranslateText(it.text, target) && !cache[it.cacheKey]);
+
+    const needTitlePass = hasMissing(titleItems);
+    const needRestPass = hasMissing(restItems);
+
+    if ((needTitlePass || needRestPass) && DocumentPanel.currentPath === path) {
+      DocumentPanel.flashNotice(path, m().analysis.localizingFindings, 'info', 1400);
+    }
+
+    if (needTitlePass) {
+      const changedTitle = await ensureLocalizedTexts(target, titleItems);
+      if (changedTitle && DocumentPanel.currentPath === path) {
+        await refreshDocPanel(path);
+      }
+    }
+
+    if (needRestPass) {
+      const changedRest = await ensureLocalizedTexts(target, restItems);
+      if (changedRest && DocumentPanel.currentPath === path) {
+        await refreshDocPanel(path);
+      }
     }
   } finally {
     inFlightDocLocalization.delete(key);
@@ -455,6 +491,26 @@ function setAppliedFix(key: string, edit: { oldText: string; newText: string }):
   flushAppliedFixes();
 }
 
+/** Forces every visible review surface to re-render in the current language. */
+function refreshUiForLanguageSwitch(): void {
+  refreshStatusBarText();
+  WorkbenchPanel.rerenderIfOpen();
+  // Rebuild shell text (tab/button labels) first.
+  DocumentPanel.refreshIfOpen();
+  const currentPath = DocumentPanel.currentPath;
+  if (currentPath) {
+    // Then refresh the data model for the currently opened file so findings /
+    // annotations follow the new language as well.
+    void refreshDocPanel(currentPath);
+  }
+  FixProposalPanel.refreshIfOpen();
+  if (session.globalReport) {
+    showGlobalReport();
+  } else {
+    GlobalReportPanel.refreshIfOpen();
+  }
+}
+
 function deleteAppliedFix(key: string): void {
   appliedFixes.delete(key);
   flushAppliedFixes();
@@ -544,20 +600,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // bar and any open webviews switch language without a reload.
   context.subscriptions.push(
     onLanguageChange(() => {
-      refreshStatusBarText();
-      WorkbenchPanel.rerenderIfOpen();
-      const currentPath = DocumentPanel.currentPath;
-      if (currentPath) {
-        void refreshDocPanel(currentPath);
-      } else {
-        DocumentPanel.refreshIfOpen();
-      }
-      FixProposalPanel.refreshIfOpen();
-      if (session.globalReport) {
-        showGlobalReport();
-      } else {
-        GlobalReportPanel.refreshIfOpen();
-      }
+      refreshUiForLanguageSwitch();
     }),
   );
 
@@ -925,6 +968,7 @@ async function applyLanguage(id: string): Promise<void> {
   await vscode.workspace
     .getConfiguration('codereview')
     .update('language', id, vscode.ConfigurationTarget.Global);
+  refreshUiForLanguageSwitch();
 }
 
 async function selectLanguage(): Promise<void> {
@@ -946,7 +990,7 @@ async function selectLanguage(): Promise<void> {
   await vscode.workspace
     .getConfiguration('codereview')
     .update('language', pick.value, vscode.ConfigurationTarget.Global);
-  // The onDidChangeConfiguration listener refreshes UI; nothing else to do.
+  refreshUiForLanguageSwitch();
 }
 
 /** Opens (or reveals) the Review Workbench webview. */

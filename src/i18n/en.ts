@@ -73,6 +73,7 @@ export const en = {
   analysis: {
     translating: 'AI Coding Review: translating…',
     explaining: 'AI Coding Review: explaining…',
+    localizingFindings: 'AI Coding Review: localizing findings…',
     reuseExplanation: 'Already explained — showing the saved result (delete it to regenerate)',
     reuseTranslation: 'Already translated — showing the saved result (delete it to regenerate)',
     convertedToNote: 'Converted to a note — click Edit to modify it',
