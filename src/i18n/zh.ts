@@ -62,6 +62,7 @@ export const zh: Messages = {
   analysis: {
     translating: 'AI Coding Review：翻译中…',
     explaining: 'AI Coding Review：解释中…',
+    localizingFindings: 'AI Coding Review：发现项本地化中…',
     reuseExplanation: '这段已解释过，已为你显示之前的结果（删除后可重新生成）',
     reuseTranslation: '这段已翻译过，已为你显示之前的结果（删除后可重新生成）',
     convertedToNote: '已转为批注，可点“编辑”修改',
@@ -491,6 +492,8 @@ export const zh: Messages = {
     modelCallFailed: (msg) => `模型调用失败：${msg}`,
     jsonParseFailed: (preview, truncated) =>
       `无法解析模型返回的 JSON。返回预览：${preview}${truncated ? '…' : ''}`,
+    batchTranslateShapeMismatch: (expected, actual) =>
+      `批量翻译返回 ${actual} 项，预期 ${expected} 项。`,
     untitledFinding: '未命名问题',
     untitledVerdict: '未命名判断',
     noCrossFileIssues: '无重大跨文件问题。',
