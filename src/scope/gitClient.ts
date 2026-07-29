@@ -92,8 +92,13 @@ function parseNumstat(out: string): ReviewFile[] {
   return files;
 }
 
-function parseNameStatus(out: string): Map<string, ReviewFile['status']> {
-  const statusByPath = new Map<string, ReviewFile['status']>();
+interface NameStatus {
+  status: ReviewFile['status'];
+  previousPath?: string;
+}
+
+function parseNameStatus(out: string): Map<string, NameStatus> {
+  const statusByPath = new Map<string, NameStatus>();
   for (const line of out.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -103,8 +108,10 @@ function parseNameStatus(out: string): Map<string, ReviewFile['status']> {
     const code = parts[0];
     let status: ReviewFile['status'];
     let filePath = parts[1];
+    let previousPath: string | undefined;
     if (code.startsWith('R')) {
       status = 'renamed';
+      previousPath = parts[1];
       filePath = parts[2] ?? filePath;
     } else if (code === 'A') {
       status = 'added';
@@ -114,7 +121,7 @@ function parseNameStatus(out: string): Map<string, ReviewFile['status']> {
       status = 'modified';
     }
     if (filePath) {
-      statusByPath.set(filePath, status);
+      statusByPath.set(filePath, { status, previousPath });
     }
   }
   return statusByPath;
@@ -128,7 +135,8 @@ async function diffFilesWithStatus(cwd: string, args: string[]): Promise<ReviewF
   const statuses = parseNameStatus(nameStatus);
   return parseNumstat(numstat).map((file) => ({
     ...file,
-    status: statuses.get(file.path) ?? file.status,
+    status: statuses.get(file.path)?.status ?? file.status,
+    previousPath: statuses.get(file.path)?.previousPath,
   }));
 }
 
@@ -140,6 +148,20 @@ export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[
 /** Tracked changes in the working tree and index vs HEAD. */
 export async function workingTreeFiles(cwd: string): Promise<ReviewFile[]> {
   return diffFilesWithStatus(cwd, ['HEAD']);
+}
+
+/** The common ancestor Git uses as the old side of a three-dot comparison. */
+export async function mergeBase(cwd: string, baseRef: string, headRef: string): Promise<string> {
+  return (await git(['merge-base', baseRef, headRef], cwd)).trim();
+}
+
+/** Reads a UTF-8 text file from a commit, returning undefined when it did not exist. */
+export async function readFileAtRef(cwd: string, ref: string, relPath: string): Promise<string | undefined> {
+  try {
+    return await git(['show', `${ref}:${relPath}`], cwd);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

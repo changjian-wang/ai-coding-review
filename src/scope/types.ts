@@ -2,11 +2,21 @@
 export interface ReviewFile {
   /** Repository-relative path, e.g. "src/foo/bar.ts". */
   path: string;
+  /** Repository-relative path before a rename; absent for non-renamed files. */
+  previousPath?: string;
   /** Added lines, when the scope was defined by a diff. Absent for pure source review. */
   additions?: number;
   /** Deleted lines, when the scope was defined by a diff. */
   deletions?: number;
   status?: 'added' | 'modified' | 'deleted' | 'renamed';
+}
+
+/** The immutable endpoints used to render a full-file diff. */
+export interface ReviewComparison {
+  /** Commit containing the old side of the comparison. */
+  baseSha: string;
+  /** Commit containing the new side of the comparison. */
+  headSha: string;
 }
 
 /**
@@ -24,6 +34,8 @@ export interface ReviewSet {
    */
   headSha: string;
   files: ReviewFile[];
+  /** Present only for scopes whose files came from a diff. */
+  comparison?: ReviewComparison;
 }
 
 /**

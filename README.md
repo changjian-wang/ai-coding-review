@@ -42,6 +42,8 @@ English | [简体中文](README.zh-CN.md)
 
 ### Per-file review
 
+- PR and other diff-backed scopes open in an uncollapsed, full-file inline Diff by default, with
+  old/new line numbers and added/deleted rows; switch to the clean head file at any time
 - Per-line coverage tracking and "jump to next unseen line"
 - File-level AI analysis → findings with severity levels
 - Every finding must be disposed: **fixed / commented / ignored (reason required)**

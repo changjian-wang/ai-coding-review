@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PR and other diff-backed reviews now default to an uncollapsed, full-file inline Diff with
+  old/new line numbers and added/deleted rows, while retaining a one-click clean-file view.
+
 ## [0.4.0] - 2026-07-07
 
 ### Added

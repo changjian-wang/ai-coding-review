@@ -77,7 +77,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
   let json: string;
   try {
     json = await runGh(
-      ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,headRefOid,files'],
+      ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files'],
       cwd,
     );
   } catch {
@@ -91,6 +91,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
     url: string;
     headRefName: string;
     baseRefName: string;
+    baseRefOid: string;
     headRefOid: string;
     files?: { path: string; additions?: number; deletions?: number; changeType?: string }[];
   };
@@ -105,6 +106,7 @@ export async function getCurrentPr(cwd: string): Promise<PullRequest> {
     url: raw.url,
     headRefName: raw.headRefName,
     baseRefName: raw.baseRefName,
+    baseRefOid: raw.baseRefOid,
     headRefOid: raw.headRefOid,
     files: (raw.files ?? []).map((f) => ({
       path: f.path,
@@ -193,7 +195,7 @@ export async function currentLogin(cwd: string): Promise<string> {
 /** Loads a specific PR by number — may be a branch we don't have checked out. */
 export async function getPrByNumber(cwd: string, number: number): Promise<PullRequest> {
   const json = await runGh(
-    ['pr', 'view', String(number), '--json', 'number,title,url,headRefName,baseRefName,headRefOid,files'],
+    ['pr', 'view', String(number), '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files'],
     cwd,
   );
   let raw: {
@@ -202,6 +204,7 @@ export async function getPrByNumber(cwd: string, number: number): Promise<PullRe
     url: string;
     headRefName: string;
     baseRefName: string;
+    baseRefOid: string;
     headRefOid: string;
     files?: { path: string; additions?: number; deletions?: number; changeType?: string }[];
   };
@@ -216,6 +219,7 @@ export async function getPrByNumber(cwd: string, number: number): Promise<PullRe
     url: raw.url,
     headRefName: raw.headRefName,
     baseRefName: raw.baseRefName,
+    baseRefOid: raw.baseRefOid,
     headRefOid: raw.headRefOid,
     files: (raw.files ?? []).map((f) => ({
       path: f.path,

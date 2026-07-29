@@ -34,6 +34,14 @@ export interface DocAnnotation {
   content: string;
 }
 
+/** A syntax-highlighted row in the continuous full-file diff. */
+export interface DocDiffLine {
+  kind: 'context' | 'added' | 'deleted';
+  oldLine?: number;
+  newLine?: number;
+  html: string;
+}
+
 /** Everything the document webview needs to render one file. */
 export interface DocModel {
   path: string;
@@ -44,6 +52,10 @@ export interface DocModel {
   sourceLines: string[];
   /** Raw source lines, index 0 = line 1 (used for selection anchoring). */
   raw: string[];
+  /** Present when this review scope has a base/head comparison. */
+  diffLines?: DocDiffLine[];
+  /** True for PR/diff scopes, even if this particular file cannot render a text diff. */
+  defaultToDiff: boolean;
   seen: number[];
   findings: DocFinding[];
   annotations: DocAnnotation[];
@@ -457,6 +469,17 @@ export class DocumentPanel {
   .ln.locate-hit { background:rgba(197,134,192,.16); box-shadow:inset 3px 0 0 #c586c0; }
   .ln.locate-hit.seen { box-shadow:inset 3px 0 0 #c586c0, inset 5px 0 0 var(--green); }
   .code { flex:1; }
+  .ln.diff-row.diff-added { background:var(--vscode-diffEditor-insertedLineBackground, rgba(46,160,67,.16)); }
+  .ln.diff-row.diff-deleted { background:var(--vscode-diffEditor-removedLineBackground, rgba(248,81,73,.16)); }
+  .ln.diff-row .gutter { width:44px; padding-right:8px; }
+  .ln.diff-row .diff-sign {
+    flex:none; width:22px; text-align:center; font-weight:700; user-select:none;
+  }
+  .ln.diff-added .diff-sign { color:var(--vscode-gitDecoration-addedResourceForeground, var(--green)); }
+  .ln.diff-deleted .diff-sign { color:var(--vscode-gitDecoration-deletedResourceForeground, var(--red)); }
+  .ln.diff-row .code { padding-left:8px; border-left:1px solid color-mix(in srgb, var(--line) 75%, transparent); }
+  .ln.diff-deleted .gutter.old { color:var(--vscode-gitDecoration-deletedResourceForeground, var(--red)); opacity:.9; }
+  .ln.diff-added .gutter.new { color:var(--vscode-gitDecoration-addedResourceForeground, var(--green)); opacity:.9; }
   .fmark { position:absolute; left:2px; width:6px; height:6px; border-radius:50%; top:.45em; }
   .fmark.bug { background:var(--red); }
   .fmark.conditional { background:var(--yellow); }
@@ -633,6 +656,10 @@ export class DocumentPanel {
   <div class="topbar">
     <span class="fname" id="fname"></span>
     <span class="spacer"></span>
+    <span class="seg" id="diff-seg" style="display:none">
+      <button id="m-diff">${t.diffView}</button>
+      <button id="m-file">${t.fileView}</button>
+    </span>
     <span class="seg" id="seg" style="display:none">
       <button id="m-read" class="on">${t.readView}</button>
       <button id="m-src">${t.sourceView}</button>
@@ -663,6 +690,7 @@ const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i
 let model = null;
 let loadedPath = null;
 let mode = 'source';
+let displayMode = 'file';
 const seen = new Set();
 let io = null;
 const visible = new Set();
@@ -852,18 +880,34 @@ function annoCard(a) {
 
 let srcCtx = null;
 
+function showingDiff() {
+  return displayMode === 'diff' && model && Array.isArray(model.diffLines);
+}
+
 function buildSourceRow(i, marksByLine, cardsByLine, annosByLine, frag) {
-  const lineNo = i + 1;
+  const diffLine = showingDiff() ? model.diffLines[i] : null;
+  const lineNo = diffLine ? (diffLine.newLine || 0) : i + 1;
   const row = document.createElement('div');
-  row.className = 'ln' + (seen.has(lineNo) ? ' seen' : '');
-  row.dataset.line = String(lineNo);
-  const ms = marksByLine[lineNo];
+  row.className = 'ln'
+    + (diffLine ? ' diff-row diff-' + diffLine.kind : '')
+    + (lineNo > 0 && seen.has(lineNo) ? ' seen' : '');
+  if (lineNo > 0) row.dataset.line = String(lineNo);
+  const ms = lineNo > 0 ? marksByLine[lineNo] : null;
   const fmark = ms ? '<span class="fmark ' + ms[0].severity + '" title="' + ms.map(x=>x.title.replace(/"/g,'')).join(' / ') + '"></span>' : '';
-  row.innerHTML = fmark + '<span class="gutter">' + lineNo + '</span><span class="code">' + (model.sourceLines[i] || '\\u200b') + '</span>';
+  if (diffLine) {
+    const sign = diffLine.kind === 'added' ? '+' : diffLine.kind === 'deleted' ? '−' : '';
+    row.innerHTML = fmark
+      + '<span class="diff-sign">' + sign + '</span>'
+      + '<span class="gutter old">' + (diffLine.oldLine || '') + '</span>'
+      + '<span class="gutter new">' + (diffLine.newLine || '') + '</span>'
+      + '<span class="code">' + (diffLine.html || '\\u200b') + '</span>';
+  } else {
+    row.innerHTML = fmark + '<span class="gutter">' + lineNo + '</span><span class="code">' + (model.sourceLines[i] || '\\u200b') + '</span>';
+  }
   frag.appendChild(row);
-  const cs = cardsByLine[lineNo];
+  const cs = lineNo > 0 ? cardsByLine[lineNo] : null;
   if (cs) { for (const f of cs) frag.appendChild(findingCard(f)); }
-  if (annosByLine[lineNo]) { for (const a of annosByLine[lineNo]) frag.appendChild(annoCard(a)); }
+  if (lineNo > 0 && annosByLine[lineNo]) { for (const a of annosByLine[lineNo]) frag.appendChild(annoCard(a)); }
   return row;
 }
 
@@ -897,7 +941,8 @@ function renderSource() {
   contentEl.innerHTML = '';
   contentEl.appendChild(wrap);
 
-  const total = model.sourceLines.length;
+  const headTotal = model.sourceLines.length;
+  const total = showingDiff() ? model.diffLines.length : headTotal;
 
   // One shared observer; rows are observed as they are appended per chunk.
   if (io) io.disconnect();
@@ -917,7 +962,7 @@ function renderSource() {
   function appendFoot() {
     if (ctx.footDone) return;
     ctx.footDone = true;
-    const oob = model.findings.filter((f) => { const a = findingAnchorLine(f); return a < 1 || a > total; });
+    const oob = model.findings.filter((f) => { const a = findingAnchorLine(f); return a < 1 || a > headTotal; });
     if (footAnnos.length || oob.length) {
       const foot = document.createElement('div');
       foot.className = 'notes-foot';
@@ -941,7 +986,7 @@ function renderSource() {
       rows.push(buildSourceRow(ctx.i, marksByLine, cardsByLine, annosByLine, frag));
     }
     wrap.appendChild(frag);
-    for (const r of rows) io.observe(r);
+    for (const r of rows) if (r.dataset.line) io.observe(r);
     if (ctx.i >= total) appendFoot();
   };
 
@@ -960,7 +1005,9 @@ function renderSource() {
 /** Forces synchronous rendering up to (and including) a 1-based line, for locate/scrollTo. */
 function ensureSrcRenderedThrough(line) {
   if (!srcCtx || srcCtx.i >= srcCtx.total) return;
-  while (srcCtx.i < line && srcCtx.i < srcCtx.total) srcCtx.renderChunk(1000);
+  while (!contentEl.querySelector('.ln[data-line="' + line + '"]') && srcCtx.i < srcCtx.total) {
+    srcCtx.renderChunk(1000);
+  }
 }
 
 
@@ -1046,15 +1093,17 @@ function render() {
   $('fname').textContent = model.name;
   // Switching to a different file should start at the top; refreshing the same
   // file (e.g. after re-analysis) should keep the reader where they were.
+  const firstFile = loadedPath === null;
   const isNewFile = model.path !== loadedPath;
   loadedPath = model.path;
+  if (firstFile) displayMode = model.defaultToDiff ? 'diff' : 'file';
   // A located highlight belongs to the file it was set in; drop it on switch.
   if (isNewFile) locatedRange = null;
   // Drive the analyze button from this file's real state, so switching away from
   // an analyzing file shows the new file's (idle) button instead of a stuck
   // 分析中… left over from the previous file.
   setAnalyzing(!!model.analyzing, true, true);
-  $('seg').style.display = model.isMarkdown ? 'flex' : 'none';
+  updateViewControls();
   seen.clear();
   for (const l of model.seen) seen.add(l);
   renderFindbar();
@@ -1062,7 +1111,8 @@ function render() {
   bilingual = !!model.isMarkdown && !!(vscode.getState() || {}).bilingual;
   const biBtn0 = $('m-bi');
   if (biBtn0) biBtn0.classList.toggle('on', bilingual);
-  if (model.isMarkdown && mode !== 'source') { setMode('reading', isNewFile); }
+  if (showingDiff()) { setMode('source', isNewFile); }
+  else if (model.isMarkdown && mode !== 'source') { setMode('reading', isNewFile); }
   else { setMode('source', isNewFile); }
 }
 
@@ -1097,15 +1147,33 @@ function setMode(m, resetScroll) {
   $('m-read').classList.toggle('on', m === 'reading');
   $('m-src').classList.toggle('on', m === 'source');
   const biBtn = $('m-bi');
-  if (biBtn) biBtn.style.display = (model && model.isMarkdown && m === 'reading') ? '' : 'none';
+  if (biBtn) biBtn.style.display = (!showingDiff() && model && model.isMarkdown && m === 'reading') ? '' : 'none';
   // Preserve scroll position when merely toggling the view mode; jump to the
   // top when loading a different file (resetScroll).
   const top = resetScroll ? 0 : contentEl.scrollTop;
-  if (m === 'reading' && model.isMarkdown) renderReading(); else renderSource();
+  if (!showingDiff() && m === 'reading' && model.isMarkdown) renderReading(); else renderSource();
   contentEl.scrollTop = top;
   // A full source re-render drops per-row classes, so re-paint the persistent
   // locate highlight onto the (possibly freshly rendered) rows.
   applyLocateHighlight();
+  updateViewControls();
+}
+
+function updateViewControls() {
+  if (!model) return;
+  const hasDiff = Array.isArray(model.diffLines);
+  const diffOn = hasDiff && displayMode === 'diff';
+  $('diff-seg').style.display = hasDiff ? 'flex' : 'none';
+  $('m-diff').classList.toggle('on', diffOn);
+  $('m-file').classList.toggle('on', !diffOn);
+  $('seg').style.display = !diffOn && model.isMarkdown ? 'flex' : 'none';
+}
+
+function setDisplayMode(next) {
+  if (next === 'diff' && !Array.isArray(model.diffLines)) return;
+  if (displayMode === next) return;
+  displayMode = next;
+  setMode('source', false);
 }
 
 // Persistent locate highlight -------------------------------------------------
@@ -1132,7 +1200,10 @@ let pendingSel = null;
 
 function lineOf(node) {
   let el = node && node.nodeType === 3 ? node.parentElement : node;
-  while (el && el !== contentEl) { if (el.classList && el.classList.contains('ln')) return Number(el.dataset.line); el = el.parentElement; }
+  while (el && el !== contentEl) {
+    if (el.classList && el.classList.contains('ln')) return el.dataset.line ? Number(el.dataset.line) : 0;
+    el = el.parentElement;
+  }
   return 0;
 }
 
@@ -1141,9 +1212,16 @@ function captureSelection() {
   if (!sel || sel.isCollapsed) { pop.style.display = 'none'; pendingSel = null; return; }
   const text = sel.toString();
   if (!text.trim()) { pop.style.display = 'none'; pendingSel = null; return; }
+  if (showingDiff() && Array.from(contentEl.querySelectorAll('.ln.diff-deleted'))
+    .some((row) => sel.getRangeAt(0).intersectsNode(row))) {
+    // Comments, findings and annotations are anchored to the HEAD side. A
+    // selection containing old-only lines cannot be represented truthfully.
+    pop.style.display = 'none'; pendingSel = null; return;
+  }
   let startLine = 0, endLine = 0;
   if (mode === 'source') {
     const a = lineOf(sel.anchorNode), b = lineOf(sel.focusNode);
+    if (showingDiff() && (!a || !b)) { pop.style.display = 'none'; pendingSel = null; return; }
     startLine = Math.min(a, b) || a || b;
     endLine = Math.max(a, b);
   } else {
@@ -1177,6 +1255,8 @@ function showAiBusy(label) {
 function hideAiBusy() { popBusy.style.display = 'none'; }
 
 // Toolbar -----------------------------------------------------------------
+$('m-diff').addEventListener('click', () => setDisplayMode('diff'));
+$('m-file').addEventListener('click', () => setDisplayMode('file'));
 $('m-read').addEventListener('click', () => setMode('reading'));
 $('m-src').addEventListener('click', () => setMode('source'));
 $('m-bi').addEventListener('click', () => {

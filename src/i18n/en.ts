@@ -355,6 +355,8 @@ export const en = {
   // ── Webview: document panel ──────────────────────────────────────────────────
   documentPanel: {
     title: 'File viewer',
+    diffView: 'Diff',
+    fileView: 'File',
     readView: 'Reading view',
     sourceView: 'Source view',
     bilingual: 'CN / EN',

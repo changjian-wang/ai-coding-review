@@ -2,6 +2,7 @@ import * as git from './gitClient';
 import { checkoutPr, ensureAuth, ensureGhAvailable, getCurrentPr, getPrByNumber } from '../gh/ghClient';
 import { m } from '../i18n';
 import type { ReviewFile, ReviewScope, ReviewSet } from './types';
+import type { PullRequest } from '../gh/types';
 
 /** Stable, order-independent short hash of a set of paths (FNV-1a, base36). */
 function hashPaths(paths: string[]): string {
@@ -14,6 +15,46 @@ function hashPaths(paths: string[]): string {
   return (h >>> 0).toString(36);
 }
 
+async function prReviewSet(cwd: string, pr: PullRequest): Promise<ReviewSet> {
+  let baseSha: string | undefined;
+  const candidates = [pr.baseRefOid, `origin/${pr.baseRefName}`, pr.baseRefName].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      baseSha = await git.mergeBase(cwd, candidate, pr.headRefOid);
+      break;
+    } catch {
+      // A fork may not have the upstream base tip locally; try the next ref.
+    }
+  }
+  if (!baseSha) {
+    console.warn(
+      `[codereview] Diff unavailable for PR #${pr.number}: no local merge-base for ${candidates.join(', ')}.`,
+    );
+  }
+
+  let files = pr.files;
+  if (baseSha) {
+    try {
+      const localFiles = await git.diffFiles(cwd, `${baseSha}...${pr.headRefOid}`);
+      const localByPath = new Map(localFiles.map((file) => [file.path, file]));
+      files = pr.files.map((file) => ({
+        ...file,
+        previousPath: localByPath.get(file.path)?.previousPath,
+      }));
+    } catch {
+      // GitHub's file list remains authoritative; only rename metadata is lost.
+    }
+  }
+
+  return {
+    scopeId: `pr-${pr.number}`,
+    label: `PR #${pr.number} · ${pr.title}`,
+    headSha: pr.headRefOid,
+    files,
+    comparison: baseSha ? { baseSha, headSha: pr.headRefOid } : undefined,
+  };
+}
+
 /** PR associated with the current branch (via GitHub CLI). Lists files only. */
 export class PrScope implements ReviewScope {
   async load(cwd: string): Promise<ReviewSet> {
@@ -23,12 +64,7 @@ export class PrScope implements ReviewScope {
     // Use gh's authoritative changed-file list, not a local `git diff` range:
     // on a fork the local `origin/<base>` lags upstream, so the range would
     // include thousands of unrelated files.
-    return {
-      scopeId: `pr-${pr.number}`,
-      label: `PR #${pr.number} · ${pr.title}`,
-      headSha: pr.headRefOid,
-      files: pr.files,
-    };
+    return prReviewSet(cwd, pr);
   }
 }
 
@@ -49,12 +85,7 @@ export class PrByNumberScope implements ReviewScope {
     // Use gh's authoritative changed-file list, not a local `git diff` range:
     // on a fork the local `origin/<base>` lags upstream, so the range would
     // include thousands of unrelated files.
-    return {
-      scopeId: `pr-${pr.number}`,
-      label: `PR #${pr.number} · ${pr.title}`,
-      headSha: pr.headRefOid,
-      files: pr.files,
-    };
+    return prReviewSet(cwd, pr);
   }
 }
 
@@ -66,12 +97,14 @@ export class BranchVsBaseScope implements ReviewScope {
     await git.ensureGitRepo(cwd);
     const base = this.base ?? (await git.detectBaseBranch(cwd));
     const headSha = await git.headSha(cwd);
-    const files = await git.diffFiles(cwd, `${base}...HEAD`);
+    const baseSha = await git.mergeBase(cwd, base, 'HEAD');
+    const files = await git.diffFiles(cwd, `${baseSha}...HEAD`);
     return {
       scopeId: `branch-vs-${base}`,
       label: m().scope.branchVsBase(base),
       headSha,
       files,
+      comparison: { baseSha, headSha },
     };
   }
 }
@@ -87,6 +120,7 @@ export class WorkingTreeScope implements ReviewScope {
       label: m().scope.workingTree,
       headSha,
       files,
+      comparison: { baseSha: headSha, headSha },
     };
   }
 }

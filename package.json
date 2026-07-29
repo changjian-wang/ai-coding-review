@@ -185,6 +185,7 @@
     "vitest": "^2.1.9"
   },
   "dependencies": {
+    "diff": "^9.0.0",
     "highlight.js": "^11.11.1",
     "markdown-it": "^14.2.0"
   }

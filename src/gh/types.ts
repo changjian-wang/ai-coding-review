@@ -9,6 +9,8 @@ export interface PullRequest {
   url: string;
   headRefName: string;
   baseRefName: string;
+  /** Current commit at the PR base ref. */
+  baseRefOid: string;
   /** HEAD commit SHA — review progress is bound to this. */
   headRefOid: string;
   files: ReviewFile[];

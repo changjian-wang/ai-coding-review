@@ -324,6 +324,8 @@ export const zh: Messages = {
 
   documentPanel: {
     title: '文件查看',
+    diffView: 'Diff',
+    fileView: '文件',
     readView: '阅读视图',
     sourceView: '源码视图',
     bilingual: '中英对照',

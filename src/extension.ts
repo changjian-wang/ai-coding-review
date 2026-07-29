@@ -20,18 +20,19 @@ import {
 } from './ai/analyzer';
 import type { Finding, GlobalReport } from './ai/types';
 import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePicker';
-import { FileSystemScope } from './scope/scopes';
-import { currentBranch, listBranches, switchBranchTo } from './scope/gitClient';
+import { FileSystemScope, PrByNumberScope } from './scope/scopes';
+import { currentBranch, listBranches, readFileAtRef, switchBranchTo } from './scope/gitClient';
 import type { ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
-import { DocumentPanel, type DocModel } from './ui/documentPanel';
+import { DocumentPanel, type DocDiffLine, type DocModel } from './ui/documentPanel';
 import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
 import { transientInfo, transientWarning } from './ui/toast';
 import { m, onLanguageChange, resolveLanguage, type Language } from './i18n';
+import { buildFullFileDiff } from './review/fullFileDiff';
 
 let session: ReviewSession;
 const models = new ModelProvider();
@@ -47,6 +48,10 @@ let scopePickInFlight = false;
 let openFileGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
 const docRenderCache = new Map<string, DocumentRender>();
+/** Cached full-file diff rows; invalidated whenever the live head file changes. */
+const docDiffCache = new Map<string, DocDiffLine[]>();
+/** Base snapshots are immutable for a ReviewSet, so each old file is read once. */
+const baseTextCache = new Map<string, string | null>();
 /** Most recently applied Copilot fix per finding: enables one-click revert from any UI. */
 const appliedFixes = new Map<string, { oldText: string; newText: string }>();
 /** Preferred default cwd for the next scope pick (set by openInNewWindow). */
@@ -110,7 +115,8 @@ const LAST_SCOPE_KEY = 'codereview.lastScope.v1';
 /** Persisted descriptor of the last reviewed scope. */
 type PersistedScope =
   | { kind: 'folder'; cwd: string }
-  | { kind: 'files'; cwd: string; relPaths: string[] };
+  | { kind: 'files'; cwd: string; relPaths: string[] }
+  | { kind: 'pr'; cwd: string; number: number };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
 
@@ -797,6 +803,8 @@ async function loadFolderAsReview(cwd: string): Promise<void> {
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
+        docDiffCache.clear();
+        baseTextCache.clear();
         rehydrateAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
@@ -852,6 +860,8 @@ async function startReview(kind?: string): Promise<void> {
         closeScopeBoundPanels();
         workbenchSelected = undefined;
         docRenderCache.clear();
+        docDiffCache.clear();
+        baseTextCache.clear();
         rehydrateAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
@@ -878,9 +888,12 @@ async function startReview(kind?: string): Promise<void> {
  */
 function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): void {
   void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, cwd);
+  const prNumber = Number.parseInt(reviewSet.scopeId.match(/^pr-(\d+)$/)?.[1] ?? '', 10);
   const descriptor: PersistedScope =
     source instanceof FileSystemScope
       ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
+      : Number.isFinite(prNumber)
+        ? { kind: 'pr', cwd, number: prNumber }
       : { kind: 'folder', cwd };
   void workspaceMemento?.update(LAST_SCOPE_KEY, descriptor);
 }
@@ -1151,20 +1164,24 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
  */
 async function restoreLastScope(cwd: string): Promise<void> {
   const descriptor = workspaceMemento?.get<PersistedScope>(LAST_SCOPE_KEY);
-  if (descriptor?.kind === 'files' && descriptor.relPaths.length > 0) {
+  if (descriptor?.kind === 'pr' || (descriptor?.kind === 'files' && descriptor.relPaths.length > 0)) {
     try {
-      const source = new FileSystemScope(descriptor.relPaths);
+      const source = descriptor.kind === 'pr'
+        ? new PrByNumberScope(descriptor.number)
+        : new FileSystemScope(descriptor.relPaths);
       const reviewSet = await source.load(descriptor.cwd);
       await session.start(reviewSet, descriptor.cwd);
       await refreshBranchLabel();
       workbenchSelected = undefined;
       docRenderCache.clear();
+      docDiffCache.clear();
+      baseTextCache.clear();
       rehydrateAppliedFixes();
       WorkbenchPanel.resetFolders();
       layoutAppliedForCurrentReview = false;
       return;
     } catch (err) {
-      console.warn('[codereview] restoreLastScope (files) failed, falling back to folder:', err);
+      console.warn(`[codereview] restoreLastScope (${descriptor.kind}) failed, falling back to folder:`, err);
     }
   }
   await loadFolderAsReview(cwd);
@@ -1346,12 +1363,21 @@ async function openFileInPanel(relPath: string): Promise<void> {
   if (myGeneration !== openFileGeneration) {
     return; // rendering may have yielded; bail before overwriting the panel.
   }
+  const diffLines = await buildDocDiff(relPath, text, render);
+  if (myGeneration !== openFileGeneration) {
+    return;
+  }
+  if (diffLines) {
+    docDiffCache.set(relPath, diffLines);
+  } else {
+    docDiffCache.delete(relPath);
+  }
   session.setTotalLines(relPath, render.totalLines);
   const anchors = await computeFindingAnchors(relPath);
   if (myGeneration !== openFileGeneration) {
     return; // anchoring may have yielded; bail before overwriting the panel.
   }
-  DocumentPanel.show(buildDocModel(relPath, render, anchors), docActions());
+  DocumentPanel.show(buildDocModel(relPath, render, anchors, diffLines), docActions());
   void ensureDocLocalized(relPath);
   // Showing the document beside the workbench just created the second editor
   // group. Apply the narrow-workbench / wide-document split once per review now
@@ -1395,11 +1421,61 @@ function languageIdFor(relPath: string): string {
   return map[ext] ?? ext;
 }
 
+/** Builds syntax-highlighted rows for an uncollapsed base-to-head file diff. */
+async function buildDocDiff(
+  relPath: string,
+  headText: string,
+  headRender: DocumentRender,
+): Promise<DocDiffLine[] | undefined> {
+  const reviewSet = session.reviewSet;
+  const comparison = reviewSet?.comparison;
+  const file = reviewSet?.files.find((candidate) => candidate.path === relPath);
+  const cwd = activeCwd();
+  if (!comparison || !file || !cwd) {
+    return undefined;
+  }
+
+  const basePath = file.previousPath ?? file.path;
+  let baseText: string | undefined;
+  let baseRender: DocumentRender | undefined;
+  if (file.status !== 'added') {
+    const cacheKey = `${comparison.baseSha}:${basePath}`;
+    if (!baseTextCache.has(cacheKey)) {
+      const loaded = await readFileAtRef(cwd, comparison.baseSha, basePath);
+      baseTextCache.set(cacheKey, loaded ?? null);
+    }
+    baseText = baseTextCache.get(cacheKey) ?? undefined;
+    if (baseText === undefined) {
+      return undefined;
+    }
+    baseRender = renderDocument(
+      baseText,
+      languageIdFor(basePath),
+      basePath.split('/').pop() ?? basePath,
+    );
+  }
+
+  const headSideText = file.status === 'deleted' ? undefined : headText;
+  if (baseText?.includes('\0') || headSideText?.includes('\0')) {
+    return undefined;
+  }
+
+  return buildFullFileDiff(baseText, headSideText).map((line) => ({
+    kind: line.kind,
+    oldLine: line.oldLine,
+    newLine: line.newLine,
+    html: line.kind === 'deleted'
+      ? baseRender?.sourceLines[(line.oldLine ?? 1) - 1] ?? ''
+      : headRender.sourceLines[(line.newLine ?? 1) - 1] ?? '',
+  }));
+}
+
 /** Builds the serializable model the document webview renders. */
 function buildDocModel(
   relPath: string,
   render: DocumentRender,
   anchors?: Map<string, { line: number; endLine: number }>,
+  diffLines?: DocDiffLine[],
 ): DocModel {
   const state = session.fileState(relPath);
   const rawLines = deHighlight(render.sourceLines);
@@ -1413,6 +1489,8 @@ function buildDocModel(
     readingHtml: render.readingHtml,
     sourceLines: render.sourceLines,
     raw: rawLines,
+    diffLines,
+    defaultToDiff: !!session.reviewSet?.comparison,
     seen: state?.seenLines ?? [],
     findings: findings.map((f) => {
       const d = session.findingDisposition(relPath, f.id);
@@ -1570,7 +1648,7 @@ async function refreshDocPanel(relPath: string): Promise<void> {
     if (DocumentPanel.currentPath !== relPath) {
       return;
     }
-    DocumentPanel.update(buildDocModel(relPath, render, anchors));
+    DocumentPanel.update(buildDocModel(relPath, render, anchors, docDiffCache.get(relPath)));
     void ensureDocLocalized(relPath);
   }
 }
@@ -1583,21 +1661,28 @@ async function refreshDocPanel(relPath: string): Promise<void> {
 async function reloadDocPanel(relPath: string): Promise<void> {
   if (!isReviewPath(relPath)) {
     docRenderCache.delete(relPath);
+    docDiffCache.delete(relPath);
     return;
   }
   if (DocumentPanel.currentPath !== relPath) {
     docRenderCache.delete(relPath);
+    docDiffCache.delete(relPath);
     return;
   }
   docRenderCache.delete(relPath);
+  docDiffCache.delete(relPath);
   const text = await readReviewFileText(relPath);
   const render = renderFor(relPath, text);
+  const diffLines = await buildDocDiff(relPath, text, render);
+  if (diffLines) {
+    docDiffCache.set(relPath, diffLines);
+  }
   session.setTotalLines(relPath, render.totalLines);
   const anchors = await computeFindingAnchors(relPath);
   if (DocumentPanel.currentPath !== relPath) {
     return;
   }
-  DocumentPanel.update(buildDocModel(relPath, render, anchors));
+  DocumentPanel.update(buildDocModel(relPath, render, anchors, diffLines));
   void ensureDocLocalized(relPath);
 }
 
