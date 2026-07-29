@@ -378,12 +378,18 @@ async function ensureDocLocalized(path: string): Promise<void> {
       if (changedTitle && DocumentPanel.currentPath === path) {
         await refreshDocPanel(path);
       }
+      if (changedTitle) {
+        FixProposalPanel.refreshIfOpen({ kind: 'file', rel: path });
+      }
     }
 
     if (needRestPass) {
       const changedRest = await ensureLocalizedTexts(target, restItems);
       if (changedRest && DocumentPanel.currentPath === path) {
         await refreshDocPanel(path);
+      }
+      if (changedRest) {
+        FixProposalPanel.refreshIfOpen({ kind: 'file', rel: path });
       }
     }
   } finally {
@@ -442,6 +448,7 @@ async function ensureGlobalReportLocalized(report: GlobalReport): Promise<void> 
     }
     const changed = await ensureLocalizedTexts(target, items);
     if (changed && session.globalReport) {
+      FixProposalPanel.refreshIfOpen({ kind: 'global' });
       showGlobalReport();
     }
   } finally {
@@ -981,7 +988,6 @@ async function applyLanguage(id: string): Promise<void> {
   await vscode.workspace
     .getConfiguration('codereview')
     .update('language', id, vscode.ConfigurationTarget.Global);
-  refreshUiForLanguageSwitch();
 }
 
 async function selectLanguage(): Promise<void> {
@@ -1003,7 +1009,6 @@ async function selectLanguage(): Promise<void> {
   await vscode.workspace
     .getConfiguration('codereview')
     .update('language', pick.value, vscode.ConfigurationTarget.Global);
-  refreshUiForLanguageSwitch();
 }
 
 /** Opens (or reveals) the Review Workbench webview. */
@@ -2248,6 +2253,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
+    localizationScope: { kind: 'file', rel },
     cacheKey: fixProposalCacheKey(rel, finding),
     fileUri,
     finding: {
@@ -2256,6 +2262,14 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
       title: displayFinding.title,
       detail: displayFinding.detail,
       suggestion: displayFinding.suggestion,
+    },
+    getDisplayFinding: () => {
+      const [current] = localizeFindingsNow(rel, [finding], resolveLanguage());
+      return {
+        title: current.title,
+        detail: current.detail,
+        suggestion: current.suggestion,
+      };
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();
@@ -2696,6 +2710,7 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   };
   FixProposalPanel.show({
     rel: file,
+    localizationScope: { kind: 'global' },
     cacheKey: `global::${session.getRepoName()}::${file}::${hashString(spotId + spot.title + spot.detail)}`,
     fileUri,
     finding: {
@@ -2704,6 +2719,18 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
       title: localizedSpot.title,
       detail: localizedSpot.detail,
       suggestion: localizedSpot.suggestion,
+    },
+    getDisplayFinding: () => {
+      const report = session.globalReport ?? baseReport;
+      const current = report
+        ? localizeGlobalReportNow(report, resolveLanguage()).fixSpots.find((item) => item.id === spotId)
+        : undefined;
+      const display = current ?? spot;
+      return {
+        title: display.title,
+        detail: display.detail,
+        suggestion: display.suggestion,
+      };
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();

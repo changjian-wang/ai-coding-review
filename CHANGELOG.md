@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PR and other diff-backed reviews now default to an uncollapsed, full-file inline Diff with
   old/new line numbers and added/deleted rows, while retaining a one-click clean-file view.
 
+### Fixed
+
+- Open fix-proposal panels now refresh finding text when the review language changes,
+  including after an asynchronous translation finishes, while preserving the live
+  line number and any in-progress supplementary note.
+- Language changes initiated inside the extension no longer trigger duplicate full UI refreshes.
+
+## [0.4.1] - 2026-07-08
+
+### Added
+
+- Findings, global reports, annotations, and comments now follow the selected review language.
+- Analysis, global-review, and fix-generation flows now use bilingual system prompts.
+
+### Fixed
+
+- Live language switching now refreshes open webviews consistently.
+
+### Changed
+
+- Updated the English and Chinese workbench screenshots in the README files.
+
 ## [0.4.0] - 2026-07-07
 
 ### Added
@@ -99,7 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file-level and cross-file AI analysis, per-finding disposition
   (fix / comment / ignore), and conclusion write-back for PR scopes via the GitHub CLI.
 
-[Unreleased]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.1.5...v0.2.0

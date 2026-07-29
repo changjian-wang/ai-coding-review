@@ -12,13 +12,33 @@ import {
   strictMatches,
 } from '../review/editLocator';
 
+export interface FixProposalFinding {
+  id: string;
+  line: number;
+  title: string;
+  detail: string;
+  suggestion?: string;
+}
+
+export type FixProposalDisplayFinding = Pick<
+  FixProposalFinding,
+  'title' | 'detail' | 'suggestion'
+>;
+
+export type FixProposalLocalizationScope =
+  | { kind: 'file'; rel: string }
+  | { kind: 'global' };
+
 /** Inputs needed to drive the panel. */
 export interface FixProposalRequest {
   rel: string;
+  localizationScope: FixProposalLocalizationScope;
   /** Stable identity for this finding within a review/head/signature. */
   cacheKey: string;
   fileUri: vscode.Uri;
-  finding: { id: string; line: number; title: string; detail: string; suggestion?: string };
+  finding: FixProposalFinding;
+  /** Resolves display-only finding text in the currently selected language. */
+  getDisplayFinding: () => FixProposalDisplayFinding;
   /** Generates a fresh set of proposals against the **current** file content. */
   generate: (token: vscode.CancellationToken, userContext?: string) => Promise<FixProposal[]>;
   /** Called after a proposal is successfully applied (so disposition can flip). */
@@ -99,6 +119,8 @@ export class FixProposalPanel {
   private state: PanelState = { kind: 'loading', message: m().fixPanel.generating };
   private generating?: vscode.CancellationTokenSource;
   private hasNotifiedApplied = false;
+  /** Last resolved live line shown in the header; survives full webview rebuilds. */
+  private displayLine: number;
   /** Reviewer's current supplementary note; steers (re)generation and is persisted per cacheKey. */
   private currentSupplement = '';
   private readonly disposables: vscode.Disposable[] = [];
@@ -107,6 +129,7 @@ export class FixProposalPanel {
     private readonly panel: vscode.WebviewPanel,
     private request: FixProposalRequest,
   ) {
+    this.displayLine = request.finding.line;
     this.panel.webview.html = this.renderHtml();
     this.disposables.push(
       this.panel.webview.onDidReceiveMessage((msg) => void this.onMessage(msg)),
@@ -115,7 +138,7 @@ export class FixProposalPanel {
   }
 
   static show(request: FixProposalRequest): void {
-    const title = `${m().fixPanel.titlePrefix}${request.finding.title}`.slice(0, 60);
+    const title = FixProposalPanel.titleFor(request);
     if (FixProposalPanel.instance) {
       FixProposalPanel.instance.replace(request, title);
       return;
@@ -154,11 +177,28 @@ export class FixProposalPanel {
   }
 
   /** Re-renders the open panel in the current language (after a language switch). */
-  static refreshIfOpen(): void {
+  static refreshIfOpen(scope?: FixProposalLocalizationScope): void {
     const inst = FixProposalPanel.instance;
-    if (inst) {
+    if (inst && (!scope || FixProposalPanel.sameLocalizationScope(inst.request.localizationScope, scope))) {
+      inst.panel.title = FixProposalPanel.titleFor(inst.request);
       inst.panel.webview.html = inst.renderHtml();
     }
+  }
+
+  private static sameLocalizationScope(
+    current: FixProposalLocalizationScope,
+    requested: FixProposalLocalizationScope,
+  ): boolean {
+    return current.kind === requested.kind
+      && (current.kind === 'global' || (requested.kind === 'file' && current.rel === requested.rel));
+  }
+
+  private static displayFinding(request: FixProposalRequest): FixProposalDisplayFinding {
+    return request.getDisplayFinding();
+  }
+
+  private static titleFor(request: FixProposalRequest): string {
+    return `${m().fixPanel.titlePrefix}${FixProposalPanel.displayFinding(request).title}`.slice(0, 60);
   }
 
   /**
@@ -247,6 +287,7 @@ export class FixProposalPanel {
     // instantly if the user navigates back.
     this.snapshotCurrent();
     this.request = request;
+    this.displayLine = request.finding.line;
     this.panel.title = title;
     this.panel.reveal(undefined, false);
     void this.run();
@@ -361,6 +402,10 @@ export class FixProposalPanel {
   }
 
   private async onMessage(msg: { type: string; idx?: number; supplement?: string }): Promise<void> {
+    if (msg.type === 'supplementChanged') {
+      this.currentSupplement = msg.supplement ?? '';
+      return;
+    }
     if (msg.type === 'regenerate') {
       // Capture the reviewer's supplement (may be empty to clear it).
       this.currentSupplement = (msg.supplement ?? '').trim();
@@ -610,13 +655,15 @@ export class FixProposalPanel {
    */
   private async refreshHeader(): Promise<void> {
     const line = await this.computeDisplayLine();
+    this.displayLine = line;
+    const finding = FixProposalPanel.displayFinding(this.request);
     this.panel.webview.postMessage({
       type: 'header',
       rel: this.request.rel,
       line,
-      title: this.request.finding.title,
-      detail: this.request.finding.detail,
-      suggestion: this.request.finding.suggestion ?? '',
+      title: finding.title,
+      detail: finding.detail,
+      suggestion: finding.suggestion ?? '',
     });
   }
 
@@ -688,6 +735,7 @@ export class FixProposalPanel {
     const t = m().fixPanel;
     const T = JSON.stringify(t);
     const lang = resolveLanguage();
+    const finding = FixProposalPanel.displayFinding(this.request);
     return /* html */ `<!DOCTYPE html>
 <html lang="${lang}">
 <head><meta charset="UTF-8"/>
@@ -738,12 +786,12 @@ export class FixProposalPanel {
 <body>
   <header>
     <h2>${escapeHtml(t.heading)}</h2>
-    <span class="sub" id="subline">${escapeHtml(this.request.rel)} · ${escapeHtml(fmt(t.line, this.request.finding.line))}</span>
+    <span class="sub" id="subline">${escapeHtml(this.request.rel)} · ${escapeHtml(fmt(t.line, this.displayLine))}</span>
   </header>
   <div class="finding">
-    <div class="title" id="f-title">${escapeHtml(this.request.finding.title)}</div>
-    <div id="f-detail">${escapeHtml(this.request.finding.detail)}</div>
-    <div class="meta" id="f-suggest"${this.request.finding.suggestion ? '' : ' style="display:none"'}>${this.request.finding.suggestion ? escapeHtml(t.suggestionPrefix) + escapeHtml(this.request.finding.suggestion) : ''}</div>
+    <div class="title" id="f-title">${escapeHtml(finding.title)}</div>
+    <div id="f-detail">${escapeHtml(finding.detail)}</div>
+    <div class="meta" id="f-suggest"${finding.suggestion ? '' : ' style="display:none"'}>${finding.suggestion ? escapeHtml(t.suggestionPrefix) + escapeHtml(finding.suggestion) : ''}</div>
   </div>
   <div class="supplement">
     <label class="supp-label" for="supp">${escapeHtml(t.supplementLabel)}</label>
@@ -765,7 +813,13 @@ export class FixProposalPanel {
     function syncRegenLabel() {
       regenBtn.textContent = (suppEl && suppEl.value.trim()) ? T.regenerateWithSupplement : T.regenerate;
     }
-    if (suppEl) { suppEl.addEventListener('input', syncRegenLabel); syncRegenLabel(); }
+    if (suppEl) {
+      suppEl.addEventListener('input', () => {
+        syncRegenLabel();
+        vscode.postMessage({ type: 'supplementChanged', supplement: suppEl.value });
+      });
+      syncRegenLabel();
+    }
     regenBtn.addEventListener('click', () => vscode.postMessage({ type: 'regenerate', supplement: suppEl ? suppEl.value : '' }));
     document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
 
