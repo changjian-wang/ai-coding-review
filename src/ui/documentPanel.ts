@@ -39,12 +39,15 @@ export interface DocDiffLine {
   kind: 'context' | 'added' | 'deleted';
   oldLine?: number;
   newLine?: number;
-  html: string;
+  /** Deleted rows carry base-side HTML; head-side rows reuse sourceLines. */
+  html?: string;
 }
 
 /** Everything the document webview needs to render one file. */
 export interface DocModel {
   path: string;
+  /** Stable identity of the current source content. */
+  revision: string;
   name: string;
   isMarkdown: boolean;
   readingHtml?: string;
@@ -63,6 +66,36 @@ export interface DocModel {
   analyzing: boolean;
   /** Persisted whole-document translation (rendered reading HTML) for the side-by-side view. */
   translationHtml?: string;
+}
+
+export interface SourceRenderPlan {
+  initial: number;
+  perFrame: number;
+  eager: boolean;
+}
+
+export function shouldCacheSourceDom(
+  totalRows: number,
+  findingCount: number,
+  annotationCount: number,
+): boolean {
+  return totalRows > 0
+    && totalRows <= 30_000
+    && findingCount === 0
+    && annotationCount === 0;
+}
+
+/** Small/medium source files render once, even when an expanded diff has more rows. */
+export function sourceRenderPlan(
+  renderedRows: number,
+  sourceLines = renderedRows,
+): SourceRenderPlan {
+  const eagerSourceLimit = 5000;
+  const eagerRenderedLimit = 12_000;
+  const chunkSize = 600;
+  return sourceLines <= eagerSourceLimit && renderedRows <= eagerRenderedLimit
+    ? { initial: renderedRows, perFrame: 0, eager: true }
+    : { initial: chunkSize, perFrame: chunkSize, eager: false };
 }
 
 /** Actions the document panel triggers in the extension host. */
@@ -94,7 +127,9 @@ export interface DocActions {
 
 type Inbound =
   | { type: 'ready' }
-  | { type: 'seen'; lines: number[] }
+  | { type: 'loaded'; requestId: number; path: string }
+  | { type: 'loadError'; requestId: number; path: string; message?: string }
+  | { type: 'seen'; path: string; lines: number[] }
   | { type: 'translate'; startLine: number; endLine: number; text: string }
   | { type: 'translateWhole' }
   | { type: 'explain'; startLine: number; endLine: number; text: string }
@@ -123,6 +158,10 @@ export class DocumentPanel {
   private readonly disposables: vscode.Disposable[] = [];
   private model?: DocModel;
   private ready = false;
+  private loadSequence = 0;
+  private pendingLoadId = 0;
+  private loadRetryCount = 0;
+  private loadAckTimer?: ReturnType<typeof setTimeout>;
 
   private constructor(panel: vscode.WebviewPanel, private actions: DocActions) {
     this.panel = panel;
@@ -135,8 +174,11 @@ export class DocumentPanel {
     DocumentPanel.prewarm(actions);
     const inst = DocumentPanel.current!;
     inst.actions = actions;
+    if (inst.model?.path !== model.path || inst.model?.revision !== model.revision) {
+      inst.loadRetryCount = 0;
+    }
     inst.model = model;
-    inst.panel.title = `📄 ${model.name}`;
+    inst.panel.title = `⏳ ${model.name}`;
     inst.panel.reveal(undefined, true);
     if (inst.ready) {
       inst.post();
@@ -173,12 +215,42 @@ export class DocumentPanel {
     }
   }
 
+  /** Adds a computed diff without retransmitting the rest of the document model. */
+  static setDiff(path: string, diffLines: DocDiffLine[], activate: boolean): void {
+    const inst = DocumentPanel.current;
+    if (!inst || inst.model?.path !== path) {
+      return;
+    }
+    inst.model = {
+      ...inst.model,
+      diffLines,
+      defaultToDiff: activate || inst.model.defaultToDiff,
+    };
+    if (inst.ready) {
+      void inst.panel.webview.postMessage({ type: 'diffReady', path, diffLines, activate });
+    }
+  }
+
   static get currentPath(): string | undefined {
     return DocumentPanel.current?.model?.path;
   }
 
   static get isOpen(): boolean {
     return !!DocumentPanel.current;
+  }
+
+  static beginLoading(path: string): void {
+    const inst = DocumentPanel.current;
+    if (inst) {
+      inst.panel.title = `⏳ ${path.split('/').pop() ?? path}`;
+    }
+  }
+
+  static restoreTitle(): void {
+    const inst = DocumentPanel.current;
+    if (inst?.model) {
+      inst.panel.title = `📄 ${inst.model.name}`;
+    }
   }
 
   /** The editor column the document view occupies, if open. Lets companion
@@ -275,8 +347,43 @@ export class DocumentPanel {
 
   private post(): void {
     if (this.model) {
-      void this.panel.webview.postMessage({ type: 'load', model: this.model });
+      const requestId = ++this.loadSequence;
+      this.pendingLoadId = requestId;
+      if (this.loadAckTimer) {
+        clearTimeout(this.loadAckTimer);
+      }
+      this.loadAckTimer = setTimeout(() => this.recoverLoad(requestId), 4000);
+      void this.panel.webview.postMessage({
+        type: 'load',
+        requestId,
+        model: this.model,
+      }).then((sent) => {
+        if (!sent) {
+          this.recoverLoad(requestId);
+        }
+      });
     }
+  }
+
+  private recoverLoad(requestId: number): void {
+    if (requestId !== this.pendingLoadId || !this.model) {
+      return;
+    }
+    if (this.loadAckTimer) {
+      clearTimeout(this.loadAckTimer);
+      this.loadAckTimer = undefined;
+    }
+    if (this.loadRetryCount < 1) {
+      this.loadRetryCount++;
+      this.ready = false;
+      this.panel.webview.html = this.shell();
+      return;
+    }
+    this.pendingLoadId = 0;
+    this.panel.title = `⚠ ${this.model.name}`;
+    void vscode.window.showWarningMessage(
+      m().documentPanel.loadFailed.replace('{0}', this.model.name),
+    );
   }
 
   private handle(m: Inbound): void {
@@ -291,13 +398,34 @@ export class DocumentPanel {
       this.post();
       return;
     }
+    if (m.type === 'loaded') {
+      if (m.requestId === this.pendingLoadId && this.model?.path === m.path) {
+        if (this.loadAckTimer) {
+          clearTimeout(this.loadAckTimer);
+          this.loadAckTimer = undefined;
+        }
+        this.pendingLoadId = 0;
+        this.loadRetryCount = 0;
+        this.panel.title = `📄 ${this.model.name}`;
+      }
+      return;
+    }
+    if (m.type === 'loadError') {
+      if (m.requestId === this.pendingLoadId) {
+        console.warn('[codereview] document load failed:', m.path, m.message ?? 'unknown error');
+        this.recoverLoad(m.requestId);
+      }
+      return;
+    }
     const path = this.model?.path;
     if (!path) {
       return;
     }
     switch (m.type) {
       case 'seen':
-        this.actions.seen(path, m.lines);
+        if (m.path === path) {
+          this.actions.seen(path, m.lines);
+        }
         break;
       case 'translate':
         this.actions.translate(path, m.startLine, m.endLine, m.text);
@@ -348,6 +476,10 @@ export class DocumentPanel {
   }
 
   private dispose(): void {
+    if (this.loadAckTimer) {
+      clearTimeout(this.loadAckTimer);
+      this.loadAckTimer = undefined;
+    }
     DocumentPanel.current = undefined;
     for (const d of this.disposables) {
       d.dispose();
@@ -461,7 +593,8 @@ export class DocumentPanel {
 
   /* Source view */
   .src { font-family:var(--vscode-editor-font-family, monospace); font-size:var(--vscode-editor-font-size, 13px); padding:6px 0 40vh; }
-  .ln { display:flex; align-items:flex-start; padding:0 12px 0 0; white-space:pre; position:relative; }
+  .ln { display:flex; align-items:flex-start; padding:0 12px 0 0; white-space:pre; position:relative;
+    content-visibility:auto; contain:layout style paint; contain-intrinsic-block-size:18px; }
   .ln:hover { background:rgba(127,127,127,.06); }
   .gutter { flex:none; width:52px; text-align:right; padding-right:12px; color:var(--dim); user-select:none; opacity:.6; }
   .ln.seen .gutter { color:var(--green); opacity:1; }
@@ -686,6 +819,8 @@ const vscode = acquireVsCodeApi();
 const T = ${JSON.stringify(t)};
 const SEV = ${JSON.stringify(m().severity)};
 const DISP = ${JSON.stringify(m().disposition)};
+const sourceRenderPlan = ${sourceRenderPlan.toString()};
+const shouldCacheSourceDom = ${shouldCacheSourceDom.toString()};
 const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i)] ?? '');
 let model = null;
 let loadedPath = null;
@@ -698,6 +833,13 @@ let seenTimer = null;
 // Persistent 「定位」 highlight: stays lit until you locate elsewhere or switch
 // files, instead of flashing and fading. Re-applied after every source render.
 let locatedRange = null;
+const sourceDomCache = new Map();
+let sourceDomCacheRows = 0;
+const SOURCE_DOM_CACHE_MAX_ENTRIES = 4;
+const SOURCE_DOM_CACHE_MAX_ROWS = 30000;
+let pendingDocumentLoad = null;
+let pendingDocumentLoadRaf = 0;
+let latestDocumentLoadId = 0;
 
 const $ = (id) => document.getElementById(id);
 const contentEl = $('content');
@@ -884,23 +1026,79 @@ function showingDiff() {
   return displayMode === 'diff' && model && Array.isArray(model.diffLines);
 }
 
+function sourceCacheKey() {
+  return model.path + '\u0000' + model.revision + '\u0000' + (showingDiff() ? 'diff' : 'file');
+}
+
+function takeSourceDom(key) {
+  const entry = sourceDomCache.get(key);
+  if (!entry) return null;
+  sourceDomCache.delete(key);
+  sourceDomCacheRows -= entry.rows;
+  return entry;
+}
+
+function cacheCompletedSource(ctx) {
+  if (!ctx || !ctx.cacheable || ctx.i < ctx.total || !ctx.wrap) return;
+  const previous = sourceDomCache.get(ctx.cacheKey);
+  if (previous) {
+    sourceDomCache.delete(ctx.cacheKey);
+    sourceDomCacheRows -= previous.rows;
+  }
+  sourceDomCache.set(ctx.cacheKey, {
+    key: ctx.cacheKey,
+    path: ctx.path,
+    revision: ctx.revision,
+    view: ctx.view,
+    rows: ctx.total,
+    wrap: ctx.wrap,
+  });
+  sourceDomCacheRows += ctx.total;
+  while (
+    sourceDomCache.size > SOURCE_DOM_CACHE_MAX_ENTRIES
+    || sourceDomCacheRows > SOURCE_DOM_CACHE_MAX_ROWS
+  ) {
+    const oldestKey = sourceDomCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldest = sourceDomCache.get(oldestKey);
+    sourceDomCache.delete(oldestKey);
+    sourceDomCacheRows -= oldest ? oldest.rows : 0;
+  }
+}
+
+function pruneSourceDomCache(nextModel) {
+  for (const [key, entry] of sourceDomCache) {
+    const staleRevision = entry.path === nextModel.path && entry.revision !== nextModel.revision;
+    const staleCards = entry.path === nextModel.path
+      && ((nextModel.findings || []).length > 0 || (nextModel.annotations || []).length > 0);
+    if (staleRevision || staleCards) {
+      sourceDomCache.delete(key);
+      sourceDomCacheRows -= entry.rows;
+    }
+  }
+}
+
 function buildSourceRow(i, marksByLine, cardsByLine, annosByLine, frag) {
   const diffLine = showingDiff() ? model.diffLines[i] : null;
   const lineNo = diffLine ? (diffLine.newLine || 0) : i + 1;
   const row = document.createElement('div');
   row.className = 'ln'
     + (diffLine ? ' diff-row diff-' + diffLine.kind : '')
-    + (lineNo > 0 && seen.has(lineNo) ? ' seen' : '');
+    + (lineNo > 0 && seen.has(lineNo) ? ' seen' : '')
+    + (lineNo > 0 && locatedRange && lineNo >= locatedRange.start && lineNo <= locatedRange.end ? ' locate-hit' : '');
   if (lineNo > 0) row.dataset.line = String(lineNo);
   const ms = lineNo > 0 ? marksByLine[lineNo] : null;
   const fmark = ms ? '<span class="fmark ' + ms[0].severity + '" title="' + ms.map(x=>x.title.replace(/"/g,'')).join(' / ') + '"></span>' : '';
   if (diffLine) {
     const sign = diffLine.kind === 'added' ? '+' : diffLine.kind === 'deleted' ? '−' : '';
+    const codeHtml = diffLine.kind === 'deleted'
+      ? (diffLine.html || '')
+      : (model.sourceLines[(diffLine.newLine || 1) - 1] || '');
     row.innerHTML = fmark
       + '<span class="diff-sign">' + sign + '</span>'
       + '<span class="gutter old">' + (diffLine.oldLine || '') + '</span>'
       + '<span class="gutter new">' + (diffLine.newLine || '') + '</span>'
-      + '<span class="code">' + (diffLine.html || '\\u200b') + '</span>';
+      + '<span class="code">' + (codeHtml || '\u200b') + '</span>';
   } else {
     row.innerHTML = fmark + '<span class="gutter">' + lineNo + '</span><span class="code">' + (model.sourceLines[i] || '\\u200b') + '</span>';
   }
@@ -920,8 +1118,7 @@ function findingAnchorLine(f) {
 
 function renderSource() {
   mode = 'source';
-  // Cancel any in-flight incremental render from a previous file/mode switch.
-  if (srcCtx && srcCtx.raf) cancelAnimationFrame(srcCtx.raf);
+  disposeSourceRender();
   const marksByLine = {};
   const cardsByLine = {};
   for (const f of model.findings) {
@@ -936,27 +1133,89 @@ function renderSource() {
     else { footAnnos.push(a); }
   }
 
-  const wrap = document.createElement('div');
-  wrap.className = 'src';
-  contentEl.innerHTML = '';
-  contentEl.appendChild(wrap);
-
   const headTotal = model.sourceLines.length;
   const total = showingDiff() ? model.diffLines.length : headTotal;
+  const cacheKey = sourceCacheKey();
+  const cacheable = shouldCacheSourceDom(
+    total,
+    model.findings.length,
+    model.annotations.length,
+  );
 
-  // One shared observer; rows are observed as they are appended per chunk.
   if (io) io.disconnect();
   visible.clear();
+  // One shared observer; rows are observed as they are appended per chunk.
   io = new IntersectionObserver((entries) => {
     for (const e of entries) {
       const ln = Number(e.target.dataset.line);
       if (e.isIntersecting) visible.add(ln); else visible.delete(ln);
     }
     clearTimeout(seenTimer);
-    seenTimer = setTimeout(flushSeen, 300);
+    seenTimer = setTimeout(flushSeen, 500);
   }, { root: contentEl, threshold: 0.5 });
 
-  const ctx = { i: 0, total, wrap, footDone: false, raf: 0, renderChunk: null };
+  const cached = cacheable ? takeSourceDom(cacheKey) : null;
+  if (cached) {
+    contentEl.innerHTML = '';
+    contentEl.appendChild(cached.wrap);
+    const ctx = {
+      i: total,
+      total,
+      wrap: cached.wrap,
+      footDone: true,
+      raf: 0,
+      renderChunk: () => {},
+      cacheKey,
+      cacheable,
+      path: model.path,
+      revision: model.revision,
+      view: showingDiff() ? 'diff' : 'file',
+      hydrateRaf: 0,
+    };
+    srcCtx = ctx;
+    const rows = [...cached.wrap.querySelectorAll('.ln[data-line]')];
+    let rowIndex = 0;
+    const hydrate = () => {
+      if (srcCtx !== ctx) return;
+      const stop = Math.min(rowIndex + 500, rows.length);
+      for (; rowIndex < stop; rowIndex++) {
+        const row = rows[rowIndex];
+        const line = Number(row.dataset.line);
+        row.classList.toggle('seen', seen.has(line));
+        row.classList.toggle(
+          'locate-hit',
+          !!locatedRange && line >= locatedRange.start && line <= locatedRange.end,
+        );
+        io.observe(row);
+      }
+      if (rowIndex < rows.length) {
+        ctx.hydrateRaf = requestAnimationFrame(hydrate);
+      } else {
+        ctx.hydrateRaf = 0;
+      }
+    };
+    ctx.hydrateRaf = requestAnimationFrame(hydrate);
+    return;
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = 'src';
+  contentEl.innerHTML = '';
+  contentEl.appendChild(wrap);
+
+  const ctx = {
+    i: 0,
+    total,
+    wrap,
+    footDone: false,
+    raf: 0,
+    renderChunk: null,
+    cacheKey,
+    cacheable,
+    path: model.path,
+    revision: model.revision,
+    view: showingDiff() ? 'diff' : 'file',
+  };
   srcCtx = ctx;
 
   function appendFoot() {
@@ -990,16 +1249,24 @@ function renderSource() {
     if (ctx.i >= total) appendFoot();
   };
 
-  // Render the first chunk synchronously (instant paint; small files finish
-  // here), then stream the remainder across animation frames so the webview
-  // never freezes on large files.
-  const CHUNK = 600;
-  ctx.renderChunk(CHUNK);
+  // Typical source files render completely in one pass, eliminating delayed
+  // rows during scrolling. Only very large files stream in bounded chunks.
+  const plan = sourceRenderPlan(total, headTotal);
+  ctx.renderChunk(plan.initial);
   function step() {
     ctx.raf = 0;
-    if (ctx.i < total) { ctx.renderChunk(CHUNK); ctx.raf = requestAnimationFrame(step); }
+    if (ctx.i < total) { ctx.renderChunk(plan.perFrame); ctx.raf = requestAnimationFrame(step); }
   }
   if (ctx.i < total) ctx.raf = requestAnimationFrame(step);
+}
+
+function disposeSourceRender() {
+  if (!srcCtx) return;
+  if (srcCtx.raf) cancelAnimationFrame(srcCtx.raf);
+  if (srcCtx.hydrateRaf) cancelAnimationFrame(srcCtx.hydrateRaf);
+  cacheCompletedSource(srcCtx);
+  if (srcCtx.dispose) srcCtx.dispose();
+  srcCtx = null;
 }
 
 /** Forces synchronous rendering up to (and including) a 1-based line, for locate/scrollTo. */
@@ -1019,7 +1286,7 @@ function renderReading() {
   // wrap and observing stale rows with the NEW IntersectionObserver — which
   // corrupted state and froze file switching after repeated source/reading
   // toggling (only a panel close/reopen recovered).
-  if (srcCtx && srcCtx.raf) { cancelAnimationFrame(srcCtx.raf); srcCtx.raf = 0; }
+  disposeSourceRender();
   if (io) { io.disconnect(); visible.clear(); }
   const cols = document.createElement('div');
   cols.className = 'reading-cols' + (bilingual ? ' bi' : '');
@@ -1071,7 +1338,7 @@ function renderReading() {
         if (r) for (let l = r[0]; l <= r[1]; l++) visible.add(l);
       }
       clearTimeout(seenTimer);
-      seenTimer = setTimeout(flushSeen, 300);
+      seenTimer = setTimeout(flushSeen, 500);
     }, { root: contentEl, threshold: 0.3 });
     for (const b of blocks) io.observe(b);
   }
@@ -1086,7 +1353,7 @@ function flushSeen() {
     const row = contentEl.querySelector('.ln[data-line="' + l + '"]');
     if (row) row.classList.add('seen');
   }
-  vscode.postMessage({ type:'seen', lines: fresh });
+  vscode.postMessage({ type:'seen', path:model.path, lines: fresh });
 }
 
 function render() {
@@ -1151,6 +1418,7 @@ function setMode(m, resetScroll) {
   // Preserve scroll position when merely toggling the view mode; jump to the
   // top when loading a different file (resetScroll).
   const top = resetScroll ? 0 : contentEl.scrollTop;
+  if (resetScroll) contentEl.scrollTop = 0;
   if (!showingDiff() && m === 'reading' && model.isMarkdown) renderReading(); else renderSource();
   contentEl.scrollTop = top;
   // A full source re-render drops per-row classes, so re-paint the persistent
@@ -1314,14 +1582,62 @@ function flashDocNotice(message, kind, ms) {
   docNoticeTimer = setTimeout(() => { el.hidden = true; docNoticeTimer = 0; }, ms || 4000);
 }
 
+function queueDocumentLoad(msg) {
+  latestDocumentLoadId = msg.requestId;
+  pendingDocumentLoad = msg;
+  $('fname').textContent = msg.model.name;
+  if (!pendingDocumentLoadRaf) {
+    pendingDocumentLoadRaf = requestAnimationFrame(flushDocumentLoad);
+  }
+}
+
+function flushDocumentLoad() {
+  pendingDocumentLoadRaf = 0;
+  const pending = pendingDocumentLoad;
+  pendingDocumentLoad = null;
+  if (!pending || pending.requestId !== latestDocumentLoadId) return;
+  try {
+    hideAiBusy();
+    disposeSourceRender();
+    pruneSourceDomCache(pending.model);
+    model = pending.model;
+    docTrHtml = model.translationHtml || '';
+    render();
+    requestAnimationFrame(() => {
+      if (pending.requestId === latestDocumentLoadId) {
+        vscode.postMessage({ type:'loaded', requestId:pending.requestId, path:model.path });
+      }
+    });
+  } catch (error) {
+    vscode.postMessage({
+      type:'loadError',
+      requestId:pending.requestId,
+      path:pending.model.path,
+      message:String(error && error.message ? error.message : error),
+    });
+  }
+}
+
 window.addEventListener('message', (ev) => {
   const msg = ev.data;
   if (msg.type === 'load') {
-    hideAiBusy();
-    model = msg.model;
-    // Seed the cached whole-doc translation so re-opening shows it instantly.
-    docTrHtml = model.translationHtml || '';
-    render();
+    queueDocumentLoad(msg);
+  }
+  else if (msg.type === 'diffReady' && pendingDocumentLoad?.model.path === msg.path) {
+    pendingDocumentLoad.model.diffLines = msg.diffLines;
+    if (msg.activate) pendingDocumentLoad.model.defaultToDiff = true;
+  }
+  else if (msg.type === 'diffReady' && model && model.path === msg.path) {
+    for (const [key, entry] of sourceDomCache) {
+      if (entry.path === msg.path && entry.view === 'diff') {
+        sourceDomCache.delete(key);
+        sourceDomCacheRows -= entry.rows;
+      }
+    }
+    model.diffLines = msg.diffLines;
+    if (msg.activate) displayMode = 'diff';
+    updateViewControls();
+    if (displayMode === 'diff') setMode('source', false);
   }
   else if (msg.type === 'wholeTranslation') {
     const col = document.getElementById('readingTr');

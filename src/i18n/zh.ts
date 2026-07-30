@@ -14,8 +14,8 @@ export const zh: Messages = {
   statusBar: {
     loading: 'AI Coding Review 加载中…',
     loadingTooltip: 'AI Coding Review 正在加载，请稍候…',
-    opening: '正在打开 AI Coding Review…',
-    openingTooltip: 'AI Coding Review 正在打开审查工作台，请稍候…',
+    opening: 'AI Coding Review 正在加载项目…',
+    openingTooltip: 'AI Coding Review 正在扫描项目并准备审查，请稍候…',
     ready: 'Open in AI Coding Review',
     readyTooltip: 'AI Coding Review：在独立窗口中打开审查工作台（可在窗口内选择审查范围）',
   },
@@ -201,6 +201,16 @@ export const zh: Messages = {
     pickTitle: 'AI Coding Review · 选择审查范围',
     pickPlaceholder: '挑选要纳入审查的源码（本地文件/文件夹 或 当前分支的 PR）',
     scanning: 'AI Coding Review：正在扫描项目文件…',
+    checkingCurrentPr: '正在查找当前分支关联的 PR…',
+    checkingBranchChanges: '正在检查当前分支已提交的改动…',
+    checkingWorkingTree: '正在检查未提交的改动…',
+    preferredScopeFound: (label, files) =>
+      `使用 ${label} · ${files.toLocaleString('zh-CN')} 个改动文件`,
+    noPreferredChanges: '没有发现改动文件，请选择文件或目录开始审查。',
+    scanProgress: (directories, files) =>
+      `已扫描 ${directories.toLocaleString('zh-CN')} 个目录 · 已发现 ${files.toLocaleString('zh-CN')} 个可审查文件`,
+    preparingReview: (files) =>
+      `正在为 ${files.toLocaleString('zh-CN')} 个文件准备审查状态…`,
     noFiles:
       '当前项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
     branchVsBase: (base) => `当前分支 vs ${base}`,
@@ -254,6 +264,15 @@ export const zh: Messages = {
 
   workbench: {
     title: 'AI Coding Review · 工作台',
+    loadingTitle: '正在加载 AI Coding Review',
+    loadingInitial: '正在恢复上次的审查…',
+    loadingSavedScope: '正在加载上次的审查范围…',
+    loadingOpening: '正在构建审查工作台…',
+    loadingStageScan: '发现文件',
+    loadingStageRestore: '恢复进度',
+    loadingStageOpen: '打开工作台',
+    loadingEta: '预计剩余 {0}',
+    loadingElapsed: '已用时 {0}',
     emptyTitle: 'AI Coding Review · 工作台',
     emptyDesc: '选择要审查的范围（本地文件 / 文件夹，或当前分支的 PR），开始一次审查。',
     emptyButton: '选择审查范围…',
@@ -324,6 +343,7 @@ export const zh: Messages = {
 
   documentPanel: {
     title: '文件查看',
+    loadFailed: '无法显示 {0}，文件查看器未响应。',
     diffView: 'Diff',
     fileView: '文件',
     readView: '阅读视图',

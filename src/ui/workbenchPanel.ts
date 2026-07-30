@@ -39,6 +39,8 @@ export interface WorkbenchFinding {
 export interface WorkbenchState {
   /** True when a review has been started and we have a review set loaded. */
   hasReviewSet: boolean;
+  /** Changes only when the review file set is replaced. */
+  structureVersion: number;
   label: string;
   files: WorkbenchFile[];
   selected?: string;
@@ -147,6 +149,16 @@ interface WorkbenchPatchSnapshot {
   conclusion?: WorkbenchState['conclusion'];
 }
 
+interface FolderMetric {
+  seen: number;
+  ready: number;
+  filesTotal: number;
+}
+
+type WorkbenchStateProvider = (
+  changedPaths?: ReadonlySet<string>,
+) => WorkbenchState;
+
 type InboundMessage =
   | { type: 'select'; path: string }
   | { type: 'openFocus'; path: string }
@@ -177,6 +189,7 @@ type InboundMessage =
  */
 export class WorkbenchPanel {
   private static current?: WorkbenchPanel;
+  private static extensionUri?: vscode.Uri;
   /** Folder expand/collapse state, kept static so it survives panel close/reopen. */
   private static readonly expandedFolders = new Set<string>();
   private static folderInit = false;
@@ -188,16 +201,21 @@ export class WorkbenchPanel {
     return WorkbenchPanel.expandedFolders;
   }
   private refreshTimer?: ReturnType<typeof setTimeout>;
+  private readonly pendingChangedPaths = new Set<string>();
   /** Whether the full HTML shell has been rendered at least once into the live webview. */
   private rendered = false;
   /** Signature of the file set last rendered as full HTML; a change forces a full rebuild. */
   private lastStructureSig?: string;
   /** Last dynamic snapshot used to compute incremental tree / HUD patches. */
   private lastSnapshot?: WorkbenchPatchSnapshot;
+  private treeRoot?: TreeNode;
+  private readonly fileIndexByPath = new Map<string, number>();
+  private readonly folderAncestorsByFile = new Map<string, string[]>();
+  private readonly folderMetrics = new Map<string, FolderMetric>();
 
   private constructor(
     panel: vscode.WebviewPanel,
-    private readonly getState: () => WorkbenchState,
+    private readonly getState: WorkbenchStateProvider,
     private readonly actions: WorkbenchActions,
   ) {
     this.panel = panel;
@@ -209,7 +227,11 @@ export class WorkbenchPanel {
     );
   }
 
-  static show(getState: () => WorkbenchState, actions: WorkbenchActions): WorkbenchPanel {
+  static init(extensionUri: vscode.Uri): void {
+    WorkbenchPanel.extensionUri = extensionUri;
+  }
+
+  static show(getState: WorkbenchStateProvider, actions: WorkbenchActions): WorkbenchPanel {
     if (WorkbenchPanel.current) {
       WorkbenchPanel.current.refresh();
       // Pass `undefined` to keep the panel in its current view column / window
@@ -237,7 +259,7 @@ export class WorkbenchPanel {
    */
   static adopt(
     panel: vscode.WebviewPanel,
-    getState: () => WorkbenchState,
+    getState: WorkbenchStateProvider,
     actions: WorkbenchActions,
   ): WorkbenchPanel {
     WorkbenchPanel.current?.panel.dispose();
@@ -247,6 +269,51 @@ export class WorkbenchPanel {
     instance.refresh();
     void instance.applyFocusedMode();
     return instance;
+  }
+
+  /** Creates the temporary workbench panel used while the first project loads. */
+  static createLoading(
+    initialMessage: string,
+    initialStage: WorkbenchLoadStage = 'scan',
+  ): {
+    panel: vscode.WebviewPanel;
+    progress: WorkbenchProgressReporter;
+  } {
+    const mediaRoot = WorkbenchPanel.extensionUri
+      ? [vscode.Uri.joinPath(WorkbenchPanel.extensionUri, 'media')]
+      : undefined;
+    const panel = vscode.window.createWebviewPanel(
+      'codereview.workbench',
+      m().workbench.title,
+      vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: mediaRoot },
+    );
+    return {
+      panel,
+      progress: WorkbenchPanel.showLoading(panel, initialMessage, initialStage),
+    };
+  }
+
+  /**
+   * Paints a webview immediately while its review scope is built or restored.
+   * Without this shell a first open has no visible page, and a restored editor
+   * frame remains black, for the entire repository scan.
+   */
+  static showLoading(
+    panel: vscode.WebviewPanel,
+    initialMessage: string,
+    initialStage: WorkbenchLoadStage = 'restore',
+  ): WorkbenchProgressReporter {
+    const mediaRoot = WorkbenchPanel.extensionUri
+      ? [vscode.Uri.joinPath(WorkbenchPanel.extensionUri, 'media')]
+      : undefined;
+    panel.webview.options = { enableScripts: true, localResourceRoots: mediaRoot };
+    panel.webview.html = WorkbenchPanel.renderLoading(panel, initialMessage, initialStage);
+    return {
+      report: (message, stage, metrics) => {
+        void panel.webview.postMessage({ type: 'loadingProgress', message, stage, metrics });
+      },
+    };
   }
 
   static get isOpen(): boolean {
@@ -265,8 +332,8 @@ export class WorkbenchPanel {
   }
 
   /** Re-renders the panel from current session state, if open. */
-  static refreshIfOpen(): void {
-    WorkbenchPanel.current?.scheduleRefresh();
+  static refreshIfOpen(filePath?: string): void {
+    WorkbenchPanel.current?.scheduleRefresh(filePath);
   }
 
   /** Reveals the workbench and moves keyboard focus into its file tree. */
@@ -348,35 +415,45 @@ export class WorkbenchPanel {
    * Coalesces bursts of progress events (e.g. markSeen firing per scroll) into a
    * single re-render so the webview is not rebuilt dozens of times per second.
    */
-  private scheduleRefresh(): void {
+  private scheduleRefresh(filePath?: string): void {
+    if (filePath) {
+      this.pendingChangedPaths.add(filePath);
+    }
     if (this.refreshTimer) {
       return;
     }
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
-      this.refresh();
+      const changedPaths = new Set(this.pendingChangedPaths);
+      this.pendingChangedPaths.clear();
+      this.refresh(changedPaths);
     }, 80);
   }
 
-  refresh(): void {
+  refresh(changedPaths?: ReadonlySet<string>): void {
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
-    const state = this.getState();
-    const sig = state.hasReviewSet ? structureSig(state.files) : '__empty__';
+    const state = this.getState(changedPaths);
+    const sig = state.hasReviewSet ? String(state.structureVersion) : '__empty__';
     // Hot path: while the file set is unchanged (the common case during a
     // review — only progress / findings / selection change), patch the live
     // DOM in place via postMessage instead of reassigning `webview.html`, which
     // would force a full reload + re-parse + relayout of thousands of nodes.
     if (this.rendered && sig === this.lastStructureSig && state.hasReviewSet) {
-      void this.panel.webview.postMessage({ type: 'patch', ...this.computePatch(state) });
+      void this.panel.webview.postMessage({
+        type: 'patch',
+        ...this.computePatch(state, changedPaths),
+      });
       return;
     }
+    const root = compactTree(buildTree(state.files));
+    this.indexStructure(state, root);
     this.lastStructureSig = sig;
     this.rendered = true;
-    this.lastSnapshot = snapshotFor(state);
-    this.panel.webview.html = this.render(state);
+    this.lastSnapshot = snapshotFor(state, root);
+    this.panel.webview.html = this.render(state, root);
   }
 
   /**
@@ -390,17 +467,57 @@ export class WorkbenchPanel {
       this.refreshTimer = undefined;
     }
     const state = this.getState();
-    this.lastStructureSig = state.hasReviewSet ? structureSig(state.files) : '__empty__';
+    const root = compactTree(buildTree(state.files));
+    this.indexStructure(state, root);
+    this.lastStructureSig = state.hasReviewSet ? String(state.structureVersion) : '__empty__';
     this.rendered = true;
-    this.lastSnapshot = snapshotFor(state);
-    this.panel.webview.html = this.render(state);
+    this.lastSnapshot = snapshotFor(state, root);
+    this.panel.webview.html = this.render(state, root);
+  }
+
+  private indexStructure(state: WorkbenchState, root: TreeNode): void {
+    this.treeRoot = root;
+    this.fileIndexByPath.clear();
+    state.files.forEach((file, index) => this.fileIndexByPath.set(file.path, index));
+    this.folderAncestorsByFile.clear();
+    this.folderMetrics.clear();
+
+    const walk = (node: TreeNode, ancestors: string[]): void => {
+      if (node.kind === 'file' && node.file) {
+        this.folderAncestorsByFile.set(node.file.path, ancestors);
+        return;
+      }
+      const nextAncestors = node.fullPath ? [...ancestors, node.fullPath] : ancestors;
+      if (node.fullPath) {
+        const stats = node.stats ?? {
+          seen: 0,
+          total: 0,
+          ready: 0,
+          filesTotal: 0,
+          findings: 0,
+          unconfirmed: 0,
+        };
+        this.folderMetrics.set(node.fullPath, {
+          seen: stats.seen,
+          ready: stats.ready,
+          filesTotal: stats.filesTotal,
+        });
+      }
+      for (const child of node.children ?? []) {
+        walk(child, nextAncestors);
+      }
+    };
+    walk(root, []);
   }
 
   /**
    * Computes the minimal dynamic delta while the file-tree structure stays the
    * same: changed file rows, changed folder rollups, and footer/toolbar state.
    */
-  private computePatch(state: WorkbenchState): {
+  private computePatch(
+    state: WorkbenchState,
+    changedPaths?: ReadonlySet<string>,
+  ): {
     files: FilePatch[];
     folders: FolderPatch[];
     selected?: string;
@@ -413,10 +530,10 @@ export class WorkbenchPanel {
     tokenUsage?: WorkbenchState['tokenUsage'];
     conclusion?: WorkbenchState['conclusion'];
   } {
-    const next = snapshotFor(state);
     const prev = this.lastSnapshot;
-    this.lastSnapshot = next;
     if (!prev) {
+      const next = snapshotFor(state, this.treeRoot);
+      this.lastSnapshot = next;
       return {
         files: [...next.files.values()],
         folders: [...next.folders.values()],
@@ -432,31 +549,73 @@ export class WorkbenchPanel {
       };
     }
     const files: FilePatch[] = [];
-    for (const [path, patch] of next.files) {
+    const changedFolders = new Set<string>();
+    for (const path of changedPaths ?? []) {
+      const index = this.fileIndexByPath.get(path);
+      const file = index === undefined ? undefined : state.files[index];
+      if (!file) {
+        continue;
+      }
+      const patch = filePatchOf(file);
       const before = prev.files.get(path);
       if (!before || !sameFilePatch(before, patch)) {
         files.push(patch);
+        prev.files.set(path, patch);
+        const readyDelta = Number(patch.ready) - Number(before?.ready ?? false);
+        const seenDelta = patch.seen - (before?.seen ?? 0);
+        for (const folderPath of this.folderAncestorsByFile.get(path) ?? []) {
+          const metric = this.folderMetrics.get(folderPath);
+          if (metric) {
+            metric.ready += readyDelta;
+            metric.seen += seenDelta;
+            changedFolders.add(folderPath);
+          }
+        }
       }
     }
     const folders: FolderPatch[] = [];
-    for (const [path, patch] of next.folders) {
+    for (const path of changedFolders) {
+      const metric = this.folderMetrics.get(path);
+      if (!metric) {
+        continue;
+      }
+      const patch: FolderPatch = {
+        path,
+        dotClass: metric.filesTotal > 0 && metric.ready === metric.filesTotal
+          ? 'done'
+          : metric.ready > 0 || metric.seen > 0
+            ? 'partial'
+            : 'none',
+        ready: metric.ready,
+        filesTotal: metric.filesTotal,
+      };
       const before = prev.folders.get(path);
       if (!before || !sameFolderPatch(before, patch)) {
         folders.push(patch);
+        prev.folders.set(path, patch);
       }
     }
+    prev.selected = state.selected;
+    prev.coverage = state.coverage;
+    prev.gatePassed = state.gatePassed;
+    prev.globalDone = state.globalDone;
+    prev.hasGlobalReport = state.hasGlobalReport;
+    prev.modelLabel = state.modelLabel;
+    prev.branch = state.branch;
+    prev.tokenUsage = state.tokenUsage;
+    prev.conclusion = state.conclusion;
     return {
       files,
       folders,
-      selected: next.selected,
-      coverage: next.coverage,
-      gatePassed: next.gatePassed,
-      globalDone: next.globalDone,
-      hasGlobalReport: next.hasGlobalReport,
-      modelLabel: next.modelLabel,
-      branch: next.branch,
-      tokenUsage: next.tokenUsage,
-      conclusion: next.conclusion,
+      selected: state.selected,
+      coverage: state.coverage,
+      gatePassed: state.gatePassed,
+      globalDone: state.globalDone,
+      hasGlobalReport: state.hasGlobalReport,
+      modelLabel: state.modelLabel,
+      branch: state.branch,
+      tokenUsage: state.tokenUsage,
+      conclusion: state.conclusion,
     };
   }
 
@@ -536,7 +695,7 @@ export class WorkbenchPanel {
     }
   }
 
-  private render(state: WorkbenchState): string {
+  private render(state: WorkbenchState, indexedRoot?: TreeNode): string {
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
     const t = m().workbench;
@@ -556,7 +715,7 @@ export class WorkbenchPanel {
       ? Math.round((state.coverage.seen / state.coverage.total) * 100)
       : 0;
 
-    const treeRoot = compactTree(buildTree(state.files));
+    const treeRoot = indexedRoot ?? compactTree(buildTree(state.files));
 
     if (!WorkbenchPanel.folderInit && (treeRoot.children?.length ?? 0) > 0) {
       WorkbenchPanel.folderInit = true;
@@ -1352,6 +1511,141 @@ export class WorkbenchPanel {
 </html>`;
   }
 
+  /** Temporary shell shown while a review scope is built or restored. */
+  private static renderLoading(
+    panel: vscode.WebviewPanel,
+    initialMessage: string,
+    initialStage: WorkbenchLoadStage,
+  ): string {
+    const pageNonce = makeNonce();
+    const iconUri = WorkbenchPanel.extensionUri
+      ? panel.webview.asWebviewUri(
+          vscode.Uri.joinPath(WorkbenchPanel.extensionUri, 'media', 'icon.png'),
+        ).toString()
+      : undefined;
+    const imgSource = iconUri ? ` img-src ${panel.webview.cspSource};` : '';
+    const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${pageNonce}';${imgSource}`;
+    const t = m().workbench;
+    const lang = resolveLanguage();
+    const stageLabels: Record<WorkbenchLoadStage, string> = {
+      scan: t.loadingStageScan,
+      restore: t.loadingStageRestore,
+      open: t.loadingStageOpen,
+    };
+    const brandHtml = iconUri
+      ? `<img class="brand-icon" src="${escAttr(iconUri)}" alt="" />`
+      : '<span class="brand-fallback">AI</span>';
+    return `<!DOCTYPE html>
+<html lang="${lang}">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="${csp}" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  :root { --accent:var(--vscode-progressBar-background, #4f9ee3);
+    --line:var(--vscode-editorWidget-border, rgba(127,127,127,.25));
+    --surface:var(--vscode-editorWidget-background, rgba(127,127,127,.06)); }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+    font-family:var(--vscode-font-family); color:var(--vscode-foreground);
+    background:var(--vscode-editor-background); }
+  .loading { width:min(520px, calc(100vw - 48px)); }
+  .brand { display:flex; align-items:center; gap:12px; }
+  .brand-icon, .brand-fallback { flex:none; width:42px; height:42px; }
+  .brand-icon { display:block; }
+  .brand-fallback { display:grid; place-items:center; border:1px solid var(--line);
+    border-radius:7px; color:var(--accent); font-weight:700; }
+  h1 { margin:0; font-size:19px; line-height:1.25; font-weight:650; }
+  .phase { display:flex; align-items:center; gap:6px; margin-top:5px;
+    font-size:12px; line-height:1.4; color:var(--accent); }
+  .phase-dot { width:6px; height:6px; border-radius:50%; background:var(--accent); }
+  .progress-zone { margin-top:26px; }
+  .status-row { display:flex; align-items:baseline; gap:16px; margin-bottom:11px; }
+  .message { min-width:0; flex:1; margin:0; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; font-family:var(--vscode-editor-font-family); font-size:12px;
+    line-height:1.5; color:var(--vscode-foreground); }
+  .percent { flex:none; color:var(--accent); font-family:var(--vscode-editor-font-family);
+    font-size:12px; font-weight:600; }
+  .percent[hidden] { display:none; }
+  .track { position:relative; height:6px; overflow:hidden; border-radius:3px; background:var(--surface); }
+  .bar { position:absolute; inset:0 auto 0 0; width:32%; border-radius:3px; background:var(--accent);
+    animation:loading-slide 1.2s ease-in-out infinite alternate; }
+  .bar::after { content:''; position:absolute; inset:0; background:linear-gradient(90deg, transparent, rgba(255,255,255,.42), transparent); }
+  .track.determinate .bar { animation:none; transition:width .3s ease; }
+  .metrics { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:9px;
+    font-family:var(--vscode-editor-font-family); font-size:11px; color:var(--vscode-descriptionForeground); }
+  .metric[hidden] { display:none; }
+  @keyframes loading-slide { from { transform:translateX(-12%); } to { transform:translateX(225%); } }
+  @media (max-width:480px) { .loading { width:calc(100vw - 32px); } }
+  @media (prefers-reduced-motion:reduce) { .bar { animation:none; width:100%; opacity:.7; } }
+</style>
+</head>
+<body aria-busy="true">
+  <main class="loading">
+    <header class="brand">${brandHtml}<div><h1>${esc(t.loadingTitle)}</h1>
+      <div class="phase"><span class="phase-dot" aria-hidden="true"></span><span id="loadingPhase">${esc(stageLabels[initialStage])}</span></div>
+    </div></header>
+    <section class="progress-zone">
+      <div class="status-row"><p class="message" id="loadingMessage" role="status" aria-live="polite">${esc(initialMessage)}</p>
+        <span class="percent" id="loadingPercent" hidden></span>
+      </div>
+      <div class="track" role="progressbar" aria-label="${escAttr(t.loadingTitle)}"><div class="bar"></div></div>
+      <div class="metrics"><span class="metric" id="loadingEta" hidden></span>
+        <span class="metric" id="loadingElapsed"></span>
+      </div>
+    </section>
+  </main>
+<script nonce="${pageNonce}">
+  const STAGE_LABELS = ${JSON.stringify(stageLabels)};
+  const STARTED_AT = Date.now();
+  const ETA_TEMPLATE = ${JSON.stringify(t.loadingEta)};
+  const ELAPSED_TEMPLATE = ${JSON.stringify(t.loadingElapsed)};
+  const fmtDuration = (seconds) => {
+    const value = Math.max(0, Math.round(Number(seconds) || 0));
+    const minutes = Math.floor(value / 60);
+    const rest = value % 60;
+    return minutes > 0 ? minutes + ':' + String(rest).padStart(2, '0') : rest + 's';
+  };
+  const fmtMetric = (template, value) => String(template).replace('{0}', value);
+  function updateElapsed() {
+    const elapsed = document.getElementById('loadingElapsed');
+    if (elapsed) elapsed.textContent = fmtMetric(ELAPSED_TEMPLATE, fmtDuration((Date.now() - STARTED_AT) / 1000));
+  }
+  updateElapsed();
+  window.setInterval(updateElapsed, 1000);
+  function setStage(stage) {
+    const phase = document.getElementById('loadingPhase');
+    if (phase && STAGE_LABELS[stage]) phase.textContent = STAGE_LABELS[stage];
+  }
+  window.addEventListener('message', event => {
+    const msg = event.data;
+    if (!msg || msg.type !== 'loadingProgress') return;
+    const message = document.getElementById('loadingMessage');
+    if (message) message.textContent = msg.message || '';
+    if (msg.stage) setStage(msg.stage);
+    const track = document.querySelector('.track');
+    const bar = document.querySelector('.bar');
+    const percent = document.getElementById('loadingPercent');
+    const eta = document.getElementById('loadingEta');
+    const value = Number(msg.metrics?.percent);
+    const determinate = Number.isFinite(value);
+    track?.classList.toggle('determinate', determinate);
+    if (bar) bar.style.width = determinate ? Math.max(0, Math.min(100, value)) + '%' : '';
+    if (percent) {
+      percent.hidden = !determinate;
+      percent.textContent = determinate ? (msg.metrics?.estimated ? '≈' : '') + Math.round(value) + '%' : '';
+    }
+    const etaValue = Number(msg.metrics?.etaSeconds);
+    if (eta) {
+      eta.hidden = !Number.isFinite(etaValue) || etaValue <= 0;
+      eta.textContent = eta.hidden ? '' : fmtMetric(ETA_TEMPLATE, fmtDuration(etaValue));
+    }
+  });
+</script>
+</body>
+</html>`;
+  }
+
   dispose(): void {
     WorkbenchPanel.current = undefined;
     if (this.refreshTimer) {
@@ -1475,10 +1769,6 @@ function compactTree(node: TreeNode): TreeNode {
   return { ...node, children: compactedChildren };
 }
 
-function structureSig(files: WorkbenchFile[]): string {
-  return files.map((f) => f.path).join('\n');
-}
-
 /** A flat row in the virtualized file tree (pre-order, depth-tagged). */
 interface TreeRow {
   kind: 'file' | 'folder';
@@ -1553,12 +1843,15 @@ function flattenRows(root: TreeNode): TreeRow[] {
   return out;
 }
 
-function snapshotFor(state: WorkbenchState): WorkbenchPatchSnapshot {
+function snapshotFor(
+  state: WorkbenchState,
+  indexedRoot?: TreeNode,
+): WorkbenchPatchSnapshot {
   const files = new Map<string, FilePatch>();
   for (const file of state.files) {
     files.set(file.path, filePatchOf(file));
   }
-  const root = compactTree(buildTree(state.files));
+  const root = indexedRoot ?? compactTree(buildTree(state.files));
   const folders = new Map<string, FolderPatch>();
   collectFolderPatches(root, folders);
   return {
@@ -1657,18 +1950,49 @@ function formatTime(ms: number): string {
  * full-screen workbench window never hides it). Falls back to a notification
  * when the workbench is not open yet (e.g. the very first review load).
  */
-export async function withWorkbenchProgress<T>(title: string, task: () => Promise<T>): Promise<T> {
+export type WorkbenchLoadStage = 'scan' | 'restore' | 'open';
+
+export interface WorkbenchProgressMetrics {
+  percent: number;
+  etaSeconds?: number;
+  estimated?: boolean;
+}
+
+export interface WorkbenchProgressReporter {
+  report(
+    message: string,
+    stage?: WorkbenchLoadStage,
+    metrics?: WorkbenchProgressMetrics,
+  ): void;
+}
+
+export async function withWorkbenchProgress<T>(
+  title: string,
+  task: (progress: WorkbenchProgressReporter) => Promise<T>,
+): Promise<T> {
   if (WorkbenchPanel.isOpen) {
     WorkbenchPanel.setBusy(true, title);
     try {
-      return await task();
+      return await task({
+        report: (message) => WorkbenchPanel.setBusy(true, message || title),
+      });
     } finally {
       WorkbenchPanel.setBusy(false);
     }
   }
   return vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title },
-    () => task(),
+    { location: vscode.ProgressLocation.Notification, title, cancellable: false },
+    (progress) => {
+      let lastPercent = 0;
+      return task({
+        report: (message, _stage, metrics) => {
+          const nextPercent = metrics?.percent ?? lastPercent;
+          const increment = Math.max(0, nextPercent - lastPercent);
+          lastPercent = Math.max(lastPercent, nextPercent);
+          progress.report({ message, increment: increment || undefined });
+        },
+      });
+    },
   );
 }
 

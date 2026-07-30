@@ -1,19 +1,28 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { m } from '../i18n';
-import type { ReviewSet } from '../scope/types';
+import type { ReviewFile, ReviewSet } from '../scope/types';
 import type { Finding, GlobalReport } from '../ai/types';
 import type { TokenUsage } from '../ai/analyzer';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
+
+export interface ReviewSessionChange {
+  filePath?: string;
+  structureChanged?: boolean;
+}
 
 /**
  * Holds the in-memory state of the active review and persists it through a
  * ReviewStore. Emits onDidChange whenever progress changes so UI can refresh.
  */
 export class ReviewSession {
-  private readonly _onDidChange = new vscode.EventEmitter<void>();
+  private readonly _onDidChange = new vscode.EventEmitter<ReviewSessionChange>();
   readonly onDidChange = this._onDidChange.event;
+  private readonly pendingFilePersists = new Map<string, ReturnType<typeof setTimeout>>();
+  private reviewFilesByPath = new Map<string, ReviewFile>();
+  private deletedPaths = new Set<string>();
+  private structureVersion = 0;
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
@@ -42,7 +51,13 @@ export class ReviewSession {
 
   /** Loads or initialises review progress for the given review set. */
   async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
+    await this.flushPendingFilePersists();
     this.reviewSet = reviewSet;
+    this.reviewFilesByPath = new Map(reviewSet.files.map((file) => [file.path, file]));
+    this.deletedPaths = new Set(
+      reviewSet.files.filter((file) => file.status === 'deleted').map((file) => file.path),
+    );
+    this.structureVersion++;
     this.cwd = cwd;
     this.repoName = cwd ? path.basename(cwd) : this.defaultRepo;
     const repo = this.repoName;
@@ -64,36 +79,35 @@ export class ReviewSession {
       }
     }
 
-    // Build the in-memory perFile map. Each file's own record is the source of
-    // truth; on first run after the split, adopt progress from a one-pass index
-    // of legacy per-scope snapshots (built lazily only if a file misses).
+    // Keep state sparse: untouched files do not allocate promises or empty
+    // PerFileState objects. Existing progress is loaded in one key scan.
     const perFile: Record<string, PerFileState> = {};
     const toMigrate: string[] = [];
-    // Load every file's own record in parallel (each is a cheap single-key get).
-    const loaded = await Promise.all(
-      reviewSet.files.map(async (f) =>
-        [f.path, this.store.loadFile ? await this.store.loadFile(repo, f.path) : undefined] as const,
-      ),
-    );
-    let legacyIndex: Map<string, PerFileState> | undefined;
-    for (const [filePath, own] of loaded) {
-      let state = own;
-      // Treat an empty per-file record as a miss for migration purposes: a buggy
-      // earlier build could have written blank records (seen/findings empty),
-      // which would otherwise mask real progress still held in a legacy snapshot.
-      if (!state || isBlankFileState(state)) {
-        // Build the legacy index once, the first time any file needs it.
-        if (!legacyIndex && this.store.buildLegacyFileIndex) {
-          legacyIndex = await this.store.buildLegacyFileIndex(repo);
-        }
-        const recovered = legacyIndex?.get(filePath) ?? scopeSnap?.perFile?.[filePath];
-        // Only override with legacy data when it actually carries progress.
-        if (recovered && !isBlankFileState(recovered)) {
-          state = recovered;
-          toMigrate.push(filePath);
-        }
+    const activePaths = new Set(this.reviewFilesByPath.keys());
+    const stored = await this.loadStoredFileStates(repo, activePaths);
+    for (const [filePath, state] of stored) {
+      if (!isBlankFileState(state)) {
+        perFile[filePath] = normaliseFileState(state);
       }
-      perFile[filePath] = normaliseFileState(state);
+    }
+
+    const legacyIndex = this.store.buildLegacyFileIndex
+      ? await this.store.buildLegacyFileIndex(repo)
+      : new Map<string, PerFileState>();
+    for (const [filePath, state] of Object.entries(scopeSnap?.perFile ?? {})) {
+      if (!legacyIndex.has(filePath)) {
+        legacyIndex.set(filePath, state);
+      }
+    }
+    for (const [filePath, recovered] of legacyIndex) {
+      if (
+        activePaths.has(filePath)
+        && !perFile[filePath]
+        && !isBlankFileState(recovered)
+      ) {
+        perFile[filePath] = normaliseFileState(recovered);
+        toMigrate.push(filePath);
+      }
     }
 
     this.snapshot = {
@@ -111,7 +125,7 @@ export class ReviewSession {
     };
     // Surface the panel immediately; persist migrated/initial state in the
     // background so a large review set doesn't block opening.
-    this._onDidChange.fire();
+    this._onDidChange.fire({ structureChanged: true });
     void this.persistInBackground(repo, toMigrate);
   }
 
@@ -143,8 +157,55 @@ export class ReviewSession {
     return this.snapshot?.perFile[path];
   }
 
+  private ensureFileState(path: string): PerFileState | undefined {
+    if (!this.snapshot || !this.reviewFilesByPath.has(path)) {
+      return undefined;
+    }
+    return (this.snapshot.perFile[path] ??= normaliseFileState(undefined));
+  }
+
+  private async loadStoredFileStates(
+    repo: string,
+    activePaths: ReadonlySet<string>,
+  ): Promise<Map<string, PerFileState>> {
+    if (this.store.loadFiles) {
+      return this.store.loadFiles(repo, activePaths);
+    }
+    const states = new Map<string, PerFileState>();
+    if (!this.store.loadFile) {
+      return states;
+    }
+    const paths = [...activePaths];
+    const batchSize = 1000;
+    for (let i = 0; i < paths.length; i += batchSize) {
+      const batch = paths.slice(i, i + batchSize);
+      const loaded = await Promise.all(batch.map(async (filePath) => [
+        filePath,
+        await this.store.loadFile!(repo, filePath),
+      ] as const));
+      for (const [filePath, state] of loaded) {
+        if (state && !isBlankFileState(state)) {
+          states.set(filePath, state);
+        }
+      }
+    }
+    return states;
+  }
+
+  reviewFile(path: string): ReviewFile | undefined {
+    return this.reviewFilesByPath.get(path);
+  }
+
+  hasReviewFile(path: string): boolean {
+    return this.reviewFilesByPath.has(path);
+  }
+
+  get reviewStructureVersion(): number {
+    return this.structureVersion;
+  }
+
   private isDeletedFile(path: string): boolean {
-    return this.reviewSet?.files.find((f) => f.path === path)?.status === 'deleted';
+    return this.deletedPaths.has(path);
   }
 
   /**
@@ -170,7 +231,7 @@ export class ReviewSession {
     if (!rel || rel.startsWith('..')) {
       return undefined;
     }
-    return this.reviewSet.files.some((f) => f.path === rel) ? rel : undefined;
+    return this.reviewFilesByPath.has(rel) ? rel : undefined;
   }
 
   /** Coverage for a file: how many of its lines have been seen, out of total. */
@@ -190,7 +251,7 @@ export class ReviewSession {
     if (this.isDeletedFile(path)) {
       return;
     }
-    const s = this.fileState(path);
+    const s = this.ensureFileState(path);
     if (s && s.totalLines !== total) {
       s.totalLines = total;
       // Drop any seen lines now beyond the (re-measured) end of file, so seen can
@@ -214,7 +275,7 @@ export class ReviewSession {
     if (this.isDeletedFile(path)) {
       return false;
     }
-    const s = this.fileState(path);
+    const s = this.ensureFileState(path);
     if (!s) {
       return false;
     }
@@ -229,7 +290,7 @@ export class ReviewSession {
       return false;
     }
     s.seenLines = [...set].sort((a, b) => a - b);
-    this.persistFile(path);
+    this.persistFile(path, 1000);
     return true;
   }
 
@@ -249,7 +310,7 @@ export class ReviewSession {
     if (this.isDeletedFile(path) || splices.length === 0) {
       return;
     }
-    const s = this.fileState(path);
+    const s = this.ensureFileState(path);
     if (!s) {
       return;
     }
@@ -298,7 +359,7 @@ export class ReviewSession {
 
   /** Stores file-level analysis results and marks the file analyzed. */
   setFindings(path: string, findings: Finding[]): void {
-    const s = this.fileState(path);
+    const s = this.ensureFileState(path);
     if (!s) {
       return;
     }
@@ -376,7 +437,7 @@ export class ReviewSession {
 
   /** Adds a translation / note to a file and persists it. */
   addAnnotation(path: string, annotation: Annotation): void {
-    const s = this.fileState(path);
+    const s = this.ensureFileState(path);
     if (!s) {
       return;
     }
@@ -588,24 +649,30 @@ export class ReviewSession {
   }
 
   allFilesReady(): boolean {
-    return !!this.reviewSet && this.reviewSet.files.every((f) => this.fileReady(f.path));
+    const coverage = this.totalCoverage();
+    return !!this.reviewSet && coverage.filesReady === coverage.filesTotal;
   }
 
   /** Overall coverage across all files in the review set, as seen/total lines. */
   totalCoverage(): { seen: number; total: number; filesReady: number; filesTotal: number } {
     let seen = 0;
     let total = 0;
-    let filesReady = 0;
-    const files = this.reviewSet?.files ?? [];
-    for (const f of files) {
-      const c = this.coverage(f.path);
-      seen += Math.min(c.seen, c.total || c.seen);
-      total += c.total;
-      if (this.fileReady(f.path)) {
+    let filesReady = this.deletedPaths.size;
+    for (const [filePath, state] of Object.entries(this.snapshot?.perFile ?? {})) {
+      if (this.deletedPaths.has(filePath)) {
+        continue;
+      }
+      const fileSeen = state.seenLines.length;
+      seen += state.totalLines > 0 ? Math.min(fileSeen, state.totalLines) : fileSeen;
+      total += state.totalLines;
+      if (
+        state.analyzed
+        && state.findings.every((finding) => !!state.dispositions?.[finding.id])
+      ) {
         filesReady++;
       }
     }
-    return { seen, total, filesReady, filesTotal: files.length };
+    return { seen, total, filesReady, filesTotal: this.reviewFilesByPath.size };
   }
 
   /** Gate passes only when every file is ready and global analysis is confirmed. */
@@ -634,7 +701,7 @@ export class ReviewSession {
       void vscode.window.showWarningMessage(m().review.saveFailed(message));
       return;
     }
-    this._onDidChange.fire();
+    this._onDidChange.fire({});
   }
 
   /**
@@ -642,23 +709,49 @@ export class ReviewSession {
    * path used by per-file mutations so a 300-file review doesn't re-write every
    * record on each keystroke/scroll.
    */
-  private persistFile(filePath: string): void {
+  private persistFile(filePath: string, delayMs = 0): void {
+    if (!this.snapshot) {
+      return;
+    }
+    const pending = this.pendingFilePersists.get(filePath);
+    if (pending) {
+      clearTimeout(pending);
+      this.pendingFilePersists.delete(filePath);
+    }
+    if (delayMs > 0) {
+      this.pendingFilePersists.set(filePath, setTimeout(() => {
+        this.pendingFilePersists.delete(filePath);
+        void this.persistFileNow(filePath);
+      }, delayMs));
+    } else {
+      void this.persistFileNow(filePath);
+    }
+    this._onDidChange.fire({ filePath });
+  }
+
+  private async persistFileNow(filePath: string): Promise<void> {
     if (!this.snapshot) {
       return;
     }
     const repo = this.getRepoName();
     const state = this.snapshot.perFile[filePath];
-    void (async () => {
-      try {
-        if (state && this.store.saveFile) {
-          await this.store.saveFile(repo, filePath, state);
-        }
-        await this.persistScopeMeta();
-      } catch {
-        // Non-fatal; stays in memory and re-persists on the next change.
+    try {
+      if (state && this.store.saveFile) {
+        await this.store.saveFile(repo, filePath, state);
       }
-    })();
-    this._onDidChange.fire();
+      await this.persistScopeMeta();
+    } catch {
+      // Non-fatal; stays in memory and re-persists on the next change.
+    }
+  }
+
+  private async flushPendingFilePersists(): Promise<void> {
+    const filePaths = [...this.pendingFilePersists.keys()];
+    for (const timer of this.pendingFilePersists.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingFilePersists.clear();
+    await Promise.all(filePaths.map((filePath) => this.persistFileNow(filePath)));
   }
 
   /** Saves the scope-level snapshot (global report / conclusion / token usage),
@@ -674,10 +767,11 @@ export class ReviewSession {
   /** Fire-and-forget scope-meta persist for scope-level mutations (no per-file rewrite). */
   private persistScope(): void {
     void this.persistScopeMeta().catch(() => {/* non-fatal */});
-    this._onDidChange.fire();
+    this._onDidChange.fire({});
   }
 
   dispose(): void {
+    void this.flushPendingFilePersists();
     this._onDidChange.dispose();
   }
 }

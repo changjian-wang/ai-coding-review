@@ -7,10 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-30
+
 ### Added
 
 - PR and other diff-backed reviews now default to an uncollapsed, full-file inline Diff with
   old/new line numbers and added/deleted rows, while retaining a one-click clean-file view.
+- The workbench now shows a bilingual, theme-aware loading view with live stages, file counts,
+  elapsed time, estimated progress, and ETA.
+- Automatic review scope selection now prefers the current PR, then committed branch changes,
+  then uncommitted changes; whole-folder review remains an explicit choice.
+
+### Changed
+
+- Large-repository sessions now use O(1) file indexes, sparse per-file state, incremental
+  workbench patches, Git-index-backed file discovery, and cached PR restoration.
+- Document switching now sends a lightweight file model first, adds Diff data incrementally,
+  reduces duplicate payload, and caches completed File/Diff DOM views within a bounded LRU.
+- Source files up to 5,000 lines render in one pass; expanded Diff views up to 12,000 rows also
+  render eagerly, while genuinely large documents continue to render in bounded frames.
+- Scroll coverage writes are coalesced and flushed safely before changing review scope.
 
 ### Fixed
 
@@ -18,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including after an asynchronous translation finishes, while preserving the live
   line number and any in-progress supplementary note.
 - Language changes initiated inside the extension no longer trigger duplicate full UI refreshes.
+- Loading and restoring large workspaces no longer leave a blank workbench, repeatedly prompt
+  for a project, or leave the status-bar action stuck in a busy state.
+- File switching now coalesces stale requests, acknowledges successful renders, retries a stalled
+  viewer once, and surfaces read/render failures instead of silently ignoring a click.
+- Document scrolling no longer jumps to the end after dynamic row replacement; the stable
+  append-only renderer is retained for large files.
 
 ## [0.4.1] - 2026-07-08
 

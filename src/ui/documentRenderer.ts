@@ -12,6 +12,8 @@ export interface DocumentRender {
   sourceLines: string[];
   /** Total number of source lines (drives coverage). */
   totalLines: number;
+  /** Stable identity for the exact source text, used by the webview DOM cache. */
+  revision: string;
 }
 
 const md = new MarkdownIt({
@@ -139,7 +141,17 @@ export function renderDocument(text: string, languageId: string, fileName: strin
     readingHtml: isMarkdown ? renderMarkdownReading(text) : undefined,
     sourceLines: sourceLines.slice(0, rawLines.length),
     totalLines: rawLines.length,
+    revision: textRevision(text),
   };
+}
+
+function textRevision(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${text.length}:${(hash >>> 0).toString(36)}`;
 }
 
 /**

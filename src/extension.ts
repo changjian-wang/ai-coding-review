@@ -19,14 +19,19 @@ import {
   type GlobalContextFile,
 } from './ai/analyzer';
 import type { Finding, GlobalReport } from './ai/types';
-import { pickScope, buildFolderScope, type PickedScope } from './scope/scopePicker';
+import {
+  pickScope,
+  tryLoadPreferredScope,
+  type PickedScope,
+  type PreferredScopeKind,
+} from './scope/scopePicker';
 import { FileSystemScope, PrByNumberScope } from './scope/scopes';
-import { currentBranch, listBranches, readFileAtRef, switchBranchTo } from './scope/gitClient';
-import type { ReviewScope, ReviewSet } from './scope/types';
+import { currentBranch, headSha, listBranches, readFileAtRef, switchBranchTo } from './scope/gitClient';
+import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
-import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
+import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchProgressReporter, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
 import { DocumentPanel, type DocDiffLine, type DocModel } from './ui/documentPanel';
 import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
@@ -39,11 +44,18 @@ const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
 let currentBranchLabel: string | undefined;
+let workbenchFilesVersion = -1;
+let workbenchFilesCache: WorkbenchFile[] = [];
+const workbenchFileIndex = new Map<string, number>();
 
 /** Caches the last model picks so applyDynMenu can recover the live handle by id. */
 let dynModelCache = new Map<string, PickedModel>();
 /** Guards against re-entrant scope picking (rapid clicks on "switch scope"). */
 let scopePickInFlight = false;
+/** Prevents repeated launcher clicks from starting parallel project loads. */
+let workbenchOpenInFlight = false;
+/** Temporary loading panel shown before the full workbench is ready. */
+let openingWorkbenchPanel: vscode.WebviewPanel | undefined;
 /** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
 let openFileGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
@@ -52,6 +64,8 @@ const docRenderCache = new Map<string, DocumentRender>();
 const docDiffCache = new Map<string, DocDiffLine[]>();
 /** Base snapshots are immutable for a ReviewSet, so each old file is read once. */
 const baseTextCache = new Map<string, string | null>();
+/** Highlighted base snapshots, keyed by base SHA + path for instant revisits. */
+const baseRenderCache = new Map<string, DocumentRender>();
 /** Most recently applied Copilot fix per finding: enables one-click revert from any UI. */
 const appliedFixes = new Map<string, { oldText: string; newText: string }>();
 /** Preferred default cwd for the next scope pick (set by openInNewWindow). */
@@ -69,7 +83,7 @@ let globalAnalysisCts: vscode.CancellationTokenSource | undefined;
 let activeDocTranslation: { path: string; cts: vscode.CancellationTokenSource } | undefined;
 
 function isReviewPath(relPath: string): boolean {
-  return !!session.reviewSet?.files.some((f) => f.path === relPath);
+  return session.hasReviewFile(relPath);
 }
 
 function ensureReviewPath(relPath: string, action: string): boolean {
@@ -87,7 +101,7 @@ function closeScopeBoundPanels(): void {
 }
 
 function reviewFileStatus(relPath: string): string | undefined {
-  return session.reviewSet?.files.find((f) => f.path === relPath)?.status;
+  return session.reviewFile(relPath)?.status;
 }
 
 function isDeletedReviewFile(relPath: string): boolean {
@@ -116,7 +130,7 @@ const LAST_SCOPE_KEY = 'codereview.lastScope.v1';
 type PersistedScope =
   | { kind: 'folder'; cwd: string }
   | { kind: 'files'; cwd: string; relPaths: string[] }
-  | { kind: 'pr'; cwd: string; number: number };
+  | { kind: 'pr'; cwd: string; number: number; reviewSet?: ReviewSet };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
 
@@ -507,6 +521,7 @@ function setAppliedFix(key: string, edit: { oldText: string; newText: string }):
 /** Forces every visible review surface to re-render in the current language. */
 function refreshUiForLanguageSwitch(): void {
   refreshStatusBarText();
+  workbenchFilesVersion = -1;
   WorkbenchPanel.rerenderIfOpen();
   // Rebuild shell text (tab/button labels) first.
   DocumentPanel.refreshIfOpen();
@@ -554,6 +569,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
   session = new ReviewSession(store, repo);
+  WorkbenchPanel.init(context.extensionUri);
 
   // Accumulate estimated LLM token usage onto the active review and refresh the
   // workbench HUD. Estimates are approximate (countTokens-based), not billed.
@@ -607,7 +623,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Keep the workbench webview in sync with session progress.
-  context.subscriptions.push(session.onDidChange(() => WorkbenchPanel.refreshIfOpen()));
+  context.subscriptions.push(
+    session.onDidChange((change) => WorkbenchPanel.refreshIfOpen(change.filePath)),
+  );
 
   // Re-render UI the instant the user flips `codereview.language`, so the status
   // bar and any open webviews switch language without a reload.
@@ -748,84 +766,122 @@ async function openOrStartReview(): Promise<void> {
 async function openInNewWindow(
   cwdArg?: string | vscode.WorkspaceFolder | vscode.Uri,
 ): Promise<void> {
-  const folders = vscode.workspace.workspaceFolders ?? [];
-  let chosenCwd: string | undefined = resolveCwdArg(cwdArg);
-  if (!chosenCwd) {
-    if (folders.length === 0) {
-      void vscode.window.showErrorMessage(m().review.noWorkspace);
-      return;
-    } else if (folders.length === 1) {
-      chosenCwd = folders[0].uri.fsPath;
-    } else {
-      const pick = await vscode.window.showQuickPick(
-        folders.map((f) => ({
-          label: `$(folder) ${f.name}`,
-          description: f.uri.fsPath,
-          cwd: f.uri.fsPath,
-        })),
-        {
-          title: m().review.pickProjectTitle,
-          placeHolder: m().review.pickProjectPlaceholder,
-        },
-      );
-      if (!pick) {
-        return;
-      }
-      chosenCwd = pick.cwd;
-    }
+  if (WorkbenchPanel.isOpen) {
+    WorkbenchPanel.reveal();
+    return;
   }
-  preferredDefaultCwd = chosenCwd;
-  // Auto-load the chosen project as the initial review set (whole folder, skipping
-  // node_modules / dist / bin / obj / ...). The user can still narrow down later
-  // via the 「切换范围…」 button inside the workbench.
-  setStatusBarBusy(true);
+  if (workbenchOpenInFlight) {
+    openingWorkbenchPanel?.reveal(undefined, false);
+    return;
+  }
+  workbenchOpenInFlight = true;
+  let loadingPanel: vscode.WebviewPanel | undefined;
   try {
-    await loadFolderAsReview(chosenCwd);
-    // Open the workbench straight into its own auxiliary window. The webview API
-    // can only create a panel in the current window, so we relocate it with
-    // `moveEditorToNewWindow` — but we fire that the instant the panel exists,
-    // before opening any file or applying the split layout, so the user never
-    // sees the intermediate "tab in the current window" step.
-    await openWorkbench({ moveToNewWindow: true });
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    let chosenCwd: string | undefined = resolveCwdArg(cwdArg);
+    if (!chosenCwd) {
+      if (folders.length === 0) {
+        void vscode.window.showErrorMessage(m().review.noWorkspace);
+        return;
+      } else if (folders.length === 1) {
+        chosenCwd = folders[0].uri.fsPath;
+      } else {
+        const pick = await vscode.window.showQuickPick(
+          folders.map((f) => ({
+            label: `$(folder) ${f.name}`,
+            description: f.uri.fsPath,
+            cwd: f.uri.fsPath,
+          })),
+          {
+            title: m().review.pickProjectTitle,
+            placeHolder: m().review.pickProjectPlaceholder,
+          },
+        );
+        if (!pick) {
+          return;
+        }
+        chosenCwd = pick.cwd;
+      }
+    }
+    preferredDefaultCwd = chosenCwd;
+    setStatusBarBusy(true);
+
+    const loading = WorkbenchPanel.createLoading(m().review.loadingProject, 'scan');
+    loadingPanel = loading.panel;
+    openingWorkbenchPanel = loading.panel;
+    await moveActiveEditorToNewWindow();
+
+    const loaded = await loadPreferredReviewWithProgress(chosenCwd, loading.progress);
+    if (!loaded) {
+      WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
+      return;
+    }
+    loading.progress.report(m().workbench.loadingOpening, 'open');
+    WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
   } finally {
+    if (loadingPanel && !WorkbenchPanel.isOpen) {
+      loadingPanel.dispose();
+    }
+    openingWorkbenchPanel = undefined;
+    workbenchOpenInFlight = false;
     setStatusBarBusy(false);
   }
 }
 
-/** Loads the entire folder at `cwd` as the current review set. */
-async function loadFolderAsReview(cwd: string): Promise<void> {
-  await withWorkbenchProgress(
+/** Defaults to changed files and leaves whole-project review as an explicit choice. */
+async function loadPreferredReview(cwd: string): Promise<boolean> {
+  return withWorkbenchProgress(
     m().review.loadingProject,
-    async () => {
-      try {
-        const picked = await buildFolderScope(cwd);
-        if (!picked) {
-          transientWarning(m().review.noReviewableFiles);
-          return;
-        }
-        const { scope: source, cwd: rootCwd } = picked;
-        const reviewSet = await source.load(rootCwd);
-        await session.start(reviewSet, rootCwd);
-        await refreshBranchLabel();
-        closeScopeBoundPanels();
-        workbenchSelected = undefined;
-        docRenderCache.clear();
-        docDiffCache.clear();
-        baseTextCache.clear();
-        rehydrateAppliedFixes();
-        WorkbenchPanel.resetFolders();
-        layoutAppliedForCurrentReview = false;
-        // Remember this folder so a window reload can auto-restore the review.
-        void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, rootCwd);
-        void workspaceMemento?.update(LAST_SCOPE_KEY, { kind: 'folder', cwd: rootCwd } satisfies PersistedScope);
-        void vscode.commands.executeCommand('setContext', 'codereview.active', true);
-        transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
-      } catch (err) {
-        const message = String((err as Error)?.message ?? err);
-        void vscode.window.showErrorMessage(m().review.error(message));
-      }
-    },
+    (progress) => loadPreferredReviewWithProgress(cwd, progress),
   );
+}
+
+async function loadPreferredReviewWithProgress(
+  cwd: string,
+  progress: WorkbenchProgressReporter,
+): Promise<boolean> {
+  const attemptMessage = (kind: PreferredScopeKind): string => {
+    if (kind === 'currentPr') return m().scope.checkingCurrentPr;
+    if (kind === 'branch') return m().scope.checkingBranchChanges;
+    return m().scope.checkingWorkingTree;
+  };
+  const preferred = await tryLoadPreferredScope(
+    cwd,
+    (kind) => progress.report(attemptMessage(kind), 'scan'),
+  );
+  if (!preferred) {
+    progress.report(m().scope.noPreferredChanges, 'open');
+    return false;
+  }
+  try {
+    progress.report(
+      m().scope.preferredScopeFound(preferred.reviewSet.label, preferred.reviewSet.files.length),
+      'restore',
+    );
+    await activateReviewSet(preferred.reviewSet, preferred.cwd);
+    persistScope(preferred.scope, preferred.reviewSet, preferred.cwd);
+    return true;
+  } catch (err) {
+    const message = String((err as Error)?.message ?? err);
+    void vscode.window.showErrorMessage(m().review.error(message));
+    return false;
+  }
+}
+
+async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<void> {
+  await session.start(reviewSet, cwd);
+  await refreshBranchLabel();
+  closeScopeBoundPanels();
+  workbenchSelected = undefined;
+  docRenderCache.clear();
+  docDiffCache.clear();
+  baseTextCache.clear();
+  baseRenderCache.clear();
+  rehydrateAppliedFixes();
+  WorkbenchPanel.resetFolders();
+  layoutAppliedForCurrentReview = false;
+  void vscode.commands.executeCommand('setContext', 'codereview.active', true);
+  transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
 }
 
 function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): string | undefined {
@@ -869,6 +925,7 @@ async function startReview(kind?: string): Promise<void> {
         docRenderCache.clear();
         docDiffCache.clear();
         baseTextCache.clear();
+        baseRenderCache.clear();
         rehydrateAppliedFixes();
         WorkbenchPanel.resetFolders();
         layoutAppliedForCurrentReview = false;
@@ -900,7 +957,7 @@ function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): v
     source instanceof FileSystemScope
       ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
       : Number.isFinite(prNumber)
-        ? { kind: 'pr', cwd, number: prNumber }
+        ? { kind: 'pr', cwd, number: prNumber, reviewSet }
       : { kind: 'folder', cwd };
   void workspaceMemento?.update(LAST_SCOPE_KEY, descriptor);
 }
@@ -1023,19 +1080,23 @@ async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<
     // Relocate to a dedicated window immediately — before any file open or layout
     // work — so the panel appears to open directly in its own window rather than
     // flashing as a tab in the current one first.
-    try {
-      await vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
-    } catch (err) {
-      console.warn('[codereview] moveEditorToNewWindow failed:', err);
-    }
-    // A stale document panel in the previous window would otherwise steal the
-    // Beside column; drop it so the next file opens beside the relocated panel.
-    DocumentPanel.closeIfOpen();
+    await moveActiveEditorToNewWindow();
   }
   // The document panel is created lazily on the first file open (openFileInPanel),
   // which also applies the 3:7 split. Pre-creating it here spawned an extra window:
   // an empty document webview (no model yet) renders as a blank/black window in the
   // auxiliary-window layout. So we do NOT pre-warm.
+}
+
+async function moveActiveEditorToNewWindow(): Promise<void> {
+  try {
+    await vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
+  } catch (err) {
+    console.warn('[codereview] moveEditorToNewWindow failed:', err);
+  }
+  // A stale document panel in the previous window would otherwise steal the
+  // Beside column; drop it so the next file opens beside the relocated panel.
+  DocumentPanel.closeIfOpen();
 }
 
 /**
@@ -1072,8 +1133,9 @@ async function switchProjectTo(cwd: string): Promise<void> {
   preferredDefaultCwd = cwd;
   setStatusBarBusy(true);
   try {
-    await loadFolderAsReview(cwd);
-    await openWorkbench();
+    if (await loadPreferredReview(cwd)) {
+      await openWorkbench();
+    }
   } finally {
     setStatusBarBusy(false);
   }
@@ -1100,8 +1162,9 @@ async function switchProject(): Promise<void> {
   preferredDefaultCwd = pick.cwd;
   setStatusBarBusy(true);
   try {
-    await loadFolderAsReview(pick.cwd);
-    await openWorkbench();
+    if (await loadPreferredReview(pick.cwd)) {
+      await openWorkbench();
+    }
   } finally {
     setStatusBarBusy(false);
   }
@@ -1145,18 +1208,30 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
     panel.dispose();
     return;
   }
+  if (workbenchOpenInFlight && openingWorkbenchPanel !== panel) {
+    panel.dispose();
+    return;
+  }
+  workbenchOpenInFlight = true;
+  openingWorkbenchPanel = panel;
+  const progress = WorkbenchPanel.showLoading(panel, m().workbench.loadingInitial, 'restore');
   setStatusBarBusy(true);
   try {
     if (!session.reviewSet) {
-      await restoreLastScope(cwd);
+      await restoreLastScope(cwd, progress);
     }
     if (!session.reviewSet) {
-      panel.dispose();
+      WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
       return;
     }
+    progress.report(m().workbench.loadingOpening, 'open');
     WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
     void vscode.commands.executeCommand('setContext', 'codereview.active', true);
   } finally {
+    if (openingWorkbenchPanel === panel) {
+      openingWorkbenchPanel = undefined;
+      workbenchOpenInFlight = false;
+    }
     setStatusBarBusy(false);
   }
 }
@@ -1167,29 +1242,37 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
  * snapshot); falls back to loading the whole folder when no detailed scope was
  * recorded or rebuilding it fails.
  */
-async function restoreLastScope(cwd: string): Promise<void> {
+async function restoreLastScope(
+  cwd: string,
+  progress?: WorkbenchProgressReporter,
+): Promise<void> {
   const descriptor = workspaceMemento?.get<PersistedScope>(LAST_SCOPE_KEY);
   if (descriptor?.kind === 'pr' || (descriptor?.kind === 'files' && descriptor.relPaths.length > 0)) {
     try {
-      const source = descriptor.kind === 'pr'
-        ? new PrByNumberScope(descriptor.number)
-        : new FileSystemScope(descriptor.relPaths);
-      const reviewSet = await source.load(descriptor.cwd);
-      await session.start(reviewSet, descriptor.cwd);
-      await refreshBranchLabel();
-      workbenchSelected = undefined;
-      docRenderCache.clear();
-      docDiffCache.clear();
-      baseTextCache.clear();
-      rehydrateAppliedFixes();
-      WorkbenchPanel.resetFolders();
-      layoutAppliedForCurrentReview = false;
+      progress?.report(m().workbench.loadingSavedScope, 'restore');
+      let reviewSet: ReviewSet;
+      if (descriptor.kind === 'pr') {
+        const currentHead = descriptor.reviewSet
+          ? await headSha(descriptor.cwd).catch(() => undefined)
+          : undefined;
+        reviewSet = descriptor.reviewSet && currentHead === descriptor.reviewSet.headSha
+          ? descriptor.reviewSet
+          : await new PrByNumberScope(descriptor.number).load(descriptor.cwd);
+      } else {
+        reviewSet = await new FileSystemScope(descriptor.relPaths).load(descriptor.cwd);
+      }
+      progress?.report(m().scope.preparingReview(reviewSet.files.length), 'restore');
+      await activateReviewSet(reviewSet, descriptor.cwd);
       return;
     } catch (err) {
       console.warn(`[codereview] restoreLastScope (${descriptor.kind}) failed, falling back to folder:`, err);
     }
   }
-  await loadFolderAsReview(cwd);
+  if (progress) {
+    await loadPreferredReviewWithProgress(cwd, progress);
+  } else {
+    await loadPreferredReview(cwd);
+  }
 }
 
 /**
@@ -1251,28 +1334,44 @@ async function refreshBranchLabel(): Promise<void> {
   }
 }
 
-function buildWorkbenchState(): WorkbenchState {
+function buildWorkbenchFile(file: ReviewFile): WorkbenchFile {
+  const { seen, total } = session.coverage(file.path);
+  const findings = session.findings(file.path);
+  const fileState = session.fileState(file.path);
+  return {
+    path: file.path,
+    name: file.path.split('/').pop() ?? file.path,
+    dir: file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '',
+    seen,
+    total,
+    analyzed: !!fileState?.analyzed,
+    ready: session.fileReady(file.path),
+    fullySeen: session.fileFullySeen(file.path),
+    unconfirmed: session.unconfirmedCount(file.path),
+    findings: findings.length,
+    change: changeBadge(file.status, file.additions, file.deletions),
+    active: workbenchSelected === file.path,
+    analyzing: analyzingPaths.has(file.path),
+  };
+}
+
+function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState {
   const reviewSet = session.reviewSet;
-  const files: WorkbenchFile[] = (reviewSet?.files ?? []).map((f) => {
-    const { seen, total } = session.coverage(f.path);
-    const findings = session.findings(f.path);
-    const fileState = session.fileState(f.path);
-    return {
-      path: f.path,
-      name: f.path.split('/').pop() ?? f.path,
-      dir: f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '',
-      seen,
-      total,
-      analyzed: !!fileState?.analyzed,
-      ready: session.fileReady(f.path),
-      fullySeen: session.fileFullySeen(f.path),
-      unconfirmed: session.unconfirmedCount(f.path),
-      findings: findings.length,
-      change: changeBadge(f.status, f.additions, f.deletions),
-      active: workbenchSelected === f.path,
-      analyzing: analyzingPaths.has(f.path),
-    };
-  });
+  const structureVersion = session.reviewStructureVersion;
+  if (workbenchFilesVersion !== structureVersion) {
+    workbenchFilesCache = (reviewSet?.files ?? []).map(buildWorkbenchFile);
+    workbenchFileIndex.clear();
+    workbenchFilesCache.forEach((file, index) => workbenchFileIndex.set(file.path, index));
+    workbenchFilesVersion = structureVersion;
+  } else {
+    for (const path of changedPaths ?? []) {
+      const index = workbenchFileIndex.get(path);
+      const reviewFile = session.reviewFile(path);
+      if (index !== undefined && reviewFile) {
+        Object.assign(workbenchFilesCache[index], buildWorkbenchFile(reviewFile));
+      }
+    }
+  }
 
   const selectedFindings = workbenchSelected
     ? session.findings(workbenchSelected).map((f) => {
@@ -1292,8 +1391,9 @@ function buildWorkbenchState(): WorkbenchState {
 
   return {
     hasReviewSet: !!reviewSet,
+    structureVersion,
     label: reviewSet?.label ?? m().review.notStarted,
-    files,
+    files: workbenchFilesCache,
     selected: workbenchSelected,
     findings: selectedFindings,
     coverage: session.totalCoverage(),
@@ -1339,7 +1439,8 @@ async function openFileInPanel(relPath: string): Promise<void> {
   }
   // Switching to a different file invalidates any open fix-proposal panel
   // (it's scoped to one finding in the file we're leaving).
-  if (workbenchSelected !== relPath) {
+  const previousSelected = workbenchSelected;
+  if (previousSelected !== relPath) {
     FixProposalPanel.closeIfOpen();
     // Cancel the leaving file's in-flight bilingual translation so it doesn't
     // keep running (and piling up) after we navigate away.
@@ -1348,6 +1449,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
     }
   }
   workbenchSelected = relPath;
+  DocumentPanel.beginLoading(relPath);
+  if (previousSelected) {
+    WorkbenchPanel.refreshIfOpen(previousSelected);
+  }
+  WorkbenchPanel.refreshIfOpen(relPath);
   // Race guard: rapid clicks must not pile up heavy renders or let a slow,
   // already-superseded open overwrite the panel. Each call claims a token; after
   // every await we bail if a newer click has taken over.
@@ -1360,7 +1466,7 @@ async function openFileInPanel(relPath: string): Promise<void> {
     WorkbenchPanel.setBusy(true, m().workbench.openingFile);
   }
   try {
-  const text = await readReviewFileText(relPath);
+  const text = await readReviewFileText(relPath, true);
   if (myGeneration !== openFileGeneration) {
     return; // a newer click superseded us — skip the expensive render + show.
   }
@@ -1368,22 +1474,21 @@ async function openFileInPanel(relPath: string): Promise<void> {
   if (myGeneration !== openFileGeneration) {
     return; // rendering may have yielded; bail before overwriting the panel.
   }
-  const diffLines = await buildDocDiff(relPath, text, render);
-  if (myGeneration !== openFileGeneration) {
-    return;
-  }
-  if (diffLines) {
-    docDiffCache.set(relPath, diffLines);
-  } else {
-    docDiffCache.delete(relPath);
-  }
+  const cachedDiff = docDiffCache.get(relPath);
   session.setTotalLines(relPath, render.totalLines);
-  const anchors = await computeFindingAnchors(relPath);
+  const anchors = await computeFindingAnchors(relPath, text);
   if (myGeneration !== openFileGeneration) {
     return; // anchoring may have yielded; bail before overwriting the panel.
   }
-  DocumentPanel.show(buildDocModel(relPath, render, anchors, diffLines), docActions());
+  const initialModel = buildDocModel(relPath, render, anchors, cachedDiff);
+  if (!cachedDiff && session.reviewSet?.comparison) {
+    initialModel.defaultToDiff = false;
+  }
+  DocumentPanel.show(initialModel, docActions());
   void ensureDocLocalized(relPath);
+  if (!cachedDiff && session.reviewSet?.comparison) {
+    void buildAndAttachDocDiff(relPath, text, myGeneration);
+  }
   // Showing the document beside the workbench just created the second editor
   // group. Apply the narrow-workbench / wide-document split once per review now
   // that there is real content to size — rather than pre-creating an empty group
@@ -1392,12 +1497,43 @@ async function openFileInPanel(relPath: string): Promise<void> {
     layoutAppliedForCurrentReview = true;
     await applyWorkbenchLayout();
   }
-  WorkbenchPanel.refreshIfOpen();
+  } catch (err) {
+    if (myGeneration === openFileGeneration) {
+      workbenchSelected = previousSelected;
+      WorkbenchPanel.refreshIfOpen(relPath);
+      if (previousSelected) {
+        WorkbenchPanel.refreshIfOpen(previousSelected);
+      }
+      DocumentPanel.restoreTitle();
+      const message = String((err as Error)?.message ?? err);
+      if (!WorkbenchPanel.flashNotice(m().review.error(message), 'error')) {
+        void vscode.window.showErrorMessage(m().review.error(message));
+      }
+    }
   } finally {
     if (needLayout) {
       WorkbenchPanel.setBusy(false);
     }
   }
+}
+
+async function buildAndAttachDocDiff(
+  relPath: string,
+  text: string,
+  generation: number,
+): Promise<void> {
+  // Let the lightweight file model paint before base-file I/O and diff work.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const diffLines = await buildDocDiff(relPath, text);
+  if (
+    generation !== openFileGeneration
+    || DocumentPanel.currentPath !== relPath
+    || !diffLines
+  ) {
+    return;
+  }
+  docDiffCache.set(relPath, diffLines);
+  DocumentPanel.setDiff(relPath, diffLines, true);
 }
 
 /** Renders (and caches) the highlighted/markdown content for a file. */
@@ -1430,11 +1566,10 @@ function languageIdFor(relPath: string): string {
 async function buildDocDiff(
   relPath: string,
   headText: string,
-  headRender: DocumentRender,
 ): Promise<DocDiffLine[] | undefined> {
   const reviewSet = session.reviewSet;
   const comparison = reviewSet?.comparison;
-  const file = reviewSet?.files.find((candidate) => candidate.path === relPath);
+  const file = session.reviewFile(relPath);
   const cwd = activeCwd();
   if (!comparison || !file || !cwd) {
     return undefined;
@@ -1453,11 +1588,15 @@ async function buildDocDiff(
     if (baseText === undefined) {
       return undefined;
     }
-    baseRender = renderDocument(
-      baseText,
-      languageIdFor(basePath),
-      basePath.split('/').pop() ?? basePath,
-    );
+    baseRender = baseRenderCache.get(cacheKey);
+    if (!baseRender) {
+      baseRender = renderDocument(
+        baseText,
+        languageIdFor(basePath),
+        basePath.split('/').pop() ?? basePath,
+      );
+      baseRenderCache.set(cacheKey, baseRender);
+    }
   }
 
   const headSideText = file.status === 'deleted' ? undefined : headText;
@@ -1471,7 +1610,7 @@ async function buildDocDiff(
     newLine: line.newLine,
     html: line.kind === 'deleted'
       ? baseRender?.sourceLines[(line.oldLine ?? 1) - 1] ?? ''
-      : headRender.sourceLines[(line.newLine ?? 1) - 1] ?? '',
+      : undefined,
   }));
 }
 
@@ -1483,12 +1622,13 @@ function buildDocModel(
   diffLines?: DocDiffLine[],
 ): DocModel {
   const state = session.fileState(relPath);
-  const rawLines = deHighlight(render.sourceLines);
+  const rawLines = render.isMarkdown ? deHighlight(render.sourceLines) : [];
   const lang = resolveLanguage();
   const findings = localizeFindingsNow(relPath, session.findings(relPath), lang);
   const annotations = localizeAnnotationsNow(relPath, session.annotations(relPath), lang);
   return {
     path: relPath,
+    revision: render.revision,
     name: relPath.split('/').pop() ?? relPath,
     isMarkdown: render.isMarkdown,
     readingHtml: render.readingHtml,
@@ -1547,6 +1687,7 @@ function buildDocModel(
  */
 async function computeFindingAnchors(
   relPath: string,
+  currentText?: string,
 ): Promise<Map<string, { line: number; endLine: number }>> {
   const anchors = new Map<string, { line: number; endLine: number }>();
   const findings = session.findings(relPath);
@@ -1558,9 +1699,9 @@ async function computeFindingAnchors(
     return anchors;
   }
   try {
-    const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), relPath);
-    const doc = await vscode.workspace.openTextDocument(fileUri);
-    const docLines = doc.getText().split(/\r?\n/);
+    const docLines = currentText !== undefined
+      ? currentText.split(/\r?\n/)
+      : (await readReviewFileText(relPath)).split(/\r?\n/);
     for (const f of findings) {
       const edit = appliedFixes.get(fixKey(relPath, f.id));
       // Anchor the inline card to real code: prefer an applied fix's current
@@ -1678,7 +1819,7 @@ async function reloadDocPanel(relPath: string): Promise<void> {
   docDiffCache.delete(relPath);
   const text = await readReviewFileText(relPath);
   const render = renderFor(relPath, text);
-  const diffLines = await buildDocDiff(relPath, text, render);
+  const diffLines = await buildDocDiff(relPath, text);
   if (diffLines) {
     docDiffCache.set(relPath, diffLines);
   }
@@ -2120,7 +2261,7 @@ async function annotateWithNote(
  * Reads the current text of a review file, preferring an already-open document
  * (which includes unsaved edits) over the on-disk copy.
  */
-async function readReviewFileText(relPath: string): Promise<string> {
+async function readReviewFileText(relPath: string, strict = false): Promise<string> {
   if (!ensureReviewPath(relPath, m().actions.read)) {
     return '';
   }
@@ -2137,9 +2278,11 @@ async function readReviewFileText(relPath: string): Promise<string> {
     return open.getText();
   }
   try {
-    const doc = await vscode.workspace.openTextDocument(uri);
-    return doc.getText();
-  } catch {
+    return Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+  } catch (err) {
+    if (strict) {
+      throw err;
+    }
     return '';
   }
 }
@@ -2194,7 +2337,7 @@ async function analyzeByPath(rel: string): Promise<void> {
   // the current session's findings.
   const reviewSet = session.reviewSet;
   analyzingPaths.add(rel);
-  WorkbenchPanel.refreshIfOpen();
+  WorkbenchPanel.refreshIfOpen(rel);
   // Progress + result feedback lives in the document view (current window), not a
   // parent-window notification that is invisible when the workbench is full-screen.
   // The 「分析此文件」 button shows an indeterminate progress bar via setAnalyzing.
@@ -2227,7 +2370,7 @@ async function analyzeByPath(rel: string): Promise<void> {
   } finally {
     cts.dispose();
     analyzingPaths.delete(rel);
-    WorkbenchPanel.refreshIfOpen();
+    WorkbenchPanel.refreshIfOpen(rel);
     DocumentPanel.setAnalyzing(rel, false, ok);
   }
 }

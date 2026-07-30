@@ -4,6 +4,7 @@ interface Disposable {
 
 interface MockWebview {
   html: string;
+  options?: unknown;
   messages: unknown[];
   onDidReceiveMessage(listener: (message: unknown) => void): Disposable;
   postMessage(message: unknown): Promise<boolean>;
@@ -22,6 +23,7 @@ export interface MockWebviewPanel {
 export const vscodeMockState: {
   language: string;
   panel?: MockWebviewPanel;
+  progress?: { options: unknown; reports: unknown[] };
 } = {
   language: 'en',
 };
@@ -69,10 +71,18 @@ function createPanel(): MockWebviewPanel {
   };
 }
 
+export function createMockWebviewPanel(title = ''): MockWebviewPanel {
+  const panel = createPanel();
+  panel.title = title;
+  vscodeMockState.panel = panel;
+  return panel;
+}
+
 export function resetVscodeMock(): void {
   vscodeMockState.panel?.dispose();
   vscodeMockState.language = 'en';
   vscodeMockState.panel = undefined;
+  vscodeMockState.progress = undefined;
 }
 
 export const workspace = {
@@ -88,17 +98,49 @@ export const workspace = {
 
 export const window = {
   createWebviewPanel: (_viewType: string, title: string) => {
-    const panel = createPanel();
-    panel.title = title;
-    vscodeMockState.panel = panel;
-    return panel;
+    return createMockWebviewPanel(title);
   },
   showWarningMessage: async () => undefined,
   setStatusBarMessage: () => disposable(),
+  withProgress: async <T>(
+    options: unknown,
+    task: (progress: { report(value: unknown): void }) => Promise<T>,
+  ): Promise<T> => {
+    const reports: unknown[] = [];
+    vscodeMockState.progress = { options, reports };
+    return task({ report: (value) => reports.push(value) });
+  },
+};
+
+export const commands = {
+  executeCommand: async () => undefined,
 };
 
 export const env = { language: 'en' };
-export const ViewColumn = { Beside: 2 };
+export const ViewColumn = { One: 1, Beside: 2 };
+export const ProgressLocation = { Notification: 15 };
+
+export class EventEmitter<T> {
+  private readonly listeners = new Set<(value: T) => void>();
+  readonly event = (listener: (value: T) => void): Disposable => {
+    this.listeners.add(listener);
+    return { dispose: () => this.listeners.delete(listener) };
+  };
+
+  fire(value: T): void {
+    for (const listener of this.listeners) listener(value);
+  }
+
+  dispose(): void {
+    this.listeners.clear();
+  }
+}
+
+export class Uri {
+  static file(fsPath: string): { fsPath: string; scheme: string } {
+    return { fsPath, scheme: 'file' };
+  }
+}
 
 export class CancellationTokenSource {
   readonly token = { isCancellationRequested: false };

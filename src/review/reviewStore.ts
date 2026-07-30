@@ -154,7 +154,9 @@ export function isBlankFileState(s: PerFileState | undefined): boolean {
   const noNotes = !s.annotations || s.annotations.length === 0;
   const noDisp = !s.dispositions || Object.keys(s.dispositions).length === 0;
   const noLegacy = !s.confirmedFindings || s.confirmedFindings.length === 0;
-  return noSeen && noFindings && noNotes && noDisp && noLegacy;
+  const noMeasuredLines = !s.totalLines;
+  const noAnalysis = !s.analyzed;
+  return noSeen && noFindings && noNotes && noDisp && noLegacy && noMeasuredLines && noAnalysis;
 }
 
 /**
@@ -175,6 +177,11 @@ export interface ReviewStore {
   findLatestForScope?(repo: string, scopeId: string): Promise<ReviewSnapshot | undefined>;
   /** Loads a single file's progress (per-file storage), or undefined. */
   loadFile?(repo: string, filePath: string): Promise<PerFileState | undefined>;
+  /** Loads only persisted states whose paths belong to the active review. */
+  loadFiles?(
+    repo: string,
+    activePaths: ReadonlySet<string>,
+  ): Promise<Map<string, PerFileState>>;
   /** Saves a single file's progress (per-file storage). */
   saveFile?(repo: string, filePath: string, state: PerFileState): Promise<void>;
   /**
@@ -222,6 +229,28 @@ export class WorkspaceStateReviewStore implements ReviewStore {
 
   async loadFile(repo: string, filePath: string): Promise<PerFileState | undefined> {
     return this.memento.get<PerFileState>(fileStorageKey(repo, filePath));
+  }
+
+  async loadFiles(
+    repo: string,
+    activePaths: ReadonlySet<string>,
+  ): Promise<Map<string, PerFileState>> {
+    const prefix = `codereview:file:${repo}#`;
+    const states = new Map<string, PerFileState>();
+    for (const key of this.memento.keys()) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const filePath = key.slice(prefix.length);
+      if (!activePaths.has(filePath)) {
+        continue;
+      }
+      const state = this.memento.get<PerFileState>(key);
+      if (state && !isBlankFileState(state)) {
+        states.set(filePath, state);
+      }
+    }
+    return states;
   }
 
   async saveFile(repo: string, filePath: string, state: PerFileState): Promise<void> {

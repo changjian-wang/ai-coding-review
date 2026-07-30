@@ -1,5 +1,5 @@
 import * as git from './gitClient';
-import { checkoutPr, ensureAuth, ensureGhAvailable, getCurrentPr, getPrByNumber } from '../gh/ghClient';
+import { checkoutPr, getCurrentPr, getPrByNumber } from '../gh/ghClient';
 import { m } from '../i18n';
 import type { ReviewFile, ReviewScope, ReviewSet } from './types';
 import type { PullRequest } from '../gh/types';
@@ -58,8 +58,6 @@ async function prReviewSet(cwd: string, pr: PullRequest): Promise<ReviewSet> {
 /** PR associated with the current branch (via GitHub CLI). Lists files only. */
 export class PrScope implements ReviewScope {
   async load(cwd: string): Promise<ReviewSet> {
-    await ensureGhAvailable(cwd);
-    await ensureAuth(cwd);
     const pr = await getCurrentPr(cwd);
     // Use gh's authoritative changed-file list, not a local `git diff` range:
     // on a fork the local `origin/<base>` lags upstream, so the range would
@@ -76,8 +74,6 @@ export class PrByNumberScope implements ReviewScope {
   constructor(private readonly number: number) {}
 
   async load(cwd: string): Promise<ReviewSet> {
-    await ensureGhAvailable(cwd);
-    await ensureAuth(cwd);
     // Check out the PR's branch so the working tree matches the PR under review;
     // a chosen PR is usually not the branch currently checked out.
     await checkoutPr(cwd, this.number);

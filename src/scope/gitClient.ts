@@ -147,7 +147,58 @@ export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[
 
 /** Tracked changes in the working tree and index vs HEAD. */
 export async function workingTreeFiles(cwd: string): Promise<ReviewFile[]> {
-  return diffFilesWithStatus(cwd, ['HEAD']);
+  const [tracked, untracked] = await Promise.all([
+    diffFilesWithStatus(cwd, ['HEAD']),
+    git(['ls-files', '-o', '--exclude-standard', '-z'], cwd),
+  ]);
+  const byPath = new Map(tracked.map((file) => [file.path, file]));
+  for (const filePath of untracked.split('\0').filter(Boolean)) {
+    if (!byPath.has(filePath)) {
+      byPath.set(filePath, { path: filePath, status: 'added' });
+    }
+  }
+  return [...byPath.values()];
+}
+
+export interface GitWorkingFile {
+  path: string;
+  /** Git object size for tracked files; undefined for untracked files. */
+  size?: number;
+}
+
+/** Tracked plus untracked, non-ignored files in the current Git work tree. */
+export async function listWorkingFiles(cwd: string): Promise<GitWorkingFile[]> {
+  const untrackedPromise = git(['ls-files', '-o', '--exclude-standard', '-z'], cwd).then(
+    (out) => ({ out }),
+    (error: unknown) => ({ error }),
+  );
+  let tracked: GitWorkingFile[];
+  try {
+    const out = await git(
+      ['ls-files', '-z', '--format=%(objectsize)%x09%(path)'],
+      cwd,
+    );
+    tracked = out.split('\0').filter(Boolean).map((record) => {
+      const tab = record.indexOf('\t');
+      return {
+        path: tab >= 0 ? record.slice(tab + 1) : record,
+        size: tab >= 0 ? Number(record.slice(0, tab)) : undefined,
+      };
+    });
+  } catch {
+    // Older Git versions do not support objectsize in --format.
+    const out = await git(['ls-files', '-c', '-z'], cwd);
+    tracked = out.split('\0').filter(Boolean).map((filePath) => ({ path: filePath }));
+  }
+  const untrackedResult = await untrackedPromise;
+  if ('error' in untrackedResult) {
+    throw untrackedResult.error;
+  }
+  const untracked = untrackedResult.out;
+  return [
+    ...tracked,
+    ...untracked.split('\0').filter(Boolean).map((filePath) => ({ path: filePath })),
+  ];
 }
 
 /** The common ancestor Git uses as the old side of a three-dot comparison. */
