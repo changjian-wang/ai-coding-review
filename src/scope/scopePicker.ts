@@ -2,7 +2,6 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import {
-  CurrentBranchScope,
   FileSystemScope,
   PrScope,
   PrByNumberScope,
@@ -17,7 +16,7 @@ import type { ReviewScope, ReviewSet } from './types';
 import type { PrSummary } from '../gh/types';
 import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
-import { listWorkingFiles } from './gitClient';
+import { currentBranch, listWorkingFiles } from './gitClient';
 
 /** Result of {@link pickScope}: the chosen scope plus the workspace-folder cwd it should run against. */
 export interface PickedScope {
@@ -30,7 +29,7 @@ export interface PickedScope {
   cwd: string;
 }
 
-export type PreferredScopeKind = 'currentPr' | 'branch';
+export type PreferredScopeKind = 'currentPr' | 'branchSource';
 
 interface PreferredLoadedScope extends PickedScope {
   kind: PreferredScopeKind;
@@ -42,16 +41,38 @@ interface PreferredScopeCandidate {
   scope: ReviewScope;
 }
 
+export class CurrentBranchSourceScope implements ReviewScope {
+  constructor(
+    private readonly onProgress?: (progress: ScopeScanProgress) => void,
+    private readonly discover = scanReviewablePaths,
+    private readonly resolveBranch = currentBranch,
+  ) {}
+
+  async load(cwd: string): Promise<ReviewSet> {
+    const [branch, relPaths] = await Promise.all([
+      this.resolveBranch(cwd),
+      this.discover([vscode.Uri.file(cwd)], cwd, this.onProgress),
+    ]);
+    return {
+      scopeId: `branch-source-${branch}`,
+      label: m().scope.currentBranchSources(branch, relPaths.length),
+      headSha: 'live',
+      files: relPaths.map((filePath) => ({ path: filePath })),
+    };
+  }
+}
+
 /**
- * Picks the first non-empty change scope without ever falling back to a whole
- * repository scan. Callers can still offer explicit file/folder selection.
+ * Picks the current PR when available; otherwise reviews all source files on
+ * the checked-out branch.
  */
 export async function tryLoadPreferredScope(
   cwd: string,
   onAttempt?: (kind: PreferredScopeKind) => void,
+  onProgress?: (progress: ScopeScanProgress) => void,
   candidates: PreferredScopeCandidate[] = [
     { kind: 'currentPr', scope: new PrScope() },
-    { kind: 'branch', scope: new CurrentBranchScope() },
+    { kind: 'branchSource', scope: new CurrentBranchSourceScope(onProgress) },
   ],
 ): Promise<PreferredLoadedScope | undefined> {
   for (const candidate of candidates) {

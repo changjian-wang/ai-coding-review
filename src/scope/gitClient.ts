@@ -145,15 +145,6 @@ export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[
   return diffFilesWithStatus(cwd, [range]);
 }
 
-/** Untracked, non-ignored files in the current Git work tree. */
-export async function untrackedFiles(cwd: string): Promise<ReviewFile[]> {
-  const out = await git(['ls-files', '-o', '--exclude-standard', '-z'], cwd);
-  return out.split('\0').filter(Boolean).map((filePath) => ({
-    path: filePath,
-    status: 'added',
-  }));
-}
-
 export interface GitWorkingFile {
   path: string;
   /** Git object size for tracked files; undefined for untracked files. */

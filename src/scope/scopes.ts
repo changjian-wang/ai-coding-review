@@ -86,49 +86,6 @@ export class PrByNumberScope implements ReviewScope {
 }
 
 /**
- * All changes carried by the current branch, including committed, staged,
- * unstaged, and untracked files, compared with the branch's merge base.
- */
-export class CurrentBranchScope implements ReviewScope {
-  constructor(private readonly base?: string) {}
-
-  async load(cwd: string): Promise<ReviewSet> {
-    await git.ensureGitRepo(cwd);
-    const base = this.base ?? (await git.detectBaseBranch(cwd));
-    const headSha = await git.headSha(cwd);
-    const baseSha = await git.mergeBase(cwd, base, 'HEAD');
-    const [branchFiles, workingTreeFiles] = await Promise.all([
-      // A single commit argument compares that commit with index + working tree,
-      // so tracked staged/unstaged changes are already included here.
-      git.diffFiles(cwd, baseSha),
-      // Supplies untracked additions, which `git diff <base>` cannot report.
-      git.untrackedFiles(cwd),
-    ]);
-    const files = mergeCurrentBranchFiles(branchFiles, workingTreeFiles);
-    return {
-      scopeId: `current-branch-vs-${base}`,
-      label: m().scope.branchVsBase(base),
-      headSha,
-      files,
-      comparison: { baseSha, headSha },
-    };
-  }
-}
-
-export function mergeCurrentBranchFiles(
-  branchFiles: ReviewFile[],
-  workingTreeFiles: ReviewFile[],
-): ReviewFile[] {
-  const byPath = new Map(branchFiles.map((file) => [file.path, file]));
-  for (const file of workingTreeFiles) {
-    if (!byPath.has(file.path)) {
-      byPath.set(file.path, file);
-    }
-  }
-  return [...byPath.values()];
-}
-
-/**
  * Source files chosen directly by the user — pure source review, no diff.
  * `relPaths` are repository-relative paths already expanded from the selection.
  */

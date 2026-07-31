@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ReviewSet } from './types';
 import {
+  CurrentBranchSourceScope,
   scanReviewablePaths,
   tryLoadPreferredScope,
   type ScopeScanProgress,
@@ -60,37 +61,53 @@ describe('scanReviewablePaths progress', () => {
 });
 
 describe('tryLoadPreferredScope', () => {
-  it('uses the current branch when no PR is available', async () => {
+  it('uses current branch sources when no PR is available', async () => {
     const attempts: string[] = [];
     const branchSet: ReviewSet = {
-      scopeId: 'branch-vs-main',
-      label: 'Current branch vs main',
-      headSha: 'abc',
-      files: [{ path: 'src/changed.ts' }],
+      scopeId: 'branch-source-main',
+      label: 'main · 2 source files',
+      headSha: 'live',
+      files: [{ path: 'src/a.ts' }, { path: 'src/b.ts' }],
     };
     const candidates = [
       { kind: 'currentPr' as const, scope: { load: async () => { throw new Error('no PR'); } } },
-      { kind: 'branch' as const, scope: { load: async () => branchSet } },
+      { kind: 'branchSource' as const, scope: { load: async () => branchSet } },
     ];
 
     const result = await tryLoadPreferredScope(
       'C:\\repo',
       (kind) => attempts.push(kind),
+      undefined,
       candidates,
     );
 
-    expect(attempts).toEqual(['currentPr', 'branch']);
-    expect(result?.kind).toBe('branch');
+    expect(attempts).toEqual(['currentPr', 'branchSource']);
+    expect(result?.kind).toBe('branchSource');
     expect(result?.reviewSet).toBe(branchSet);
   });
 
   it('returns undefined instead of scanning the whole repository', async () => {
     const candidates = [
       { kind: 'currentPr' as const, scope: { load: async () => { throw new Error('no PR'); } } },
-      { kind: 'branch' as const, scope: { load: async () => ({ ...sampleReviewSet, files: [] }) } },
+      { kind: 'branchSource' as const, scope: { load: async () => ({ ...sampleReviewSet, files: [] }) } },
     ];
 
-    await expect(tryLoadPreferredScope('C:\\repo', undefined, candidates))
+    await expect(tryLoadPreferredScope('C:\\repo', undefined, undefined, candidates))
       .resolves.toBeUndefined();
+  });
+
+  it('builds a pure-source review for the checked-out branch', async () => {
+    const scope = new CurrentBranchSourceScope(
+      undefined,
+      async () => ['src/a.ts', 'src/b.ts'],
+      async () => 'feature/demo',
+    );
+
+    await expect(scope.load('C:\\repo')).resolves.toEqual({
+      scopeId: 'branch-source-feature/demo',
+      label: 'feature/demo · 2 source files',
+      headSha: 'live',
+      files: [{ path: 'src/a.ts' }, { path: 'src/b.ts' }],
+    });
   });
 });

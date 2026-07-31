@@ -128,7 +128,9 @@ const LAST_REVIEW_FOLDER_KEY = 'codereview.lastReviewFolder.v1';
 const LAST_SCOPE_KEY = 'codereview.lastScope.v1';
 /** Persisted descriptor of the last reviewed scope. */
 type PersistedScope =
+  // `folder` is retained for descriptors written by versions before 0.4.2.
   | { kind: 'folder'; cwd: string }
+  | { kind: 'preferred'; cwd: string }
   | { kind: 'files'; cwd: string; relPaths: string[] }
   | { kind: 'pr'; cwd: string; number: number; reviewSet?: ReviewSet };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
@@ -813,7 +815,8 @@ async function openInNewWindow(
 
     const loaded = await loadPreferredReviewWithProgress(chosenCwd, loading.progress);
     if (!loaded) {
-      WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
+      loading.panel.dispose();
+      transientWarning(m().review.noReviewableFiles);
       return;
     }
     loading.progress.report(m().workbench.loadingOpening, 'open');
@@ -842,14 +845,19 @@ async function loadPreferredReviewWithProgress(
 ): Promise<boolean> {
   const attemptMessage = (kind: PreferredScopeKind): string => {
     if (kind === 'currentPr') return m().scope.checkingCurrentPr;
-    return m().scope.checkingBranchChanges;
+    return m().scope.loadingCurrentBranch;
   };
   const preferred = await tryLoadPreferredScope(
     cwd,
     (kind) => progress.report(attemptMessage(kind), 'scan'),
+    ({ directoriesScanned, filesFound, percent, etaSeconds, estimated }) =>
+      progress.report(
+        m().scope.scanProgress(directoriesScanned, filesFound),
+        'scan',
+        { percent, etaSeconds, estimated },
+      ),
   );
   if (!preferred) {
-    progress.report(m().scope.noPreferredChanges, 'open');
     return false;
   }
   try {
@@ -957,7 +965,7 @@ function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): v
       ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
       : Number.isFinite(prNumber)
         ? { kind: 'pr', cwd, number: prNumber, reviewSet }
-      : { kind: 'folder', cwd };
+        : { kind: 'preferred', cwd };
   void workspaceMemento?.update(LAST_SCOPE_KEY, descriptor);
 }
 
@@ -1069,6 +1077,10 @@ async function selectLanguage(): Promise<void> {
 
 /** Opens (or reveals) the Review Workbench webview. */
 async function openWorkbench(opts: { moveToNewWindow?: boolean } = {}): Promise<void> {
+  if (!session.reviewSet) {
+    await startReview();
+    return;
+  }
   // Snapshot BEFORE show(): only a freshly created panel may be relocated to a
   // new window. If the workbench already exists it may already live in its own
   // auxiliary window — moving it again spawns a second empty window and leaves
@@ -1220,7 +1232,7 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
       await restoreLastScope(cwd, progress);
     }
     if (!session.reviewSet) {
-      WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
+      panel.dispose();
       return;
     }
     progress.report(m().workbench.loadingOpening, 'open');
@@ -1388,7 +1400,6 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
     : [];
 
   return {
-    hasReviewSet: !!reviewSet,
     structureVersion,
     label: reviewSet?.label ?? m().review.notStarted,
     files: workbenchFilesCache,

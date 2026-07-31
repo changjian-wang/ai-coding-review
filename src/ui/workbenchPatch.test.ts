@@ -36,7 +36,6 @@ describe('WorkbenchPanel incremental patching', () => {
 
 function workbenchState(): WorkbenchState {
   return {
-    hasReviewSet: true,
     structureVersion: 1,
     label: 'PR #1',
     files: [

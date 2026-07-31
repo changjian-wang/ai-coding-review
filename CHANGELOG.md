@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- When the current branch has no pull request, automatic scope selection now opens the
-  complete current-branch change set, including committed, staged, unstaged, and untracked files.
+- When the current branch has no pull request, automatic scope selection now opens all
+  reviewable source files from the checked-out branch instead of showing an empty workbench.
 
 ## [0.4.2] - 2026-07-30
 

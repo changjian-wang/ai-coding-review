@@ -37,8 +37,6 @@ export interface WorkbenchFinding {
 
 /** Serializable snapshot the webview renders. */
 export interface WorkbenchState {
-  /** True when a review has been started and we have a review set loaded. */
-  hasReviewSet: boolean;
   /** Changes only when the review file set is replaced. */
   structureVersion: number;
   label: string;
@@ -436,12 +434,12 @@ export class WorkbenchPanel {
       this.refreshTimer = undefined;
     }
     const state = this.getState(changedPaths);
-    const sig = state.hasReviewSet ? String(state.structureVersion) : '__empty__';
+    const sig = String(state.structureVersion);
     // Hot path: while the file set is unchanged (the common case during a
     // review — only progress / findings / selection change), patch the live
     // DOM in place via postMessage instead of reassigning `webview.html`, which
     // would force a full reload + re-parse + relayout of thousands of nodes.
-    if (this.rendered && sig === this.lastStructureSig && state.hasReviewSet) {
+    if (this.rendered && sig === this.lastStructureSig) {
       void this.panel.webview.postMessage({
         type: 'patch',
         ...this.computePatch(state, changedPaths),
@@ -469,7 +467,7 @@ export class WorkbenchPanel {
     const state = this.getState();
     const root = compactTree(buildTree(state.files));
     this.indexStructure(state, root);
-    this.lastStructureSig = state.hasReviewSet ? String(state.structureVersion) : '__empty__';
+    this.lastStructureSig = String(state.structureVersion);
     this.rendered = true;
     this.lastSnapshot = snapshotFor(state, root);
     this.panel.webview.html = this.render(state, root);
@@ -706,10 +704,6 @@ export class WorkbenchPanel {
       { id: 'currentPr', label: stripIcon(m().scope.pickPrLabel), detail: m().scope.pickPrDetail },
       { id: 'prList', label: stripIcon(m().scope.pickPrListLabel), detail: m().scope.pickPrListDetail },
     ];
-
-    if (!state.hasReviewSet) {
-      return this.renderEmpty(nonce, csp);
-    }
 
     const pct = state.coverage.total > 0
       ? Math.round((state.coverage.seen / state.coverage.total) * 100)
@@ -1467,45 +1461,6 @@ export class WorkbenchPanel {
       if (tbCaret) tbCaret.textContent = '\u25BE';
     }
   }
-</script>
-</body>
-</html>`;
-  }
-
-  /** Empty hero shown when the workbench is open but no review has been started yet. */
-  private renderEmpty(nonce: string, csp: string): string {
-    const t = m().workbench;
-    const lang = resolveLanguage();
-    return `<!DOCTYPE html>
-<html lang="${lang}">
-<head>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Security-Policy" content="${csp}" />
-<style>
-  * { box-sizing:border-box; }
-  body { margin:0; height:100vh; display:flex; align-items:center; justify-content:center;
-    font-family:var(--vscode-font-family); color:var(--vscode-foreground);
-    background:var(--vscode-editor-background); }
-  .hero { max-width:520px; padding:32px 40px; text-align:center; }
-  .hero h1 { font-size:1.4rem; margin:0 0 .8rem; font-weight:600; }
-  .hero p { font-size:.92rem; line-height:1.6; color:var(--vscode-descriptionForeground); margin:0 0 1.5rem; }
-  .hero button { font-family:inherit; font-size:.95rem; padding:.65rem 1.4rem; border-radius:6px;
-    background:var(--vscode-button-background); color:var(--vscode-button-foreground);
-    border:1px solid transparent; cursor:pointer; }
-  .hero button:hover { background:var(--vscode-button-hoverBackground); }
-  .hero .hint { font-size:.78rem; color:var(--vscode-descriptionForeground); margin-top:1.2rem; }
-</style>
-</head>
-<body>
-  <div class="hero">
-    <h1>${esc(t.emptyTitle)}</h1>
-    <p>${esc(t.emptyDesc)}</p>
-    <button id="pickScope" autofocus>${esc(t.emptyButton)}</button>
-    <div class="hint">${esc(t.emptyHint)}</div>
-  </div>
-<script nonce="${nonce}">
-  const vscode = acquireVsCodeApi();
-  document.getElementById('pickScope').addEventListener('click', () => vscode.postMessage({ type:'pickScope' }));
 </script>
 </body>
 </html>`;

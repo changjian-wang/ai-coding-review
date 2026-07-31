@@ -227,17 +227,17 @@ export const en = {
       'Pick the sources to review (local files/folders or the current branch PR)',
     scanning: 'AI Coding Review: scanning project files…',
     checkingCurrentPr: 'Checking for a pull request on the current branch…',
-    checkingBranchChanges: 'Opening all changes on the current branch…',
+    loadingCurrentBranch: 'Loading source files from the current branch…',
     preferredScopeFound: (label: string, files: number) =>
-      `Using ${label} · ${files.toLocaleString('en-US')} changed files`,
-    noPreferredChanges: 'No changed files found. Select files or a folder to start a review.',
+      `Using ${label} · ${files.toLocaleString('en-US')} review files`,
     scanProgress: (directories: number, files: number) =>
       `Scanned ${directories.toLocaleString('en-US')} folders · found ${files.toLocaleString('en-US')} reviewable files`,
     preparingReview: (files: number) =>
       `Preparing review state for ${files.toLocaleString('en-US')} files…`,
     noFiles:
       'No reviewable files in this project (skipped node_modules / .git / dist / out / bin / obj / .vs).',
-    branchVsBase: (base: string) => `Current branch vs ${base}`,
+    currentBranchSources: (branch: string, count: number) =>
+      `${branch} · ${count.toLocaleString('en-US')} source files`,
     selectedSources: (count: number) => `Selected sources (${count})`,
   },
 
@@ -298,12 +298,6 @@ export const en = {
     loadingStageOpen: 'Open workbench',
     loadingEta: 'About {0} remaining',
     loadingElapsed: '{0} elapsed',
-    emptyTitle: 'AI Coding Review · Workbench',
-    emptyDesc:
-      'Pick a scope to review (local files / folders, or the current branch PR) to start a review.',
-    emptyButton: 'Select review scope…',
-    emptyHint:
-      'Once the scope is set, review file-by-file and run global analysis in this window.',
     gateReasonFiles: '{0} file(s) not read and confirmed',
     gateReasonGlobal: 'Global conclusion not confirmed',
     submittedConclusionPrefix: 'Conclusion submitted: ',

@@ -202,17 +202,17 @@ export const zh: Messages = {
     pickPlaceholder: '挑选要纳入审查的源码（本地文件/文件夹 或 当前分支的 PR）',
     scanning: 'AI Coding Review：正在扫描项目文件…',
     checkingCurrentPr: '正在查找当前分支关联的 PR…',
-    checkingBranchChanges: '正在打开当前分支的全部改动…',
+    loadingCurrentBranch: '正在加载当前分支的源码…',
     preferredScopeFound: (label, files) =>
-      `使用 ${label} · ${files.toLocaleString('zh-CN')} 个改动文件`,
-    noPreferredChanges: '没有发现改动文件，请选择文件或目录开始审查。',
+      `使用 ${label} · ${files.toLocaleString('zh-CN')} 个审查文件`,
     scanProgress: (directories, files) =>
       `已扫描 ${directories.toLocaleString('zh-CN')} 个目录 · 已发现 ${files.toLocaleString('zh-CN')} 个可审查文件`,
     preparingReview: (files) =>
       `正在为 ${files.toLocaleString('zh-CN')} 个文件准备审查状态…`,
     noFiles:
       '当前项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
-    branchVsBase: (base) => `当前分支 vs ${base}`,
+    currentBranchSources: (branch, count) =>
+      `${branch} · ${count.toLocaleString('zh-CN')} 个源码文件`,
     selectedSources: (count) => `选定的源码（${count}）`,
   },
 
@@ -271,10 +271,6 @@ export const zh: Messages = {
     loadingStageOpen: '打开工作台',
     loadingEta: '预计剩余 {0}',
     loadingElapsed: '已用时 {0}',
-    emptyTitle: 'AI Coding Review · 工作台',
-    emptyDesc: '选择要审查的范围（本地文件 / 文件夹，或当前分支的 PR），开始一次审查。',
-    emptyButton: '选择审查范围…',
-    emptyHint: '范围确定后即可在此窗口逐文件审查与全局分析。',
     gateReasonFiles: '{0} 个文件未读完并确认',
     gateReasonGlobal: '全局结论未确认',
     submittedConclusionPrefix: '已提交结论：',
