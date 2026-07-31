@@ -260,11 +260,6 @@ function normaliseFileStatus(status: string | undefined): PullRequest['files'][n
   }
 }
 
-/** Raw unified diff for the current branch's PR. */
-export async function getPrDiff(cwd: string): Promise<string> {
-  return runGh(['pr', 'diff'], cwd);
-}
-
 /** Posts a review verdict to a PR via `gh pr review`. */
 export async function submitPrReview(
   cwd: string,
@@ -279,50 +274,6 @@ export async function submitPrReview(
     args.push('--body', body);
   }
   await runGh(args, cwd);
-}
-
-/** Posts a non-line-anchored PR comment. Used when a finding is outside the PR diff. */
-export async function postPrComment(cwd: string, prNumber: number, body: string): Promise<void> {
-  await runGh(['pr', 'comment', String(prNumber), '--body', body], cwd);
-}
-
-/** Posts a single line-anchored review comment to a PR via the GitHub REST API. */
-export async function postPrLineComment(
-  cwd: string,
-  prNumber: number,
-  commitSha: string,
-  filePath: string,
-  line: number,
-  body: string,
-): Promise<{ id: number; url: string }> {
-  // gh api needs the owner/repo, derivable from the remote.
-  const repoJson = await runGh(['repo', 'view', '--json', 'owner,name'], cwd);
-  let repo: { owner: { login: string }; name: string };
-  try {
-    repo = JSON.parse(repoJson);
-  } catch {
-    throw new GhError(m().gh.repoViewParseFailed);
-  }
-  const slug = `${repo.owner.login}/${repo.name}`;
-  const out = await runGh(
-    [
-      'api',
-      `repos/${slug}/pulls/${prNumber}/comments`,
-      '-X', 'POST',
-      '-f', `body=${body}`,
-      '-f', `commit_id=${commitSha}`,
-      '-f', `path=${filePath}`,
-      '-F', `line=${line}`,
-      '-f', 'side=RIGHT',
-    ],
-    cwd,
-  );
-  try {
-    const parsed = JSON.parse(out);
-    return { id: parsed.id, url: parsed.html_url };
-  } catch {
-    throw new GhError(m().gh.commentParseFailed);
-  }
 }
 
 /**

@@ -202,8 +202,7 @@ export const zh: Messages = {
     pickPlaceholder: '挑选要纳入审查的源码（本地文件/文件夹 或 当前分支的 PR）',
     scanning: 'AI Coding Review：正在扫描项目文件…',
     checkingCurrentPr: '正在查找当前分支关联的 PR…',
-    checkingBranchChanges: '正在检查当前分支已提交的改动…',
-    checkingWorkingTree: '正在检查未提交的改动…',
+    checkingBranchChanges: '正在打开当前分支的全部改动…',
     preferredScopeFound: (label, files) =>
       `使用 ${label} · ${files.toLocaleString('zh-CN')} 个改动文件`,
     noPreferredChanges: '没有发现改动文件，请选择文件或目录开始审查。',
@@ -214,7 +213,6 @@ export const zh: Messages = {
     noFiles:
       '当前项目没有可审查的文件（已跳过 node_modules / .git / dist / out / bin / obj / .vs 等目录）',
     branchVsBase: (base) => `当前分支 vs ${base}`,
-    workingTree: '未提交的改动',
     selectedSources: (count) => `选定的源码（${count}）`,
   },
 
@@ -351,6 +349,8 @@ export const zh: Messages = {
     bilingual: '中英对照',
     bilingualTitle: '在右侧并排显示中文译文',
     translatingDoc: '正在翻译文档…',
+    jumpNextChange: '下一处改动',
+    jumpNextChangeTitle: '跳到下一处新增或删除的变更块',
     jumpNextUnseen: '跳到下一处未看',
     analyzeFile: '分析此文件',
     analyzing: '分析中…',
@@ -499,7 +499,6 @@ export const zh: Messages = {
     prParseFailed: '无法解析 gh 返回的 PR 数据。',
     prListParseFailed: '无法解析 gh 返回的 PR 列表。',
     repoViewParseFailed: '无法解析 gh repo view 返回。',
-    commentParseFailed: 'PR 评论已发送但响应解析失败。',
     noCurrentPr: '当前分支没有关联的 PR。请切换到有 PR 的分支，或改用「选择源码文件/文件夹」。',
     checkoutFailed: '切换到 PR 分支失败（可能有未提交改动，或该 Merged/Closed PR 的分支已被删除）。请提交/暂存后重试，或改选 Open PR。',
   },

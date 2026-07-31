@@ -9,7 +9,7 @@ const MAX_BUFFER = 32 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
 
 /** Raised for any git failure with a user-facing message. */
-export class GitError extends Error {}
+class GitError extends Error {}
 
 async function git(args: string[], cwd: string): Promise<string> {
   try {
@@ -145,19 +145,13 @@ export async function diffFiles(cwd: string, range: string): Promise<ReviewFile[
   return diffFilesWithStatus(cwd, [range]);
 }
 
-/** Tracked changes in the working tree and index vs HEAD. */
-export async function workingTreeFiles(cwd: string): Promise<ReviewFile[]> {
-  const [tracked, untracked] = await Promise.all([
-    diffFilesWithStatus(cwd, ['HEAD']),
-    git(['ls-files', '-o', '--exclude-standard', '-z'], cwd),
-  ]);
-  const byPath = new Map(tracked.map((file) => [file.path, file]));
-  for (const filePath of untracked.split('\0').filter(Boolean)) {
-    if (!byPath.has(filePath)) {
-      byPath.set(filePath, { path: filePath, status: 'added' });
-    }
-  }
-  return [...byPath.values()];
+/** Untracked, non-ignored files in the current Git work tree. */
+export async function untrackedFiles(cwd: string): Promise<ReviewFile[]> {
+  const out = await git(['ls-files', '-o', '--exclude-standard', '-z'], cwd);
+  return out.split('\0').filter(Boolean).map((filePath) => ({
+    path: filePath,
+    status: 'added',
+  }));
 }
 
 export interface GitWorkingFile {
@@ -235,7 +229,7 @@ export async function listBranches(cwd: string): Promise<string[]> {
 }
 
 /** True when the working tree or index has uncommitted changes. */
-export async function hasUncommittedChanges(cwd: string): Promise<boolean> {
+async function hasUncommittedChanges(cwd: string): Promise<boolean> {
   const out = await git(['status', '--porcelain'], cwd);
   return out.trim().length > 0;
 }

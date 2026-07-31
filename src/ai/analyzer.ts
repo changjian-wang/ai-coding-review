@@ -15,7 +15,7 @@ import { m } from '../i18n';
 export class AnalysisError extends Error {}
 
 /** The kind of LLM operation, used to bucket token usage by purpose. */
-export type LlmOp = 'analyze' | 'global' | 'fix' | 'diff' | 'translate' | 'explain';
+type LlmOp = 'analyze' | 'global' | 'fix' | 'diff' | 'translate' | 'explain';
 
 /** A single LLM call's estimated token usage. Estimated locally via `countTokens`. */
 export interface TokenUsage {
@@ -32,7 +32,7 @@ export interface TokenUsage {
  * review session. Estimation uses `model.countTokens`, so totals are an
  * approximation — they are NOT the provider's billed token counts.
  */
-export type TokenUsageSink = (usage: TokenUsage) => void;
+type TokenUsageSink = (usage: TokenUsage) => void;
 
 let usageSink: TokenUsageSink | undefined;
 

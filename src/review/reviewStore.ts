@@ -125,7 +125,7 @@ export interface ReviewKey {
   headSha: string;
 }
 
-export function storageKey(k: ReviewKey): string {
+function storageKey(k: ReviewKey): string {
   return `codereview:review:${k.repo}#${k.scopeId}@${k.headSha}`;
 }
 
@@ -135,7 +135,7 @@ export function storageKey(k: ReviewKey): string {
  * belongs to the FILE, so it follows the file across scope re-selections and
  * commits instead of being orphaned when the scope id changes.
  */
-export function fileStorageKey(repo: string, filePath: string): string {
+function fileStorageKey(repo: string, filePath: string): string {
   return `codereview:file:${repo}#${filePath}`;
 }
 

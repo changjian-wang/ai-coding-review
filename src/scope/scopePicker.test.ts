@@ -2,11 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ReviewScope, ReviewSet } from './types';
+import type { ReviewSet } from './types';
 import {
-  buildFolderScope,
+  scanReviewablePaths,
   tryLoadPreferredScope,
-  tryLoadCurrentPrScope,
   type ScopeScanProgress,
 } from './scopePicker';
 
@@ -17,7 +16,7 @@ const sampleReviewSet: ReviewSet = {
   files: [{ path: 'src/extension.ts' }],
 };
 
-describe('buildFolderScope progress', () => {
+describe('scanReviewablePaths progress', () => {
   let root: string | undefined;
 
   afterEach(async () => {
@@ -39,9 +38,13 @@ describe('buildFolderScope progress', () => {
     ]);
 
     const updates: ScopeScanProgress[] = [];
-    const picked = await buildFolderScope(root, (progress) => updates.push(progress));
+    const relPaths = await scanReviewablePaths(
+      [{ fsPath: root } as import('vscode').Uri],
+      root,
+      (progress) => updates.push(progress),
+    );
 
-    expect(picked).toBeDefined();
+    expect(relPaths).toEqual(['src/one.ts', 'src/two.ts']);
     expect(updates[0]).toMatchObject({ directoriesScanned: 0, filesFound: 0, percent: 0 });
     expect(updates.at(-1)).toEqual({
       directoriesScanned: 2,
@@ -56,26 +59,8 @@ describe('buildFolderScope progress', () => {
   });
 });
 
-describe('tryLoadCurrentPrScope', () => {
-  it('returns the current branch PR when one is available', async () => {
-    const scope: ReviewScope = { load: async () => sampleReviewSet };
-
-    await expect(tryLoadCurrentPrScope('C:\\repo', scope)).resolves.toEqual({
-      scope,
-      cwd: 'C:\\repo',
-      reviewSet: sampleReviewSet,
-    });
-  });
-
-  it('returns undefined so the caller can fall back to the project', async () => {
-    const scope: ReviewScope = { load: async () => { throw new Error('no PR'); } };
-
-    await expect(tryLoadCurrentPrScope('C:\\repo', scope)).resolves.toBeUndefined();
-  });
-});
-
 describe('tryLoadPreferredScope', () => {
-  it('uses the first non-empty scope in PR, branch, working-tree order', async () => {
+  it('uses the current branch when no PR is available', async () => {
     const attempts: string[] = [];
     const branchSet: ReviewSet = {
       scopeId: 'branch-vs-main',
@@ -86,7 +71,6 @@ describe('tryLoadPreferredScope', () => {
     const candidates = [
       { kind: 'currentPr' as const, scope: { load: async () => { throw new Error('no PR'); } } },
       { kind: 'branch' as const, scope: { load: async () => branchSet } },
-      { kind: 'workingTree' as const, scope: { load: async () => sampleReviewSet } },
     ];
 
     const result = await tryLoadPreferredScope(
@@ -104,7 +88,6 @@ describe('tryLoadPreferredScope', () => {
     const candidates = [
       { kind: 'currentPr' as const, scope: { load: async () => { throw new Error('no PR'); } } },
       { kind: 'branch' as const, scope: { load: async () => ({ ...sampleReviewSet, files: [] }) } },
-      { kind: 'workingTree' as const, scope: { load: async () => ({ ...sampleReviewSet, files: [] }) } },
     ];
 
     await expect(tryLoadPreferredScope('C:\\repo', undefined, candidates))

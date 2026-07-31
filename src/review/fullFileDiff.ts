@@ -1,6 +1,6 @@
 import { diffArrays } from 'diff';
 
-export type FullFileDiffKind = 'context' | 'added' | 'deleted';
+type FullFileDiffKind = 'context' | 'added' | 'deleted';
 
 /** One row in a continuous, full-file inline diff. */
 export interface FullFileDiffLine {

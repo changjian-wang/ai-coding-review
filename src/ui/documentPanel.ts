@@ -85,6 +85,29 @@ export function shouldCacheSourceDom(
     && annotationCount === 0;
 }
 
+/** Zero-based starts of contiguous added/deleted blocks in a full-file diff. */
+export function diffChangeStarts(lines: readonly DocDiffLine[]): number[] {
+  const starts: number[] = [];
+  let changing = false;
+  for (let index = 0; index < lines.length; index++) {
+    const changed = lines[index].kind !== 'context';
+    if (changed && !changing) {
+      starts.push(index);
+    }
+    changing = changed;
+  }
+  return starts;
+}
+
+/** Next change block strictly after the current row, wrapping at EOF. */
+export function nextDiffChangeIndex(
+  lines: readonly DocDiffLine[],
+  currentRow: number,
+): number | undefined {
+  const starts = diffChangeStarts(lines);
+  return starts.find((index) => index > currentRow) ?? starts[0];
+}
+
 /** Small/medium source files render once, even when an expanded diff has more rows. */
 export function sourceRenderPlan(
   renderedRows: number,
@@ -533,13 +556,13 @@ export class DocumentPanel {
   button:focus-visible { outline:none; border-color:var(--vscode-focusBorder, var(--blue)); box-shadow:0 0 0 2px color-mix(in srgb, var(--vscode-focusBorder, #569cd6) 35%, transparent); }
 
   /* Topbar action buttons */
-  .topbar #act-jump, .topbar #act-analyze {
+  .topbar #act-next-diff, .topbar #act-jump, .topbar #act-analyze {
     position:relative; font-weight:600; padding:4px 12px;
   }
-  .topbar #act-jump:hover, .topbar #act-analyze:hover {
+  .topbar #act-next-diff:hover, .topbar #act-jump:hover, .topbar #act-analyze:hover {
     transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.18);
   }
-  .topbar #act-jump:active, .topbar #act-analyze:active {
+  .topbar #act-next-diff:active, .topbar #act-jump:active, .topbar #act-analyze:active {
     transform:translateY(0); box-shadow:none;
   }
   .topbar #act-analyze {
@@ -604,6 +627,7 @@ export class DocumentPanel {
   .code { flex:1; }
   .ln.diff-row.diff-added { background:var(--vscode-diffEditor-insertedLineBackground, rgba(46,160,67,.16)); }
   .ln.diff-row.diff-deleted { background:var(--vscode-diffEditor-removedLineBackground, rgba(248,81,73,.16)); }
+  .ln.diff-jump-hit { box-shadow:inset 3px 0 0 var(--vscode-focusBorder, var(--blue)); }
   .ln.diff-row .gutter { width:44px; padding-right:8px; }
   .ln.diff-row .diff-sign {
     flex:none; width:22px; text-align:center; font-weight:700; user-select:none;
@@ -798,6 +822,7 @@ export class DocumentPanel {
       <button id="m-src">${t.sourceView}</button>
     </span>
     <button id="m-bi" title="${t.bilingualTitle}" style="display:none">${t.bilingual}</button>
+    <button id="act-next-diff" title="${t.jumpNextChangeTitle}" style="display:none"><span class="ico">↓</span>${t.jumpNextChange}</button>
     <button id="act-jump"><span class="ico">⤵</span>${t.jumpNextUnseen}</button>
     <button id="act-analyze"><span class="ico">🔬</span><span class="btn-label">${t.analyzeFile}</span><span class="kbd">A</span></button>
   </div>
@@ -821,6 +846,8 @@ const SEV = ${JSON.stringify(m().severity)};
 const DISP = ${JSON.stringify(m().disposition)};
 const sourceRenderPlan = ${sourceRenderPlan.toString()};
 const shouldCacheSourceDom = ${shouldCacheSourceDom.toString()};
+const diffChangeStarts = ${diffChangeStarts.toString()};
+const nextDiffChangeIndex = ${nextDiffChangeIndex.toString()};
 const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i)] ?? '');
 let model = null;
 let loadedPath = null;
@@ -1087,6 +1114,7 @@ function buildSourceRow(i, marksByLine, cardsByLine, annosByLine, frag) {
     + (lineNo > 0 && seen.has(lineNo) ? ' seen' : '')
     + (lineNo > 0 && locatedRange && lineNo >= locatedRange.start && lineNo <= locatedRange.end ? ' locate-hit' : '');
   if (lineNo > 0) row.dataset.line = String(lineNo);
+  row.dataset.row = String(i);
   const ms = lineNo > 0 ? marksByLine[lineNo] : null;
   const fmark = ms ? '<span class="fmark ' + ms[0].severity + '" title="' + ms.map(x=>x.title.replace(/"/g,'')).join(' / ') + '"></span>' : '';
   if (diffLine) {
@@ -1277,6 +1305,13 @@ function ensureSrcRenderedThrough(line) {
   }
 }
 
+function ensureSrcRenderedIndex(index) {
+  if (!srcCtx || index < srcCtx.i || srcCtx.i >= srcCtx.total) return;
+  while (srcCtx.i <= index && srcCtx.i < srcCtx.total) {
+    srcCtx.renderChunk(1000);
+  }
+}
+
 
 function renderReading() {
   mode = 'reading';
@@ -1435,6 +1470,10 @@ function updateViewControls() {
   $('m-diff').classList.toggle('on', diffOn);
   $('m-file').classList.toggle('on', !diffOn);
   $('seg').style.display = !diffOn && model.isMarkdown ? 'flex' : 'none';
+  const nextDiff = $('act-next-diff');
+  if (nextDiff) {
+    nextDiff.style.display = diffOn && diffChangeStarts(model.diffLines).length ? '' : 'none';
+  }
 }
 
 function setDisplayMode(next) {
@@ -1522,6 +1561,36 @@ function showAiBusy(label) {
 }
 function hideAiBusy() { popBusy.style.display = 'none'; }
 
+function jumpToNextDiffChange() {
+  if (!showingDiff()) return;
+  const renderedRows = [...contentEl.querySelectorAll('.ln[data-row]')];
+  const current = renderedRows.reduce((rowIndex, row) => {
+    return row.offsetTop <= contentEl.scrollTop + 8
+      ? Math.max(rowIndex, Number(row.dataset.row))
+      : rowIndex;
+  }, -1);
+  const start = nextDiffChangeIndex(model.diffLines, current);
+  if (start === undefined) return;
+  let end = start;
+  while (end + 1 < model.diffLines.length && model.diffLines[end + 1].kind !== 'context') {
+    end++;
+  }
+  const contextRows = Math.ceil(contentEl.clientHeight / 18 / 2);
+  ensureSrcRenderedIndex(Math.min(model.diffLines.length - 1, end + contextRows));
+  const doScroll = () => {
+    for (const row of contentEl.querySelectorAll('.ln.diff-jump-hit')) {
+      row.classList.remove('diff-jump-hit');
+    }
+    for (let index = start; index <= end; index++) {
+      contentEl.querySelector('.ln[data-row="' + index + '"]')?.classList.add('diff-jump-hit');
+    }
+    const target = contentEl.querySelector('.ln[data-row="' + start + '"]');
+    if (!target) return;
+    contentEl.scrollTop = Math.max(0, target.offsetTop - contentEl.clientHeight * 0.25);
+  };
+  requestAnimationFrame(() => requestAnimationFrame(doScroll));
+}
+
 // Toolbar -----------------------------------------------------------------
 $('m-diff').addEventListener('click', () => setDisplayMode('diff'));
 $('m-file').addEventListener('click', () => setDisplayMode('file'));
@@ -1534,6 +1603,7 @@ $('m-bi').addEventListener('click', () => {
   if (mode !== 'reading') { setMode('reading'); return; }
   renderReading();
 });
+$('act-next-diff').addEventListener('click', jumpToNextDiffChange);
 $('act-analyze').addEventListener('click', () => { setAnalyzing(true); vscode.postMessage({ type:'analyze' }); });
 $('act-jump').addEventListener('click', () => vscode.postMessage({ type:'jumpNext' }));
 $('findbar-toggle').addEventListener('click', () => $('findbar').classList.toggle('collapsed'));

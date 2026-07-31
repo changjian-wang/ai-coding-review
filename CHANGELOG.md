@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Diff view now includes a "Next change" action that jumps between contiguous added/deleted
+  blocks and wraps to the first change after reaching the end of a file.
+
+### Changed
+
+- When the current branch has no pull request, automatic scope selection now opens the
+  complete current-branch change set, including committed, staged, unstaged, and untracked files.
+
 ## [0.4.2] - 2026-07-30
 
 ### Added

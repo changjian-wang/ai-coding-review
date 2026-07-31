@@ -2,11 +2,10 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import {
-  BranchVsBaseScope,
+  CurrentBranchScope,
   FileSystemScope,
   PrScope,
   PrByNumberScope,
-  WorkingTreeScope,
 } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
 import { pickPr } from './prPickerPanel';
@@ -31,31 +30,16 @@ export interface PickedScope {
   cwd: string;
 }
 
-export interface LoadedScope extends PickedScope {
+export type PreferredScopeKind = 'currentPr' | 'branch';
+
+interface PreferredLoadedScope extends PickedScope {
+  kind: PreferredScopeKind;
   reviewSet: ReviewSet;
 }
 
-export type PreferredScopeKind = 'currentPr' | 'branch' | 'workingTree';
-
-export interface PreferredLoadedScope extends LoadedScope {
-  kind: PreferredScopeKind;
-}
-
-export interface PreferredScopeCandidate {
+interface PreferredScopeCandidate {
   kind: PreferredScopeKind;
   scope: ReviewScope;
-}
-
-/** Best-effort current-branch PR lookup; failures deliberately fall back locally. */
-export async function tryLoadCurrentPrScope(
-  cwd: string,
-  scope: ReviewScope = new PrScope(),
-): Promise<LoadedScope | undefined> {
-  try {
-    return { scope, cwd, reviewSet: await scope.load(cwd) };
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -67,8 +51,7 @@ export async function tryLoadPreferredScope(
   onAttempt?: (kind: PreferredScopeKind) => void,
   candidates: PreferredScopeCandidate[] = [
     { kind: 'currentPr', scope: new PrScope() },
-    { kind: 'branch', scope: new BranchVsBaseScope() },
-    { kind: 'workingTree', scope: new WorkingTreeScope() },
+    { kind: 'branch', scope: new CurrentBranchScope() },
   ],
 ): Promise<PreferredLoadedScope | undefined> {
   for (const candidate of candidates) {
@@ -146,7 +129,7 @@ export async function pickScope(
     // fail with an error that is invisible when the workbench is full-screen.
     const relPaths = await withWorkbenchProgress(
       m().scope.scanning,
-      (progress) => expandToRelPaths(
+      (progress) => scanReviewablePaths(
         [vscode.Uri.file(defaultCwd)],
         defaultCwd,
         ({ directoriesScanned, filesFound, percent, etaSeconds, estimated }) =>
@@ -240,7 +223,7 @@ interface ScanState {
 }
 
 /** Expands selected files/folders into a de-duplicated, sorted list of relative file paths. */
-async function expandToRelPaths(
+export async function scanReviewablePaths(
   uris: vscode.Uri[],
   cwd: string,
   onProgress?: (progress: ScopeScanProgress) => void,
@@ -477,21 +460,6 @@ function isReviewableFile(absPath: string, size: number): boolean {
   return size <= MAX_FILE_BYTES && isReviewableExt(path.basename(absPath));
 }
 
-function isReviewableExt(name: string): boolean {
-  // Reject lock files & minified bundles early — they bloat the tree and
-  // nobody reviews them.
-  if (SKIP_FILES.has(name)) return false;
-  if (name.endsWith('.min.js') || name.endsWith('.min.css') || name.endsWith('.map')) return false;
-  const dotAt = name.lastIndexOf('.');
-  if (dotAt < 0) {
-    // No extension: typical README, Makefile, Dockerfile etc. — keep if name
-    // is in the allow list, otherwise skip.
-    return EXTENSIONLESS_ALLOW.has(name);
-  }
-  const ext = name.slice(dotAt + 1).toLowerCase();
-  return !SKIP_EXTS.has(ext);
-}
-
 const MAX_FILE_BYTES = 1_000_000; // 1 MB: anything bigger is almost never reviewable source.
 
 /** Directories that are virtually never review targets. */
@@ -533,18 +501,17 @@ const EXTENSIONLESS_ALLOW = new Set([
   'README', 'LICENSE', 'NOTICE', 'CHANGELOG', 'CONTRIBUTING', 'AUTHORS',
 ]);
 
-/**
- * Builds a {@link FileSystemScope} covering every reviewable file under `cwd`
- * (skipping the same `SKIP_DIRS` as the interactive picker). Returns
- * `undefined` if the folder has no reviewable files.
- */
-export async function buildFolderScope(
-  cwd: string,
-  onProgress?: (progress: ScopeScanProgress) => void,
-): Promise<PickedScope | undefined> {
-  const rels = await expandToRelPaths([vscode.Uri.file(cwd)], cwd, onProgress);
-  if (rels.length === 0) {
-    return undefined;
+function isReviewableExt(name: string): boolean {
+  // Reject lock files & minified bundles early — they bloat the tree and
+  // nobody reviews them.
+  if (SKIP_FILES.has(name)) return false;
+  if (name.endsWith('.min.js') || name.endsWith('.min.css') || name.endsWith('.map')) return false;
+  const dotAt = name.lastIndexOf('.');
+  if (dotAt < 0) {
+    // No extension: typical README, Makefile, Dockerfile etc. — keep if name
+    // is in the allow list, otherwise skip.
+    return EXTENSIONLESS_ALLOW.has(name);
   }
-  return { scope: new FileSystemScope(rels), cwd };
+  const ext = name.slice(dotAt + 1).toLowerCase();
+  return !SKIP_EXTS.has(ext);
 }

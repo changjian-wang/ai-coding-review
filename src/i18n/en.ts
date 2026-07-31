@@ -227,8 +227,7 @@ export const en = {
       'Pick the sources to review (local files/folders or the current branch PR)',
     scanning: 'AI Coding Review: scanning project files…',
     checkingCurrentPr: 'Checking for a pull request on the current branch…',
-    checkingBranchChanges: 'Checking committed changes on the current branch…',
-    checkingWorkingTree: 'Checking uncommitted changes…',
+    checkingBranchChanges: 'Opening all changes on the current branch…',
     preferredScopeFound: (label: string, files: number) =>
       `Using ${label} · ${files.toLocaleString('en-US')} changed files`,
     noPreferredChanges: 'No changed files found. Select files or a folder to start a review.',
@@ -239,7 +238,6 @@ export const en = {
     noFiles:
       'No reviewable files in this project (skipped node_modules / .git / dist / out / bin / obj / .vs).',
     branchVsBase: (base: string) => `Current branch vs ${base}`,
-    workingTree: 'Uncommitted changes',
     selectedSources: (count: number) => `Selected sources (${count})`,
   },
 
@@ -382,6 +380,8 @@ export const en = {
     bilingual: 'CN / EN',
     bilingualTitle: 'Show the Chinese translation side by side',
     translatingDoc: 'Translating document…',
+    jumpNextChange: 'Next change',
+    jumpNextChangeTitle: 'Jump to the next added or deleted block',
     jumpNextUnseen: 'Jump to next unseen',
     analyzeFile: 'Analyze this file',
     analyzing: 'Analyzing…',
@@ -542,7 +542,6 @@ export const en = {
     prParseFailed: 'Could not parse the PR data returned by gh.',
     prListParseFailed: 'Could not parse the PR list returned by gh.',
     repoViewParseFailed: 'Could not parse the gh repo view response.',
-    commentParseFailed: 'The PR comment was sent but the response could not be parsed.',
     noCurrentPr: 'The current branch has no associated PR. Switch to a branch that has one, or use "Pick source files/folders".',
     checkoutFailed: 'Failed to check out the PR branch (uncommitted changes, or a merged/closed PR whose branch was deleted). Commit/stash and retry, or pick an open PR.',
   },

@@ -842,8 +842,7 @@ async function loadPreferredReviewWithProgress(
 ): Promise<boolean> {
   const attemptMessage = (kind: PreferredScopeKind): string => {
     if (kind === 'currentPr') return m().scope.checkingCurrentPr;
-    if (kind === 'branch') return m().scope.checkingBranchChanges;
-    return m().scope.checkingWorkingTree;
+    return m().scope.checkingBranchChanges;
   };
   const preferred = await tryLoadPreferredScope(
     cwd,
@@ -1122,8 +1121,8 @@ async function switchBranch(): Promise<void> {
 
 /**
  * Switches which workspace folder (project) is under review. No-op in a
- * single-root workspace. Picking another root reloads it as a whole-folder
- * review (restoring that root's own saved progress, if any).
+ * single-root workspace. Picking another root loads its preferred change scope
+ * (current PR, then the complete current-branch change set).
  */
 /** Switches the review to the given workspace-folder cwd (from the inline menu). */
 async function switchProjectTo(cwd: string): Promise<void> {
@@ -1239,8 +1238,7 @@ async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
 /**
  * Rebuilds the last reviewed scope after an extension/host restart. Prefers the
  * exact persisted selection (so a narrowed file-system scope reuses its saved
- * snapshot); falls back to loading the whole folder when no detailed scope was
- * recorded or rebuilding it fails.
+ * snapshot); otherwise reloads the preferred change scope for the project.
  */
 async function restoreLastScope(
   cwd: string,
@@ -1265,7 +1263,7 @@ async function restoreLastScope(
       await activateReviewSet(reviewSet, descriptor.cwd);
       return;
     } catch (err) {
-      console.warn(`[codereview] restoreLastScope (${descriptor.kind}) failed, falling back to folder:`, err);
+      console.warn(`[codereview] restoreLastScope (${descriptor.kind}) failed; using preferred scope:`, err);
     }
   }
   if (progress) {

@@ -19,7 +19,7 @@ import type { FixEdit } from '../ai/analyzer';
  */
 
 /** A line of `text` with char offsets into the original string (offsets exclude the trailing '\n'). */
-export interface LineSpan {
+interface LineSpan {
   start: number;
   end: number;
   raw: string;
@@ -46,7 +46,7 @@ export interface LocatedMatch {
  * as they need, but `end` stops BEFORE a trailing '\r' so a replacement slots in
  * ahead of the '\r\n' — editing a CRLF file preserves its CRLF endings.
  */
-export function lineTable(text: string): LineSpan[] {
+function lineTable(text: string): LineSpan[] {
   const out: LineSpan[] = [];
   let pos = 0;
   for (const raw of text.split('\n')) {
@@ -60,7 +60,7 @@ export function lineTable(text: string): LineSpan[] {
 }
 
 /** Drop trailing whitespace / CR only; leading indentation is significant. */
-export function normTrailing(l: string): string {
+function normTrailing(l: string): string {
   return l.replace(/\s+$/, '');
 }
 
@@ -69,7 +69,7 @@ export function normTrailing(l: string): string {
  * already pins the location so the model dropping/adding indentation is safe to
  * ignore (we still replace the file's real bytes, reindented to the file).
  */
-export function normLoose(l: string): string {
+function normLoose(l: string): string {
   return l.trim();
 }
 
@@ -90,7 +90,7 @@ export function needleLines(needle: string): string[] {
  * line-based, ignoring only what `norm` discards. Returns char-offset ranges
  * into the original `text` plus the 1-based start line of each match.
  */
-export function matchesBy(
+function matchesBy(
   text: string,
   needle: string,
   norm: (l: string) => string,
@@ -150,7 +150,7 @@ export function isPresent(text: string, needle: string): boolean {
  * span or null. The line-anchored path uses this: the line number says WHERE,
  * this confirms WHAT.
  */
-export function matchBlockAt(
+function matchBlockAt(
   lines: LineSpan[],
   startIdx: number,
   nl: string[],
@@ -168,7 +168,7 @@ export function matchBlockAt(
 }
 
 /** Leading run of spaces/tabs on a line (its indentation). */
-export function leadingWhitespace(s: string): string {
+function leadingWhitespace(s: string): string {
   return (s.match(/^[ \t]*/) || [''])[0];
 }
 

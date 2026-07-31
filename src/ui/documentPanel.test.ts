@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resetVscodeMock, vscodeMockState } from '../test/vscodeMock';
 import {
   DocumentPanel,
+  diffChangeStarts,
+  nextDiffChangeIndex,
   shouldCacheSourceDom,
   sourceRenderPlan,
   type DocActions,
@@ -29,6 +31,8 @@ describe('DocumentPanel diff updates', () => {
     expect(script).toContain('const cached = cacheable ? takeSourceDom(cacheKey) : null');
     expect(script).toContain('queueDocumentLoad(msg)');
     expect(script).toContain("type:'loaded'");
+    expect(vscodeMockState.panel?.webview.html).toContain('id="act-next-diff"');
+    expect(script).toContain("$('act-next-diff').addEventListener('click', jumpToNextDiffChange)");
     vscodeMockState.panel?.webview.receiveMessage({ type: 'ready' });
     const load = vscodeMockState.panel?.webview.messages.at(-1) as {
       type: string;
@@ -114,6 +118,29 @@ describe('shouldCacheSourceDom', () => {
     expect(shouldCacheSourceDom(30_001, 0, 0)).toBe(false);
     expect(shouldCacheSourceDom(1000, 1, 0)).toBe(false);
     expect(shouldCacheSourceDom(1000, 0, 1)).toBe(false);
+  });
+});
+
+describe('Diff change navigation', () => {
+  const lines: DocDiffLine[] = [
+    { kind: 'context', oldLine: 1, newLine: 1 },
+    { kind: 'deleted', oldLine: 2 },
+    { kind: 'added', newLine: 2 },
+    { kind: 'added', newLine: 3 },
+    { kind: 'context', oldLine: 3, newLine: 4 },
+    { kind: 'deleted', oldLine: 4 },
+    { kind: 'context', oldLine: 5, newLine: 5 },
+  ];
+
+  it('treats adjacent deleted and added rows as one change block', () => {
+    expect(diffChangeStarts(lines)).toEqual([1, 5]);
+  });
+
+  it('jumps forward and wraps to the first change block', () => {
+    expect(nextDiffChangeIndex(lines, -1)).toBe(1);
+    expect(nextDiffChangeIndex(lines, 1)).toBe(5);
+    expect(nextDiffChangeIndex(lines, 6)).toBe(1);
+    expect(nextDiffChangeIndex([], 0)).toBeUndefined();
   });
 });
 

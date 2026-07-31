@@ -85,8 +85,11 @@ export class PrByNumberScope implements ReviewScope {
   }
 }
 
-/** Files differing between the current branch and its base (pure git). */
-export class BranchVsBaseScope implements ReviewScope {
+/**
+ * All changes carried by the current branch, including committed, staged,
+ * unstaged, and untracked files, compared with the branch's merge base.
+ */
+export class CurrentBranchScope implements ReviewScope {
   constructor(private readonly base?: string) {}
 
   async load(cwd: string): Promise<ReviewSet> {
@@ -94,9 +97,16 @@ export class BranchVsBaseScope implements ReviewScope {
     const base = this.base ?? (await git.detectBaseBranch(cwd));
     const headSha = await git.headSha(cwd);
     const baseSha = await git.mergeBase(cwd, base, 'HEAD');
-    const files = await git.diffFiles(cwd, `${baseSha}...HEAD`);
+    const [branchFiles, workingTreeFiles] = await Promise.all([
+      // A single commit argument compares that commit with index + working tree,
+      // so tracked staged/unstaged changes are already included here.
+      git.diffFiles(cwd, baseSha),
+      // Supplies untracked additions, which `git diff <base>` cannot report.
+      git.untrackedFiles(cwd),
+    ]);
+    const files = mergeCurrentBranchFiles(branchFiles, workingTreeFiles);
     return {
-      scopeId: `branch-vs-${base}`,
+      scopeId: `current-branch-vs-${base}`,
       label: m().scope.branchVsBase(base),
       headSha,
       files,
@@ -105,20 +115,17 @@ export class BranchVsBaseScope implements ReviewScope {
   }
 }
 
-/** Uncommitted tracked changes in the working tree (pure git). */
-export class WorkingTreeScope implements ReviewScope {
-  async load(cwd: string): Promise<ReviewSet> {
-    await git.ensureGitRepo(cwd);
-    const headSha = await git.headSha(cwd);
-    const files = await git.workingTreeFiles(cwd);
-    return {
-      scopeId: 'working-tree',
-      label: m().scope.workingTree,
-      headSha,
-      files,
-      comparison: { baseSha: headSha, headSha },
-    };
+export function mergeCurrentBranchFiles(
+  branchFiles: ReviewFile[],
+  workingTreeFiles: ReviewFile[],
+): ReviewFile[] {
+  const byPath = new Map(branchFiles.map((file) => [file.path, file]));
+  for (const file of workingTreeFiles) {
+    if (!byPath.has(file.path)) {
+      byPath.set(file.path, file);
+    }
   }
+  return [...byPath.values()];
 }
 
 /**
