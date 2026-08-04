@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-04
+
 ### Added
 
 - Diff view now includes a "Next change" action that jumps between contiguous added/deleted
@@ -16,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - When the current branch has no pull request, automatic scope selection now opens all
   reviewable source files from the checked-out branch instead of showing an empty workbench.
+
+### Fixed
+
+- Long source and diff lines can now be scrolled horizontally instead of being clipped.
 
 ## [0.4.2] - 2026-07-30
 
@@ -153,7 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file-level and cross-file AI analysis, per-finding disposition
   (fix / comment / ignore), and conclusion write-back for PR scopes via the GitHub CLI.
 
-[Unreleased]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/changjian-wang/ai-coding-review/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/changjian-wang/ai-coding-review/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/changjian-wang/ai-coding-review/compare/v0.2.0...v0.3.0
