@@ -616,7 +616,7 @@ export class DocumentPanel {
 
   /* Source view */
   .src { font-family:var(--vscode-editor-font-family, monospace); font-size:var(--vscode-editor-font-size, 13px); padding:6px 0 40vh; }
-  .ln { display:flex; align-items:flex-start; padding:0 12px 0 0; white-space:pre; position:relative;
+  .ln { display:flex; align-items:flex-start; width:max-content; min-width:100%; padding:0 12px 0 0; white-space:pre; position:relative;
     content-visibility:auto; contain:layout style paint; contain-intrinsic-block-size:18px; }
   .ln:hover { background:rgba(127,127,127,.06); }
   .gutter { flex:none; width:52px; text-align:right; padding-right:12px; color:var(--dim); user-select:none; opacity:.6; }
