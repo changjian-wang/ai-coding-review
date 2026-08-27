@@ -104,6 +104,14 @@
         "icon": "$(arrow-down)"
       }
     ],
+    "keybindings": [
+      {
+        "command": "codereview.pasteIgnoreReason",
+        "key": "ctrl+v",
+        "mac": "cmd+v",
+        "when": "codereview.ignoreReasonInputActive"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
