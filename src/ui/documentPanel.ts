@@ -140,7 +140,7 @@ export interface DocActions {
   editAnnotation(path: string, id: string, content: string): void;
   disposeFinding(path: string, id: string, kind: DocFindingDisposition): void;
   /** Opens the fix-proposal panel for a finding to *view* it, without changing its disposition. */
-  viewFix(path: string, id: string): void;
+  viewFix(path: string, id: string, cachedOnly?: boolean): void;
   locate(path: string, line: number, endLine?: number, findingId?: string): void;
   analyze(path: string): void;
   jumpNext(path: string): void;
@@ -163,7 +163,7 @@ type Inbound =
   | { type: 'convertToNote'; id: string }
   | { type: 'editAnnotation'; id: string; content: string }
   | { type: 'dispose'; id: string; kind: DocFindingDisposition }
-  | { type: 'viewFix'; id: string }
+  | { type: 'viewFix'; id: string; cachedOnly?: boolean }
   | { type: 'locate'; line: number; endLine?: number; id?: string }
   | { type: 'analyze' }
   | { type: 'jumpNext' }
@@ -481,7 +481,7 @@ export class DocumentPanel {
         this.actions.disposeFinding(path, m.id, m.kind);
         break;
       case 'viewFix':
-        this.actions.viewFix(path, m.id);
+        this.actions.viewFix(path, m.id, m.cachedOnly);
         break;
       case 'locate':
         this.actions.locate(path, m.line, m.endLine, m.id);
@@ -926,7 +926,10 @@ function findingCard(f) {
   if (f.disposition) {
     head.querySelector('.f-status').textContent = '✓ ' + (DISP_LABEL[f.disposition] || f.disposition);
   }
-  head.addEventListener('click', () => div.classList.toggle('collapsed'));
+  head.addEventListener('click', () => {
+    div.classList.toggle('collapsed');
+    vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
+  });
   const body = document.createElement('div');
   body.className = 'f-body';
   const detail = document.createElement('p');
@@ -1788,6 +1791,7 @@ function centerLine(line) {
  */
 function focusFindingCard(f) {
   if (mode !== 'source') setMode('source');
+  vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
   const start = f.line;
   const end = (f.endLine && f.endLine > start) ? f.endLine : start;
   ensureSrcRenderedThrough(end);

@@ -172,6 +172,8 @@ export const en = {
     ignorePrompt: 'Enter a reason for ignoring this finding (persisted to the local review record)',
     ignorePlaceholder: 'e.g. false positive / not this iteration / tracked in issue #123',
     ignoreMinLength: 'At least 4 characters',
+    ignorePaste: 'Paste from clipboard',
+    ignorePasteFailed: (msg: string) => `Unable to read the clipboard: ${msg}`,
     ignored: 'Ignored',
   },
 
@@ -432,6 +434,8 @@ export const en = {
   // ── Webview: fix-proposal panel ──────────────────────────────────────────────
   fixPanel: {
     generating: 'Generating fix proposals…',
+    cachedUnavailable:
+      'The cached proposals no longer match the current file. Click "Regenerate" to request fresh proposals.',
     titlePrefix: 'Fix proposals: ',
     mutexApplied:
       'Applied "{0}". These are mutually-exclusive alternatives; to switch, undo the applied one first.',

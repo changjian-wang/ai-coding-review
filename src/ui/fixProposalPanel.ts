@@ -118,6 +118,8 @@ export class FixProposalPanel {
   private static memento?: vscode.Memento;
   private state: PanelState = { kind: 'loading', message: m().fixPanel.generating };
   private generating?: vscode.CancellationTokenSource;
+  /** Monotonic guard preventing an older async restore/generation from winning after a context switch. */
+  private runVersion = 0;
   private hasNotifiedApplied = false;
   /** Last resolved live line shown in the header; survives full webview rebuilds. */
   private displayLine: number;
@@ -137,10 +139,10 @@ export class FixProposalPanel {
     );
   }
 
-  static show(request: FixProposalRequest): void {
+  static show(request: FixProposalRequest, options?: { cacheOnly?: boolean }): void {
     const title = FixProposalPanel.titleFor(request);
     if (FixProposalPanel.instance) {
-      FixProposalPanel.instance.replace(request, title);
+      FixProposalPanel.instance.replace(request, title, options);
       return;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -153,7 +155,7 @@ export class FixProposalPanel {
       { enableScripts: true, retainContextWhenHidden: true },
     );
     FixProposalPanel.instance = new FixProposalPanel(panel, request);
-    void FixProposalPanel.instance.run();
+    void FixProposalPanel.instance.run({ cacheOnly: options?.cacheOnly });
   }
 
   /**
@@ -174,6 +176,19 @@ export class FixProposalPanel {
     if (FixProposalPanel.instance?.request.rel === rel) {
       FixProposalPanel.instance.panel.dispose();
     }
+  }
+
+  /**
+   * Returns whether an open panel can follow selection to an already-generated
+   * finding without starting a new model request.
+   */
+  static canSwitchToCached(cacheKey: string): boolean {
+    const inst = FixProposalPanel.instance;
+    if (!inst || inst.request.cacheKey === cacheKey) {
+      return false;
+    }
+    const cached = FixProposalPanel.cache.get(cacheKey);
+    return Boolean(cached?.proposals.length);
   }
 
   /** Re-renders the open panel in the current language (after a language switch). */
@@ -281,7 +296,11 @@ export class FixProposalPanel {
     void FixProposalPanel.memento.update(CACHE_MEMENTO_KEY, obj);
   }
 
-  private replace(request: FixProposalRequest, title: string): void {
+  private replace(
+    request: FixProposalRequest,
+    title: string,
+    options?: { cacheOnly?: boolean },
+  ): void {
     this.cancelGeneration();
     // Snapshot the outgoing finding's state before swapping so we can restore it
     // instantly if the user navigates back.
@@ -289,13 +308,23 @@ export class FixProposalPanel {
     this.request = request;
     this.displayLine = request.finding.line;
     this.panel.title = title;
+    // Clear the outgoing proposal immediately. The cached replacement is restored
+    // asynchronously and must not leave the previous finding visible in the meantime.
+    this.setState({ kind: 'loading', message: m().fixPanel.generating });
     this.panel.reveal(undefined, false);
-    void this.run();
+    void this.run({ cacheOnly: options?.cacheOnly });
   }
 
-  private async run(options?: { force?: boolean; supplement?: string }): Promise<void> {
+  private async run(options?: {
+    force?: boolean;
+    supplement?: string;
+    cacheOnly?: boolean;
+  }): Promise<void> {
     this.cancelGeneration();
-    const key = FixProposalPanel.keyOf(this.request);
+    const runVersion = ++this.runVersion;
+    const request = this.request;
+    const key = FixProposalPanel.keyOf(request);
+    const isCurrent = () => this.runVersion === runVersion && this.request === request;
     // Fast path: re-use cached proposals so users can navigate between findings
     // without paying the LLM round-trip every time.
     if (!options?.force) {
@@ -311,12 +340,35 @@ export class FixProposalPanel {
       this.syncSupplementInput();
       if (cached && cached.proposals.length > 0) {
         try {
-          await this.restoreFromCache(cached);
+          const restored = await this.restoreFromCache(cached, request.fileUri);
+          if (!isCurrent()) {
+            return;
+          }
+          this.setState(restored);
           return;
         } catch {
+          if (!isCurrent()) {
+            return;
+          }
+          if (options?.cacheOnly) {
+            this.setState({
+              kind: 'error',
+              message: m().fixPanel.cachedUnavailable,
+              canRetry: true,
+            });
+            return;
+          }
           // Fall through to fresh generation if restoration fails.
         }
       }
+    }
+    if (options?.cacheOnly) {
+      this.setState({
+        kind: 'error',
+        message: m().fixPanel.cachedUnavailable,
+        canRetry: true,
+      });
+      return;
     }
     // The supplement that should steer this generation: an explicit one from the
     // regenerate action, else whatever the reviewer last entered.
@@ -327,11 +379,14 @@ export class FixProposalPanel {
     this.generating = cts;
     this.setState({ kind: 'loading', message: m().fixPanel.generating });
     try {
-      const proposals = await this.request.generate(cts.token, supplement || undefined);
-      if (cts.token.isCancellationRequested) {
+      const proposals = await request.generate(cts.token, supplement || undefined);
+      if (cts.token.isCancellationRequested || !isCurrent()) {
         return;
       }
-      const content = await this.currentFileText();
+      const content = await this.currentFileText(request.fileUri);
+      if (cts.token.isCancellationRequested || !isCurrent()) {
+        return;
+      }
       const views: ProposalView[] = proposals.map((p) => buildView(p, content, false));
       this.setState({ kind: 'ready', proposals: views });
       FixProposalPanel.saveCache(key, {
@@ -342,7 +397,7 @@ export class FixProposalPanel {
         supplement: supplement || undefined,
       });
     } catch (err) {
-      if (cts.token.isCancellationRequested) {
+      if (cts.token.isCancellationRequested || !isCurrent()) {
         return;
       }
       const message = (err as Error)?.message ?? String(err);
@@ -356,8 +411,11 @@ export class FixProposalPanel {
   }
 
   /** Rebuilds runtime ProposalView state from a cached entry against the current file content. */
-  private async restoreFromCache(entry: CachedEntry): Promise<void> {
-    const content = await this.currentFileText();
+  private async restoreFromCache(
+    entry: CachedEntry,
+    fileUri: vscode.Uri,
+  ): Promise<Extract<PanelState, { kind: 'ready' }>> {
+    const content = await this.currentFileText(fileUri);
     const anyApplied = entry.proposals.some((p) => p.applied);
     // Anti-drift: if the file changed since these proposals were generated and we
     // haven't applied any of them, the cached line anchors / snippets refer to a
@@ -379,7 +437,7 @@ export class FixProposalPanel {
       return buildView(p, content, false);
     });
     const lastApplied = views.find((p) => p.applied)?.title;
-    this.setState({ kind: 'ready', proposals: views, lastApplied });
+    return { kind: 'ready', proposals: views, lastApplied };
   }
 
   /** Snapshots the current panel state into the cache (no-op if not yet ready). */
@@ -622,14 +680,14 @@ export class FixProposalPanel {
     return ok;
   }
 
-  private async currentFileText(): Promise<string> {
+  private async currentFileText(fileUri: vscode.Uri = this.request.fileUri): Promise<string> {
     const open = vscode.workspace.textDocuments.find(
-      (d) => d.uri.fsPath === this.request.fileUri.fsPath,
+      (d) => d.uri.fsPath === fileUri.fsPath,
     );
     if (open) {
       return open.getText();
     }
-    const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
+    const doc = await vscode.workspace.openTextDocument(fileUri);
     return doc.getText();
   }
 
@@ -637,7 +695,7 @@ export class FixProposalPanel {
     this.state = state;
     this.panel.webview.postMessage({ type: 'state', state });
     // Keep the header's line label in sync with the (possibly fix-shifted) content.
-    void this.refreshHeader();
+    void this.refreshHeader(this.request, state);
   }
 
   /** Pushes the current supplement into the webview textarea when context switches. */
@@ -653,13 +711,16 @@ export class FixProposalPanel {
    * N follows the live content by anchoring to the **last line** of the applied
    * snippet; otherwise it falls back to the finding's original line.
    */
-  private async refreshHeader(): Promise<void> {
-    const line = await this.computeDisplayLine();
+  private async refreshHeader(request: FixProposalRequest, state: PanelState): Promise<void> {
+    const line = await this.computeDisplayLine(request, state);
+    if (this.request !== request || this.state !== state) {
+      return;
+    }
     this.displayLine = line;
-    const finding = FixProposalPanel.displayFinding(this.request);
+    const finding = FixProposalPanel.displayFinding(request);
     this.panel.webview.postMessage({
       type: 'header',
-      rel: this.request.rel,
+      rel: request.rel,
       line,
       title: finding.title,
       detail: finding.detail,
@@ -668,23 +729,23 @@ export class FixProposalPanel {
   }
 
   /** Resolves the line number to show in the header (see {@link refreshHeader}). */
-  private async computeDisplayLine(): Promise<number> {
-    const fallback = this.request.finding.line;
-    if (this.state.kind !== 'ready') {
+  private async computeDisplayLine(request: FixProposalRequest, state: PanelState): Promise<number> {
+    const fallback = request.finding.line;
+    if (state.kind !== 'ready') {
       return fallback;
     }
-    const applied = this.state.proposals.find((p) => p.applied);
+    const applied = state.proposals.find((p) => p.applied);
     if (!applied || applied.edits.length === 0) {
       return fallback;
     }
     try {
-      const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
+      const doc = await vscode.workspace.openTextDocument(request.fileUri);
       const text = doc.getText();
       // Show the change nearest the finding line — NOT blindly edits[0], which for
       // a multi-edit fix is usually a top-of-block comment far from the real edit.
       // Prefer each edit's declared startLine (robust, no search); fall back to a
       // loose search of newText (tolerant of the reindent apply may have done).
-      const target = this.request.finding.line;
+      const target = request.finding.line;
       let bestLine = -1;
       let bestDist = Number.POSITIVE_INFINITY;
       const consider = (line: number) => {
@@ -716,6 +777,7 @@ export class FixProposalPanel {
   }
 
   private dispose(): void {
+    this.runVersion += 1;
     this.cancelGeneration();
     // Final snapshot so the next time the panel opens for this finding we restore
     // its state from cache rather than re-calling the model.
@@ -1036,5 +1098,3 @@ function renderInlineDiff(oldText: string, newText: string): string {
 function diffRow(cls: 'add' | 'del' | 'ctx', sign: string, text: string): string {
   return `<div class="row ${cls}"><span class="sign">${sign}</span><span class="text">${escapeHtml(text) || '&nbsp;'}</span></div>`;
 }
-
-

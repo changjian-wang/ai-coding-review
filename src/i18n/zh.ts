@@ -153,6 +153,8 @@ export const zh: Messages = {
     ignorePrompt: '请输入忽略此发现的理由（会持久化到本地审查记录）',
     ignorePlaceholder: '例：误报 / 当前迭代不处理 / 已在 issue #123 跟进',
     ignoreMinLength: '至少 4 个字符',
+    ignorePaste: '从剪贴板粘贴',
+    ignorePasteFailed: (msg) => `无法读取剪贴板：${msg}`,
     ignored: '已忽略',
   },
 
@@ -401,6 +403,7 @@ export const zh: Messages = {
 
   fixPanel: {
     generating: '正在生成修复方案…',
+    cachedUnavailable: '缓存的修复方案已与当前文件不一致。点击「重新生成」可主动获取新方案。',
     titlePrefix: '修复方案：',
     mutexApplied: '已应用「{0}」。这些是互斥的备选方案，如需改用此方案，请先撤销已应用的方案。',
     locateGone: '无法定位：方案中有一处原代码片段在当前文件中已不存在（文件可能被修改了）。请「重新生成」。',

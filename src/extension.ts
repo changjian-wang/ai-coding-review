@@ -36,6 +36,10 @@ import { DocumentPanel, type DocDiffLine, type DocModel } from './ui/documentPan
 import { FixProposalPanel } from './ui/fixProposalPanel';
 import { renderDocument, type DocumentRender } from './ui/documentRenderer';
 import { transientInfo, transientWarning } from './ui/toast';
+import {
+  registerIgnoreReasonPasteCommand,
+  showIgnoreReasonInput,
+} from './ui/ignoreReasonInput';
 import { m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 import { buildFullFileDiff } from './review/fullFileDiff';
 
@@ -58,6 +62,8 @@ let workbenchOpenInFlight = false;
 let openingWorkbenchPanel: vscode.WebviewPanel | undefined;
 /** Monotonic token for file-open requests; lets a newer click cancel a slower in-flight open. */
 let openFileGeneration = 0;
+/** Monotonic token preventing an older async fix-panel open from replacing a newer selection. */
+let fixProposalOpenGeneration = 0;
 /** Cache of rendered (highlighted) file content, keyed by relative path. */
 const docRenderCache = new Map<string, DocumentRender>();
 /** Cached full-file diff rows; invalidated whenever the live head file changes. */
@@ -96,6 +102,7 @@ function ensureReviewPath(relPath: string, action: string): boolean {
 
 function closeScopeBoundPanels(): void {
   DocumentPanel.closeIfOpen();
+  fixProposalOpenGeneration += 1;
   FixProposalPanel.closeIfOpen();
   GlobalReportPanel.closeIfOpen();
 }
@@ -620,6 +627,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codereview.viewPendingComments', viewPendingComments),
     vscode.commands.registerCommand('codereview.locateFinding', locateInFile),
     vscode.commands.registerCommand('codereview.jumpToNextUnseen', jumpToNextUnseenCurrent),
+    registerIgnoreReasonPasteCommand(),
     createStatusBarEntry(),
     registerLauncherView(),
   );
@@ -1450,6 +1458,7 @@ async function openFileInPanel(relPath: string): Promise<void> {
   // (it's scoped to one finding in the file we're leaving).
   const previousSelected = workbenchSelected;
   if (previousSelected !== relPath) {
+    fixProposalOpenGeneration += 1;
     FixProposalPanel.closeIfOpen();
     // Cancel the leaving file's in-flight bilingual translation so it doesn't
     // keep running (and piling up) after we navigate away.
@@ -1917,7 +1926,8 @@ function docActions() {
     disposeFinding: (path: string, id: string, kind: FindingDispositionKind) => {
       void disposeFinding(path, id, kind);
     },
-    viewFix: (path: string, id: string) => void viewFixProposal(path, id),
+    viewFix: (path: string, id: string, cachedOnly?: boolean) =>
+      void viewFixProposal(path, id, cachedOnly),
     locate: (path: string, line: number, endLine?: number, findingId?: string) =>
       void locateInFile(path, line, endLine, findingId),
     analyze: (path: string) => void analyzeByPath(path),
@@ -2362,6 +2372,7 @@ async function analyzeByPath(rel: string): Promise<void> {
     // Re-analysis replaces this file's findings (new ids), so any fix proposal
     // open for THIS file is now tied to a finding that no longer exists — close
     // it instead of leaving a stale proposal beside the fresh results.
+    fixProposalOpenGeneration += 1;
     FixProposalPanel.closeIfFile(rel);
     refreshDocPanel(rel);
     ok = true;
@@ -2390,7 +2401,12 @@ async function analyzeByPath(rel: string): Promise<void> {
  * `fixed`. This does NOT itself change the disposition — it's a pure entry point
  * shared by the "Copilot 修复" button and the clickable finding header.
  */
-async function openFixProposal(rel: string, finding: Finding): Promise<void> {
+async function openFixProposal(
+  rel: string,
+  finding: Finding,
+  options?: { cacheOnly?: boolean },
+): Promise<void> {
+  const openGeneration = ++fixProposalOpenGeneration;
   const cwd = activeCwd();
   if (!cwd) {
     return;
@@ -2402,6 +2418,9 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
   // finding's CURRENT line via the shared authority (no side effects), so the
   // panel header/edit-picking use the live line while the document stays put.
   const { startLine: liveLine } = await resolveLiveRange(rel, finding.line, finding.endLine, finding.id);
+  if (openGeneration !== fixProposalOpenGeneration) {
+    return;
+  }
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
@@ -2476,7 +2495,7 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
         await locateInFile(rel, finding.line, finding.endLine, findingId);
       })();
     },
-  });
+  }, options);
 }
 
 /**
@@ -2485,7 +2504,11 @@ async function openFixProposal(rel: string, finding: Finding): Promise<void> {
  * finding header so reviewers can re-inspect a proposal even after the finding
  * has been disposed.
  */
-async function viewFixProposal(rel: string, findingId: string): Promise<void> {
+async function viewFixProposal(
+  rel: string,
+  findingId: string,
+  cachedOnly = false,
+): Promise<void> {
   if (!session.reviewSet) {
     return;
   }
@@ -2496,7 +2519,16 @@ async function viewFixProposal(rel: string, findingId: string): Promise<void> {
   if (!finding) {
     return;
   }
-  await openFixProposal(rel, finding);
+  if (
+    cachedOnly
+    && !FixProposalPanel.canSwitchToCached(fixProposalCacheKey(rel, finding))
+  ) {
+    // This selection is still the latest user intent even though there is no
+    // cached panel to show. Cancel any slower open started by an earlier click.
+    fixProposalOpenGeneration += 1;
+    return;
+  }
+  await openFixProposal(rel, finding, { cacheOnly: cachedOnly });
 }
 
 /**
@@ -2580,13 +2612,7 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
       transientInfo(m().finding.recordedInlineNote);
     }
   } else if (kind === 'ignored') {
-    const reason = await vscode.window.showInputBox({
-      title: m().finding.ignoreTitle(displayFinding.title),
-      prompt: m().finding.ignorePrompt,
-      placeHolder: m().finding.ignorePlaceholder,
-      ignoreFocusOut: true,
-      validateInput: (v) => (v.trim().length >= 4 ? null : m().finding.ignoreMinLength),
-    });
+    const reason = await showIgnoreReasonInput(displayFinding.title);
     if (!reason) {
       return;
     }
@@ -2830,6 +2856,7 @@ function globalFixAnchor(spotId: string): string | undefined {
  * findings be fixed with the same one-click flow as file-level findings.
  */
 async function openGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
+  const openGeneration = ++fixProposalOpenGeneration;
   if (!ensureReviewPath(file, m().actions.analyze)) {
     return;
   }
@@ -2849,6 +2876,9 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   // 「定位」 scrolls. Resolve the spot's current line via the shared authority
   // (no side effects) so the panel header is right while the document stays put.
   const { startLine: liveLine } = await resolveLiveRange(file, spot.line, spot.endLine, spotId);
+  if (openGeneration !== fixProposalOpenGeneration) {
+    return;
+  }
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
   const findingLike: Finding = {
     id: spotId,
@@ -2993,13 +3023,7 @@ async function disposeGlobalFix(
       transientInfo(m().finding.recordedInlineNote);
     }
   } else {
-    const reason = await vscode.window.showInputBox({
-      title: m().finding.ignoreTitle(localizedSpot.title),
-      prompt: m().finding.ignorePrompt,
-      placeHolder: m().finding.ignorePlaceholder,
-      ignoreFocusOut: true,
-      validateInput: (v) => (v.trim().length >= 4 ? null : m().finding.ignoreMinLength),
-    });
+    const reason = await showIgnoreReasonInput(localizedSpot.title);
     if (!reason) {
       return;
     }

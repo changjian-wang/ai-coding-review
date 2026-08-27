@@ -31,6 +31,7 @@ describe('DocumentPanel diff updates', () => {
     expect(script).toContain('const cached = cacheable ? takeSourceDom(cacheKey) : null');
     expect(script).toContain('queueDocumentLoad(msg)');
     expect(script).toContain("type:'loaded'");
+    expect(script?.match(/type:'viewFix', id:f\.id, cachedOnly:true/g)).toHaveLength(2);
     expect(vscodeMockState.panel?.webview.html).toContain('id="act-next-diff"');
     expect(script).toContain("$('act-next-diff').addEventListener('click', jumpToNextDiffChange)");
     vscodeMockState.panel?.webview.receiveMessage({ type: 'ready' });
@@ -76,6 +77,20 @@ describe('DocumentPanel diff updates', () => {
       type: 'load',
       model: { path: model.path, diffLines, defaultToDiff: true },
     });
+  });
+
+  it('forwards cached-only finding selections to the host action', () => {
+    const model = documentModel();
+    const viewFix = vi.fn();
+    DocumentPanel.show(model, { ...actions(), viewFix });
+
+    vscodeMockState.panel?.webview.receiveMessage({
+      type: 'viewFix',
+      id: 'f2',
+      cachedOnly: true,
+    });
+
+    expect(viewFix).toHaveBeenCalledWith(model.path, 'f2', true);
   });
 
   it('rebuilds the shell once when a load receives no acknowledgement', async () => {
