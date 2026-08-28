@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { nonce as makeNonce } from './html';
 import { m, resolveLanguage } from '../i18n';
+import type { FindingEvidenceRef } from '../ai/types';
 
 export type DocFindingDisposition = 'fixed' | 'commented' | 'ignored';
 
@@ -15,6 +16,9 @@ export interface DocFinding {
   suggestion?: string;
   disposition?: DocFindingDisposition;
   dispositionReason?: string;
+  verificationStatus?: 'repo-confirmed' | 'unresolved' | 'overturned';
+  verificationRationale?: string;
+  verificationEvidence?: FindingEvidenceRef[];
   /**
    * True when the line came from the model's reported number because the
    * finding's `anchor` snippet could NOT be located in the file — so the line is
@@ -320,7 +324,7 @@ export class DocumentPanel {
   }
 
   /**
-   * Reflects analysis progress on the topbar "分析此文件" button. Only the panel
+   * Reflects analysis progress on the topbar "基于此文件分析" button. Only the panel
    * currently showing `path` reacts. When `on` is false, `ok` controls whether a
    * brief "完成" flash is shown.
    */
@@ -328,6 +332,14 @@ export class DocumentPanel {
     const inst = DocumentPanel.current;
     if (inst?.ready && inst.model?.path === path) {
       void inst.panel.webview.postMessage({ type: 'analyzing', on, ok });
+    }
+  }
+
+  /** Updates the in-button label while a multi-stage file analysis is running. */
+  static setAnalysisStage(path: string, message: string): void {
+    const inst = DocumentPanel.current;
+    if (inst?.ready && inst.model?.path === path) {
+      void inst.panel.webview.postMessage({ type: 'analysisStage', message });
     }
   }
 
@@ -760,12 +772,17 @@ export class DocumentPanel {
   .finding.bug { border-left:3px solid var(--red); }
   .finding.conditional { border-left:3px solid var(--yellow); }
   .finding.suggestion { border-left:3px solid var(--blue); }
+  .finding.unresolved { border-left-color:var(--vscode-descriptionForeground); border-style:dashed; opacity:.82; }
+  .finding.overturned { border-left-color:var(--vscode-descriptionForeground); opacity:.62; }
   .finding.confirmed { opacity:.55; }
   .f-head { display:flex; align-items:center; gap:8px; padding:6px 10px; cursor:pointer; user-select:none; }
   .f-head:hover .f-title { text-decoration:underline; text-underline-offset:2px; }
   .f-caret { flex:none; width:10px; color:var(--dim); font-size:10px; transition:transform .12s; transform:rotate(90deg); }
   .finding.collapsed .f-caret { transform:rotate(0deg); }
   .f-tag { font-size:11px; padding:1px 7px; border-radius:4px; font-weight:600; flex:none; white-space:nowrap; }
+  .f-verify { font-size:10px; padding:1px 6px; border-radius:10px; white-space:nowrap; color:var(--green); border:1px solid color-mix(in srgb, var(--green) 50%, transparent); }
+  .f-verify.unresolved { color:var(--vscode-descriptionForeground); border-color:var(--vscode-panel-border); }
+  .f-verify.overturned { color:var(--vscode-descriptionForeground); border-color:var(--vscode-panel-border); text-decoration:line-through; }
   .finding.bug .f-tag { background:var(--red-bg, rgba(241,76,76,.14)); color:var(--red); }
   .finding.conditional .f-tag { background:rgba(216,192,32,.14); color:var(--yellow); }
   .finding.suggestion .f-tag { background:rgba(86,156,214,.16); color:var(--blue); }
@@ -780,6 +797,8 @@ export class DocumentPanel {
   .finding.collapsed .f-body { display:none; }
   .f-detail { margin:0 0 6px; line-height:1.6; opacity:.9; }
   .f-suggest { margin:0 0 8px; color:var(--vscode-textLink-foreground, var(--blue)); line-height:1.6; }
+  .f-verification { margin:0 0 8px; padding:6px 8px; border-radius:5px; background:var(--vscode-textBlockQuote-background); color:var(--vscode-descriptionForeground); line-height:1.5; }
+  .f-evidence { margin:4px 0 0; padding-left:18px; font-family:var(--vscode-editor-font-family, monospace); font-size:11px; }
   .f-actions { display:flex; gap:6px; }
   .f-actions .done { color:var(--green); align-self:center; font-size:11px; }
   button.primary { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
@@ -905,7 +924,11 @@ const DISP_LABEL = DISP;
 
 function findingCard(f) {
   const div = document.createElement('div');
-  div.className = 'finding ' + f.severity + (f.disposition ? ' disposed' : '');
+  const unresolved = f.verificationStatus === 'unresolved';
+  const overturned = f.verificationStatus === 'overturned';
+  const nonActionable = unresolved || overturned;
+  div.className = 'finding ' + f.severity + (f.disposition ? ' disposed' : '') +
+    (unresolved ? ' unresolved' : '') + (overturned ? ' overturned' : '');
   div.dataset.findingId = f.id;
   // Default-collapse anything already dealt with (fixed / commented / ignored)
   // so resolved findings stop splitting the code; keep open findings expanded.
@@ -916,6 +939,7 @@ function findingCard(f) {
   head.innerHTML =
     '<span class="f-caret">▸</span>' +
     '<span class="f-tag">' + (SEV_LABEL[f.severity] || f.severity) + '</span>' +
+    (f.verificationStatus ? '<span class="f-verify ' + f.verificationStatus + '"></span>' : '') +
     '<span class="f-title"></span>' +
     '<span class="f-status"></span>' +
     '<span class="f-spacer"></span>' +
@@ -923,12 +947,19 @@ function findingCard(f) {
       (f.estimatedLine ? ' title="' + T.estimatedLineHint + '"' : '') + '>' +
       (f.estimatedLine ? '~' : '') + fmt(T.line, f.line) + '</span>';
   head.querySelector('.f-title').textContent = f.title;
+  const verifyBadge = head.querySelector('.f-verify');
+  if (verifyBadge) {
+    verifyBadge.textContent = overturned
+      ? T.repoOverturned
+      : (unresolved ? T.repoUnresolved : T.repoConfirmed);
+    verifyBadge.title = f.verificationRationale || '';
+  }
   if (f.disposition) {
     head.querySelector('.f-status').textContent = '✓ ' + (DISP_LABEL[f.disposition] || f.disposition);
   }
   head.addEventListener('click', () => {
     div.classList.toggle('collapsed');
-    vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
+    if (!nonActionable) vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
   });
   const body = document.createElement('div');
   body.className = 'f-body';
@@ -941,6 +972,28 @@ function findingCard(f) {
     sug.className = 'f-suggest';
     sug.textContent = T.suggestionPrefix + f.suggestion;
     body.appendChild(sug);
+  }
+  if (f.verificationStatus) {
+    const verification = document.createElement('div');
+    verification.className = 'f-verification';
+    verification.textContent =
+      (overturned
+        ? T.repoOverturnedDetail
+        : (unresolved ? T.repoUnresolvedDetail : T.repoConfirmedDetail)) +
+      (f.verificationRationale ? ' ' + f.verificationRationale : '');
+    const evidence = f.verificationEvidence || [];
+    if (evidence.length) {
+      const list = document.createElement('ul');
+      list.className = 'f-evidence';
+      for (const item of evidence) {
+        const li = document.createElement('li');
+        li.textContent = item.file + ':' + item.line +
+          (item.endLine && item.endLine !== item.line ? '-' + item.endLine : '');
+        list.appendChild(li);
+      }
+      verification.appendChild(list);
+    }
+    body.appendChild(verification);
   }
   if (f.disposition) {
     const tag = document.createElement('div');
@@ -969,8 +1022,13 @@ function findingCard(f) {
   const fixBtn = document.createElement('button');
   const isFixed = f.disposition === 'fixed';
   fixBtn.textContent = isFixed ? T.fixedView : T.fixWithCopilot;
-  if (!f.disposition) fixBtn.className = 'primary';
-  fixBtn.addEventListener('click', () => vscode.postMessage({ type:'viewFix', id:f.id }));
+  if (nonActionable) {
+    fixBtn.disabled = true;
+    fixBtn.title = overturned ? T.repoOverturnedNoFix : T.repoUnresolvedNoFix;
+  } else {
+    if (!f.disposition) fixBtn.className = 'primary';
+    fixBtn.addEventListener('click', () => vscode.postMessage({ type:'viewFix', id:f.id }));
+  }
   actions.appendChild(fixBtn);
   actions.appendChild(disposeBtn('commented', T.commentBtn, false));
   actions.appendChild(disposeBtn('ignored', T.ignoreBtn, false));
@@ -1426,10 +1484,18 @@ function renderFindbar() {
   const fs = (model.findings || []);
   if (!fs.length) { fb.style.display = 'none'; return; }
   fb.style.display = 'block';
-  const unconfirmed = fs.filter((f) => !f.disposition).length;
+  const unresolved = fs.filter((f) => f.verificationStatus === 'unresolved').length;
+  const overturned = fs.filter((f) => f.verificationStatus === 'overturned').length;
+  const unconfirmed = fs.filter((f) =>
+    f.verificationStatus !== 'unresolved'
+    && f.verificationStatus !== 'overturned'
+    && !f.disposition,
+  ).length;
   $('findbar-toggle').innerHTML =
     '<span class="fb-count">' + fmt(T.findingCount, fs.length) + '</span>' +
     (unconfirmed ? '<span class="fb-warn">' + fmt(T.unconfirmedCount, unconfirmed) + '</span>' : '<span class="fb-ok">' + T.allConfirmed + '</span>') +
+    (unresolved ? '<span class="fb-warn">' + fmt(T.repoUnresolvedCount, unresolved) + '</span>' : '') +
+    (overturned ? '<span class="fb-ok">' + fmt(T.repoOverturnedCount, overturned) + '</span>' : '') +
     '<span class="fb-caret">▾</span>';
   const list = $('findlist');
   list.innerHTML = '';
@@ -1728,6 +1794,11 @@ window.addEventListener('message', (ev) => {
   else if (msg.type === 'docNotice') { flashDocNotice(msg.message, msg.kind, msg.ms); }
   else if (msg.type === 'focusContent') { contentEl.setAttribute('tabindex', '-1'); contentEl.focus(); }
   else if (msg.type === 'analyzing') { setAnalyzing(msg.on, msg.ok); }
+  else if (msg.type === 'analysisStage') {
+    const btn = $('act-analyze');
+    const label = btn && btn.querySelector('.btn-label');
+    if (btn && btn.classList.contains('analyzing') && label) label.textContent = msg.message;
+  }
   else if (msg.type === 'scrollTo') {
     if (mode !== 'source') setMode('source');
     const start = msg.line;
@@ -1854,7 +1925,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     jumpToFinding(findingPtr + 1); // wraps to first after the last
   } else if (k === 'a' || k === 'A') {
-    // The ONLY shortcut that may cost tokens — mirrors the 分析此文件 button.
+    // The ONLY shortcut that may cost tokens — mirrors the 基于此文件分析 button.
     const btn = $('act-analyze');
     if (btn && !btn.classList.contains('analyzing')) {
       e.preventDefault();

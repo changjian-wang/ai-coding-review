@@ -1,6 +1,6 @@
 # AI Coding Review
 
-> 不信任驱动的代码审查：**每一行都必须被看过**。把 “Review = 不信任” 做成硬门禁——逐行通读 + 文件级 AI 分析 + 逐条处置每个问题 + 跨文件全局分析，全部完成才允许给出审查结论。
+> 不信任驱动的代码审查：**每一行都必须被看过**。把 “Review = 不信任” 做成硬门禁——逐行通读 + 以每个文件为入口的仓库分析 + 逐条处置确认问题 + 跨文件全局分析，全部完成才允许给出审查结论。
 
 [![VS Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/changjian-wang.ai-coding-review?label=Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=changjian-wang.ai-coding-review)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/changjian-wang.ai-coding-review)](https://marketplace.visualstudio.com/items?itemName=changjian-wang.ai-coding-review)
@@ -40,8 +40,10 @@ VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 
 - PR 等差异范围默认打开不折叠的完整文件行内 Diff，显示新旧双行号和新增/删除行；可随时切回干净的 HEAD 文件
 - 逐行覆盖追踪与「跳到下一处未读行」
-- 文件级 AI 分析 → 带严重级别的 findings
-- 每条 finding 必须处置：**已修复 / 已评论 / 已忽略（需理由）**
+- **基于此文件分析**：在明确的递归深度、文件数、Token 和时间预算内，递归追踪相关实现、调用方、配置与测试
+- 每个候选 Bug 都会基于同一份仓库上下文再由模型独立复核；只有确认 Bug 会显示，已推翻或证据不足的候选只进入完成统计
+- 确认 Bug 可落在相关文件；若该文件不在当前范围，会自动加入审查并要求正常完成审查
+- 每条可操作 finding 必须处置：**已修复 / 已评论 / 已忽略（需理由）**
 - 修复方案：Copilot 生成互斥的「多处编辑 = 一个完整方案」候选，一键应用 + 一键撤销，应用快照持久化
 - **修复前补充信息**：当模型对某条 finding 判断偏了，在修复面板里写一段补充说明；生成方案时它优先于原 finding，且按 finding 持久化
 - 选区翻译 / 代码讲解标注
@@ -61,7 +63,7 @@ VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 
 ```text
 gatePassed = 所有文件就绪 && 全局分析已确认
-文件就绪    = 已做文件级分析 && 该文件每条 finding 都已处置
+文件就绪    = 已做文件级分析 && 该文件每条可操作 finding 都已处置
 ```
 
 逐行覆盖率作为实时进度信号展示（每文件 / 整体 `seen/total`），鞭策「真的读过」，与门禁判定并列呈现。
@@ -87,7 +89,7 @@ AI Coding Review 全面双语（English / 简体中文），**默认英文**。
 | `codereview.openInNewWindow` | 在独立窗口打开审查工作台 |
 | `codereview.startReview` | 选择范围并开始审查 |
 | `codereview.openWorkbench` | 打开审查工作台 |
-| `codereview.analyzeFile` | 分析当前文件 |
+| `codereview.analyzeFile` | 以当前文件为入口分析相关仓库行为 |
 | `codereview.globalAnalysis` | 运行全局分析 |
 | `codereview.showGlobalReport` | 查看全局报告 |
 | `codereview.submitConclusion` | 提交审查结论 |
@@ -101,6 +103,8 @@ AI Coding Review 全面双语（English / 简体中文），**默认英文**。
 |--------|------|------|
 | `codereview.language` | `en` | 整体体验（UI + LLM 输出）的语言：`en` / `zh-CN` / `auto` |
 | `codereview.focusedWorkbench` | `false` | 打开工作台时隐藏侧栏 / 活动栏占满主编辑区，关闭后恢复 |
+| `codereview.repositoryAwareAnalysis` | `auto` | `auto` 递归构建相关仓库上下文并自行复核候选 Bug；`off` 保留旧单文件行为 |
+| `codereview.repositoryContextTokenBudget` | `28000` | 仓库上下文最大估算输入 Token；超限时优先移除较低价值的相关片段 |
 
 ## 架构分层
 

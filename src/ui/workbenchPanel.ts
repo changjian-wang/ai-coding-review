@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { FindingSeverity } from '../ai/types';
+import type { FindingEvidenceRef, FindingSeverity } from '../ai/types';
 import { esc, escAttr, nonce as makeNonce } from './html';
 import { m, fmt, resolveLanguage, type Messages } from '../i18n';
 
@@ -33,6 +33,9 @@ export interface WorkbenchFinding {
   suggestion?: string;
   disposition?: FindingDispositionKind;
   dispositionReason?: string;
+  verificationStatus?: 'repo-confirmed' | 'unresolved' | 'overturned';
+  verificationRationale?: string;
+  verificationEvidence?: FindingEvidenceRef[];
 }
 
 /** Serializable snapshot the webview renders. */

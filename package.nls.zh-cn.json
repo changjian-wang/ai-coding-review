@@ -6,7 +6,7 @@
   "cmd.pickLanguage": "AI Coding Review：切换语言",
   "cmd.openWorkbench": "AI Coding Review：打开审查工作台",
   "cmd.openFile": "AI Coding Review：打开改动文件",
-  "cmd.analyzeFile": "AI Coding Review：分析当前文件",
+  "cmd.analyzeFile": "AI Coding Review：基于当前文件分析",
   "cmd.globalAnalysis": "AI Coding Review：运行全局分析",
   "cmd.showGlobalReport": "AI Coding Review：查看全局报告",
   "cmd.submitConclusion": "AI Coding Review：提交审查结论",
@@ -20,6 +20,10 @@
   "config.language.en": "始终使用英文",
   "config.language.description": "AI Coding Review 整体体验使用的语言——包括扩展 UI（状态栏、提示、面板）以及所有 LLM 输出（findings、修复方案、解释、跨文件结论）。命令面板中的命令标题跟随 VS Code 显示语言。",
   "config.focusedWorkbench.description": "打开 AI Coding Review 工作台时自动关闭左侧栏并隐藏活动栏，让工作台占满主编辑区；关闭工作台后自动恢复。",
+  "config.repositoryAwareAnalysis.auto": "以选定文件为入口递归分析相关仓库行为，并对每个候选 Bug 进行独立自复核。",
+  "config.repositoryAwareAnalysis.off": "仅做单文件分析，不运行仓库证据复核。",
+  "config.repositoryAwareAnalysis.description": "控制“基于此文件分析”。Auto 会有界构建相关仓库上下文、查找候选 Bug，并在存在候选时额外调用一次 Copilot 模型进行自复核。",
+  "config.repositoryContextTokenBudget.description": "“基于此文件分析”使用的仓库上下文最大估算输入 Token；超过预算时优先移除较低价值的相关片段。",
   "config.autoAccount.description": "自动选择能访问当前仓库（按其 owner 匹配）的 GitHub CLI 账号，并仅为该仓库的 GitHub 调用使用它，而不改变你的全局活动 gh 账号。关闭后将始终使用活动 gh 账号。",
   "config.accountByOwner.description": "可选：将仓库 owner（组织或用户）映射到指定的 GitHub CLI 账号登录名，例如 `{ \"my-org\": \"work-account\" }`。优先级高于自动探测。"
 }

@@ -13,7 +13,7 @@ type SpotDispositionKind = 'fixed' | 'commented' | 'ignored';
 
 /** Message from the webview to the extension. */
 type InboundMessage =
-  | { type: 'locate'; file: string; line: number }
+  | { type: 'locate'; file: string; line: number; id?: string; findingRef?: string }
   | { type: 'globalFix'; id: string; file: string; line: number }
   | { type: 'globalIgnore'; id: string; file: string; line: number }
   | { type: 'globalComment'; id: string; file: string; line: number }
@@ -38,7 +38,7 @@ export interface GlobalReportStats {
  * every other argument).
  */
 export interface GlobalReportHandlers {
-  onLocate: (file: string, line: number) => void;
+  onLocate: (file: string, line: number, spotId?: string, findingRef?: string) => void;
   onConfirm: () => void;
   onGlobalFix?: (spotId: string, file: string, line: number) => void;
   onGlobalIgnore?: (spotId: string, file: string, line: number) => void;
@@ -73,7 +73,7 @@ export class GlobalReportPanel {
       (msg: InboundMessage) => {
         const h = this.handlers;
         if (msg.type === 'locate') {
-          h.onLocate(msg.file, msg.line);
+          h.onLocate(msg.file, msg.line, msg.id, msg.findingRef);
         } else if (msg.type === 'globalFix') {
           h.onGlobalFix?.(msg.id, msg.file, msg.line);
         } else if (msg.type === 'globalIgnore') {
@@ -271,7 +271,7 @@ export class GlobalReportPanel {
             ${v.evidence ? `<div class="vc-evidence">${esc(v.evidence)}</div>` : ''}
             ${
               v.file
-                ? `<div class="card-actions"><button class="locate" data-file="${escAttr(v.file)}" data-line="${v.line ?? 1}">${esc(t.locate)}</button></div>`
+                ? `<div class="card-actions"><button class="locate" data-finding-ref="${escAttr(v.findingRef ?? '')}" data-file="${escAttr(v.file)}" data-line="${v.line ?? 1}">${esc(t.locate)}</button></div>`
                 : ''
             }
           </div>
@@ -293,7 +293,7 @@ export class GlobalReportPanel {
             <p class="why">${esc(sp.detail)}</p>
             ${sp.suggestion ? `<p class="suggest">${esc(t.suggestionPrefix)}${esc(sp.suggestion)}</p>` : ''}
             <div class="card-actions">
-              <button class="locate" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
+              <button class="locate" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
               <button class="globalfix" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.fixWithCopilot)}</button>
               <button class="act act-comment" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.actComment)}</button>
               <button class="act act-ignore" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.actIgnore)}</button>
@@ -312,7 +312,7 @@ export class GlobalReportPanel {
           <span class="hrow-title">${esc(sp.title)}</span>
           <span class="where">${esc(sp.file)}:${sp.line}</span>
           <span class="hrow-actions">
-            <button class="locate" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
+            <button class="locate" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.locate)}</button>
             <button class="act act-revert" data-id="${escAttr(sp.id)}" data-file="${escAttr(sp.file)}" data-line="${sp.line}">${esc(t.revert)}</button>
           </span>
         </div>`;
@@ -524,7 +524,7 @@ export class GlobalReportPanel {
   }
   document.querySelectorAll('.locate').forEach((btn) => {
     btn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'locate', file: btn.dataset.file, line: Number(btn.dataset.line) });
+      vscode.postMessage({ type: 'locate', id: btn.dataset.id, findingRef: btn.dataset.findingRef, file: btn.dataset.file, line: Number(btn.dataset.line) });
     });
   });
   document.querySelectorAll('.globalfix').forEach((btn) => {
@@ -580,5 +580,3 @@ export class GlobalReportPanel {
     }
   }
 }
-
-

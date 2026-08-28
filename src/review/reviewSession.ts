@@ -2,7 +2,16 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { m } from '../i18n';
 import type { ReviewFile, ReviewSet } from '../scope/types';
-import type { Finding, GlobalReport } from '../ai/types';
+import {
+  findingAnalysisRoots,
+  findingContentSignatures,
+  findingHasAnalysisRoot,
+  globalFixSpotSignatures,
+  isActionableFinding,
+  type FileAnalysisSummary,
+  type Finding,
+  type GlobalReport,
+} from '../ai/types';
 import type { TokenUsage } from '../ai/analyzer';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
@@ -10,6 +19,18 @@ import { isBlankFileState } from './reviewStore';
 export interface ReviewSessionChange {
   filePath?: string;
   structureChanged?: boolean;
+}
+
+export interface ReviewInvalidation {
+  changed: boolean;
+  affectedFiles: string[];
+  removedFiles: string[];
+}
+
+export interface RootedFindingsUpdate {
+  addedFiles: string[];
+  updatedFiles: string[];
+  removedFiles: string[];
 }
 
 /**
@@ -52,12 +73,6 @@ export class ReviewSession {
   /** Loads or initialises review progress for the given review set. */
   async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
     await this.flushPendingFilePersists();
-    this.reviewSet = reviewSet;
-    this.reviewFilesByPath = new Map(reviewSet.files.map((file) => [file.path, file]));
-    this.deletedPaths = new Set(
-      reviewSet.files.filter((file) => file.status === 'deleted').map((file) => file.path),
-    );
-    this.structureVersion++;
     this.cwd = cwd;
     this.repoName = cwd ? path.basename(cwd) : this.defaultRepo;
     const repo = this.repoName;
@@ -78,6 +93,28 @@ export class ReviewSession {
         scopeSnap = { ...legacy, headSha: 'live' };
       }
     }
+
+    const originalPaths = new Set(reviewSet.files.map((file) => file.path));
+    const contextFiles = [...new Set(
+      (scopeSnap?.contextFiles ?? [])
+        .map((filePath) => filePath.replaceAll('\\', '/').replace(/^\.\//, ''))
+        .filter((filePath) =>
+          !!filePath
+          && filePath !== '..'
+          && !filePath.startsWith('../')
+          && !originalPaths.has(filePath),
+        ),
+    )];
+    const effectiveFiles: ReviewFile[] = [
+      ...reviewSet.files,
+      ...contextFiles.map((filePath) => ({ path: filePath, context: true })),
+    ];
+    this.reviewSet = { ...reviewSet, files: effectiveFiles };
+    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
+    this.deletedPaths = new Set(
+      effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
+    );
+    this.structureVersion++;
 
     // Keep state sparse: untouched files do not allocate promises or empty
     // PerFileState objects. Existing progress is loaded in one key scan.
@@ -115,6 +152,8 @@ export class ReviewSession {
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
       perFile,
+      contextFiles,
+      analysisDependencies: scopeSnap?.analysisDependencies,
       globalReport: scopeSnap?.globalReport,
       globalDone: scopeSnap?.globalDone ?? false,
       globalFixDispositions: scopeSnap?.globalFixDispositions,
@@ -155,6 +194,41 @@ export class ReviewSession {
 
   fileState(path: string): PerFileState | undefined {
     return this.snapshot?.perFile[path];
+  }
+
+  /** Adds confirmed out-of-scope bug locations to the active review and persists them. */
+  addContextReviewFiles(paths: readonly string[]): string[] {
+    if (!this.reviewSet || !this.snapshot) {
+      return [];
+    }
+    const added: string[] = [];
+    const files = [...this.reviewSet.files];
+    for (const filePath of paths) {
+      const normalized = filePath.replaceAll('\\', '/').replace(/^\.\//, '');
+      if (
+        !normalized
+        || normalized === '..'
+        || normalized.startsWith('../')
+        || this.reviewFilesByPath.has(normalized)
+      ) {
+        continue;
+      }
+      const file: ReviewFile = { path: normalized, context: true };
+      files.push(file);
+      this.reviewFilesByPath.set(normalized, file);
+      added.push(normalized);
+    }
+    if (added.length === 0) {
+      return [];
+    }
+    this.reviewSet = { ...this.reviewSet, files };
+    this.snapshot.contextFiles = [
+      ...new Set([...(this.snapshot.contextFiles ?? []), ...added]),
+    ];
+    this.structureVersion++;
+    void this.persistScopeMeta().catch(() => {/* non-fatal */});
+    this._onDidChange.fire({ structureChanged: true });
+    return added;
   }
 
   private ensureFileState(path: string): PerFileState | undefined {
@@ -214,6 +288,12 @@ export class ReviewSession {
    * single source of truth for "is this document under review, and as what path".
    */
   relPathInSet(uri: vscode.Uri): string | undefined {
+    const rel = this.relPathInRepo(uri);
+    return rel && this.reviewFilesByPath.has(rel) ? rel : undefined;
+  }
+
+  /** Resolves a file URI under the active repository, whether or not it is in scope. */
+  relPathInRepo(uri: vscode.Uri): string | undefined {
     if (uri.scheme !== 'file' || !this.reviewSet) {
       return undefined;
     }
@@ -231,7 +311,12 @@ export class ReviewSession {
     if (!rel || rel.startsWith('..')) {
       return undefined;
     }
-    return this.reviewFilesByPath.has(rel) ? rel : undefined;
+    return rel;
+  }
+
+  hasAnalysisDependency(path: string): boolean {
+    return Object.values(this.snapshot?.analysisDependencies ?? {})
+      .some((files) => files.includes(path));
   }
 
   /** Coverage for a file: how many of its lines have been seen, out of total. */
@@ -345,7 +430,9 @@ export class ReviewSession {
       return false;
     }
     const dispositions = s.dispositions ?? {};
-    return s.findings.every((f) => !!dispositions[f.id]);
+    return s.findings
+      .filter(isActionableFinding)
+      .every((f) => !!dispositions[f.id]);
   }
 
   /** Whether every line of the file has been seen (coverage complete). */
@@ -358,7 +445,11 @@ export class ReviewSession {
   }
 
   /** Stores file-level analysis results and marks the file analyzed. */
-  setFindings(path: string, findings: Finding[]): void {
+  setFindings(
+    path: string,
+    findings: Finding[],
+    analysisSummary?: FileAnalysisSummary,
+  ): void {
     const s = this.ensureFileState(path);
     if (!s) {
       return;
@@ -367,30 +458,341 @@ export class ReviewSession {
     // re-analysis. Re-keying dispositions by id would resurrect already-handled
     // findings as fresh, unconfirmed ones. Instead, carry each prior disposition
     // forward by matching the new finding to the old one by content signature.
-    const prev = s.dispositions ?? {};
-    const sigToDisp = new Map<string, FindingDisposition>();
-    for (const old of s.findings) {
-      const d = prev[old.id];
-      if (d) {
-        sigToDisp.set(findingSignature(old), d);
-      }
-    }
-    const next: Record<string, FindingDisposition> = {};
-    for (const f of findings) {
-      const d = sigToDisp.get(findingSignature(f));
-      if (d) {
-        next[f.id] = d;
-      }
-    }
-    s.findings = findings;
+    const keyed = rekeyFindings(
+      s.findings,
+      findings.map((finding) => ({
+        ...finding,
+        analysisRoot: path,
+        analysisRoots: [path],
+      })),
+      s.dispositions ?? {},
+    );
+    const invalidatedFiles = this.invalidateGlobalAnalysis();
+    s.findings = keyed.findings;
+    s.analysisSummary = analysisSummary;
     s.analyzed = true;
-    s.dispositions = next;
+    s.dispositions = keyed.dispositions;
     s.confirmedFindings = [];
+    if (this.snapshot) {
+      (this.snapshot.analysisDependencies ??= {})[path] = [path];
+    }
+    for (const invalidatedFile of invalidatedFiles) {
+      if (invalidatedFile !== path) {
+        this.persistFile(invalidatedFile);
+      }
+    }
     this.persistFile(path);
+  }
+
+  /**
+   * Replaces every finding previously produced from one entry file, including
+   * findings located in related files. Only the entry file becomes analyzed;
+   * newly-added related files still require their own rooted review.
+   */
+  setRootedFindings(
+    rootPath: string,
+    findingsByFile: Record<string, Finding[]>,
+    analysisSummary: FileAnalysisSummary,
+    contextFiles: readonly string[] = [rootPath],
+  ): RootedFindingsUpdate {
+    if (!this.snapshot || !this.reviewSet || !this.reviewFilesByPath.has(rootPath)) {
+      return { addedFiles: [], updatedFiles: [], removedFiles: [] };
+    }
+    const resultPaths = Object.keys(findingsByFile);
+    const added = this.addContextReviewFiles(
+      resultPaths.filter((filePath) => !this.reviewFilesByPath.has(filePath)),
+    );
+    const affected = new Set<string>([rootPath, ...resultPaths]);
+    for (const [filePath, state] of Object.entries(this.snapshot.perFile)) {
+      if (state.findings.some((finding) => findingHasAnalysisRoot(finding, rootPath))) {
+        affected.add(filePath);
+      }
+    }
+    for (const invalidatedFile of this.invalidateGlobalAnalysis()) {
+      affected.add(invalidatedFile);
+    }
+    (this.snapshot.analysisDependencies ??= {})[rootPath] = [
+      ...new Set(contextFiles),
+    ];
+
+    const updatedFiles: string[] = [];
+    for (const filePath of affected) {
+      if (!this.reviewFilesByPath.has(filePath)) {
+        continue;
+      }
+      const state = this.ensureFileState(filePath);
+      if (!state) {
+        continue;
+      }
+      const incoming = (findingsByFile[filePath] ?? []).map((finding) => ({
+        ...finding,
+        analysisRoot: rootPath,
+        analysisRoots: [rootPath],
+      }));
+      const retained: Finding[] = [];
+      for (const finding of state.findings) {
+        const roots = findingAnalysisRoots(finding);
+        if (roots.includes(rootPath)) {
+          const remainingRoots = roots.filter((root) => root !== rootPath);
+          if (remainingRoots.length > 0) {
+            retained.push({
+              ...finding,
+              analysisRoot: remainingRoots[0],
+              analysisRoots: remainingRoots,
+            });
+          }
+          continue;
+        }
+        if (roots.length === 0 && filePath === rootPath) {
+          continue;
+        }
+        retained.push(finding);
+      }
+      for (const finding of incoming) {
+        const key = rootedFindingKey(finding);
+        const existingIndex = retained.findIndex(
+          (existing) => rootedFindingKey(existing) === key,
+        );
+        if (existingIndex < 0) {
+          retained.push(finding);
+          continue;
+        }
+        const existing = retained[existingIndex];
+        const roots = [
+          ...new Set([...findingAnalysisRoots(existing), rootPath]),
+        ];
+        retained[existingIndex] = {
+          ...finding,
+          ...existing,
+          analysisRoot: roots[0],
+          analysisRoots: roots,
+          verification: mergeFindingVerification(
+            existing.verification,
+            finding.verification,
+          ),
+        };
+      }
+      const keyed = rekeyFindings(
+        state.findings,
+        retained,
+        state.dispositions ?? {},
+      );
+      state.findings = keyed.findings;
+      state.dispositions = keyed.dispositions;
+      state.confirmedFindings = [];
+      if (filePath === rootPath) {
+        state.analyzed = true;
+        state.analysisSummary = analysisSummary;
+      }
+      updatedFiles.push(filePath);
+    }
+    const removedFiles = this.pruneOrphanedContextFiles(rootPath);
+    const removed = new Set(removedFiles);
+    for (const filePath of updatedFiles) {
+      if (!removed.has(filePath)) {
+        this.persistFile(filePath);
+      }
+    }
+    return {
+      addedFiles: added,
+      updatedFiles: [...new Set(updatedFiles)],
+      removedFiles,
+    };
+  }
+
+  /** A file edit invalidates both its rooted analysis and the cross-file conclusion. */
+  invalidateAfterFileChange(path: string): ReviewInvalidation {
+    if (!this.snapshot) {
+      return { changed: false, affectedFiles: [], removedFiles: [] };
+    }
+    const roots = new Set<string>([path]);
+    for (const [root, dependencies] of Object.entries(
+      this.snapshot.analysisDependencies ?? {},
+    )) {
+      if (dependencies.includes(path)) {
+        roots.add(root);
+      }
+    }
+    for (const finding of this.fileState(path)?.findings ?? []) {
+      for (const root of findingAnalysisRoots(finding)) {
+        roots.add(root);
+      }
+    }
+    const affected = new Set<string>();
+    let changed = false;
+    for (const [filePath, state] of Object.entries(this.snapshot.perFile)) {
+      const nextFindings: Finding[] = [];
+      for (const finding of state.findings) {
+        if (filePath === path) {
+          continue;
+        }
+        const owners = findingAnalysisRoots(finding);
+        const remainingOwners = owners.filter((root) => !roots.has(root));
+        if (owners.length > 0 && remainingOwners.length === 0) {
+          continue;
+        }
+        nextFindings.push(
+          remainingOwners.length !== owners.length
+            ? {
+                ...finding,
+                analysisRoot: remainingOwners[0],
+                analysisRoots: remainingOwners,
+              }
+            : finding,
+        );
+      }
+      const findingsChanged =
+        nextFindings.length !== state.findings.length
+        || nextFindings.some((finding, index) => finding !== state.findings[index]);
+      if (findingsChanged) {
+        const keyed = rekeyFindings(
+          state.findings,
+          nextFindings,
+          state.dispositions ?? {},
+        );
+        state.findings = keyed.findings;
+        state.dispositions = keyed.dispositions;
+        affected.add(filePath);
+        changed = true;
+      }
+      if (roots.has(filePath) && (state.analyzed || state.analysisSummary)) {
+        state.analyzed = false;
+        state.analysisSummary = undefined;
+        affected.add(filePath);
+        changed = true;
+      }
+    }
+    for (const root of roots) {
+      if (this.snapshot.analysisDependencies?.[root]) {
+        delete this.snapshot.analysisDependencies[root];
+        changed = true;
+      }
+    }
+    const hadGlobalAnalysis = !!this.snapshot.globalReport || this.snapshot.globalDone;
+    for (const invalidatedFile of this.invalidateGlobalAnalysis()) {
+      affected.add(invalidatedFile);
+    }
+    changed ||= hadGlobalAnalysis;
+    const removedFiles = this.pruneOrphanedContextFiles(path);
+    const removed = new Set(removedFiles);
+    for (const filePath of removedFiles) {
+      affected.add(filePath);
+    }
+    for (const filePath of affected) {
+      if (this.reviewFilesByPath.has(filePath) && !removed.has(filePath)) {
+        this.persistFile(filePath);
+      }
+    }
+    if (changed && affected.size === 0) {
+      this.persistScope();
+    }
+    return {
+      changed: changed || removed.size > 0,
+      affectedFiles: [...affected],
+      removedFiles,
+    };
+  }
+
+  /** Removes untouched auto-added files once no rooted finding still justifies them. */
+  private pruneOrphanedContextFiles(activeRoot: string): string[] {
+    if (!this.reviewSet || !this.snapshot?.contextFiles?.length) {
+      return [];
+    }
+    const removed = this.snapshot.contextFiles.filter((filePath) => {
+      if (filePath === activeRoot) {
+        return false;
+      }
+      const state = this.snapshot?.perFile[filePath];
+      return !state
+        || (
+          state.findings.length === 0
+          && !state.analyzed
+          && state.totalLines === 0
+          && state.seenLines.length === 0
+          && (state.annotations?.length ?? 0) === 0
+          && Object.keys(state.dispositions ?? {}).length === 0
+        );
+    });
+    if (removed.length === 0) {
+      return [];
+    }
+    const removedSet = new Set(removed);
+    this.snapshot.contextFiles = this.snapshot.contextFiles.filter(
+      (filePath) => !removedSet.has(filePath),
+    );
+    this.reviewSet = {
+      ...this.reviewSet,
+      files: this.reviewSet.files.filter((file) => !removedSet.has(file.path)),
+    };
+    for (const filePath of removed) {
+      const pending = this.pendingFilePersists.get(filePath);
+      if (pending) {
+        clearTimeout(pending);
+        this.pendingFilePersists.delete(filePath);
+      }
+      this.reviewFilesByPath.delete(filePath);
+      this.deletedPaths.delete(filePath);
+      delete this.snapshot.perFile[filePath];
+      if (this.store.clearFile) {
+        void this.store.clearFile(this.getRepoName(), filePath).catch((err) => {
+          console.warn('[codereview] failed to clear orphaned context file state:', err);
+        });
+      }
+    }
+    this.structureVersion++;
+    void this.persistScopeMeta().catch(() => {/* non-fatal */});
+    this._onDidChange.fire({ structureChanged: true });
+    return removed;
+  }
+
+  /** Invalidates stale global analysis and removes its replaceable finding overlays. */
+  private invalidateGlobalAnalysis(): string[] {
+    if (!this.snapshot) {
+      return [];
+    }
+    const changedFiles: string[] = [];
+    for (const [file, state] of Object.entries(this.snapshot.perFile)) {
+      let changed = false;
+      for (const finding of state.findings) {
+        if (finding.verification?.source !== 'global') {
+          continue;
+        }
+        finding.verification = finding.verification.prior
+          ? { ...finding.verification.prior, source: 'file' }
+          : undefined;
+        changed = true;
+      }
+      if (changed) {
+        changedFiles.push(file);
+      }
+    }
+    const dispositions = this.snapshot.globalFixDispositions;
+    const previousSpots = this.snapshot.globalReport?.fixSpots ?? [];
+    const stableSpotIds = globalFixSpotSignatures(previousSpots);
+    for (let index = 0; index < previousSpots.length; index++) {
+      const spot = previousSpots[index];
+      const disposition = dispositions?.[spot.id];
+      if (disposition) {
+        dispositions![stableSpotIds[index]] = disposition;
+      }
+    }
+    this.snapshot.globalReport = undefined;
+    this.snapshot.globalDone = false;
+    return changedFiles;
   }
 
   findings(path: string): Finding[] {
     return this.fileState(path)?.findings ?? [];
+  }
+
+  findingByContentRef(path: string, findingRef: string): Finding | undefined {
+    const findings = this.findings(path);
+    const index = findingContentSignatures(findings).indexOf(findingRef);
+    return index >= 0 ? findings[index] : undefined;
+  }
+
+  actionableFindings(path: string): Finding[] {
+    return this.findings(path).filter(isActionableFinding);
   }
 
   /** Disposition of a single finding, if the reviewer has acted on it. */
@@ -427,7 +829,10 @@ export class ReviewSession {
       return 0;
     }
     const dispositions = s.dispositions ?? {};
-    return s.findings.filter((f) => !dispositions[f.id]).length;
+    return s.findings
+      .filter(isActionableFinding)
+      .filter((f) => !dispositions[f.id])
+      .length;
   }
 
   /** Reviewer translations / notes attached to a file. */
@@ -483,13 +888,107 @@ export class ReviewSession {
   /** Stores the cross-file global report (reviewer must still confirm it). */
   setGlobalReport(report: GlobalReport): void {
     if (this.snapshot) {
+      const previousReport = this.snapshot.globalReport;
+      const previousDispositions = this.snapshot.globalFixDispositions ?? {};
+      const nextDispositions: Record<string, FindingDisposition> = {};
+      const previousSpots = previousReport?.fixSpots ?? [];
+      const previousStableIds = globalFixSpotSignatures(previousSpots);
+      for (const spot of report.fixSpots) {
+        const direct = previousDispositions[spot.id];
+        if (direct) {
+          nextDispositions[spot.id] = direct;
+          continue;
+        }
+        const previousIndex = previousStableIds.indexOf(spot.id);
+        const previousSpot = previousIndex >= 0 ? previousSpots[previousIndex] : undefined;
+        if (previousSpot && previousDispositions[previousSpot.id]) {
+          nextDispositions[spot.id] = previousDispositions[previousSpot.id];
+        }
+      }
       this.snapshot.globalReport = report;
+      this.snapshot.globalDone = false;
+      this.snapshot.globalFixDispositions =
+        Object.keys(nextDispositions).length > 0 ? nextDispositions : undefined;
       this.persistScope();
     }
   }
 
   get globalReport(): GlobalReport | undefined {
     return this.snapshot?.globalReport;
+  }
+
+  /**
+   * Applies global confirmed/flip verdicts back to file findings through stable
+   * content signatures. Positional finding ids are intentionally never used.
+   */
+  reconcileGlobalVerdicts(
+    report: GlobalReport,
+    onlyFile?: string,
+    persist = true,
+  ): string[] {
+    const states = Object.entries(this.snapshot?.perFile ?? {})
+      .filter(([file]) => !onlyFile || file === onlyFile);
+    const before = new Map<string, string>();
+    for (const [file, state] of states) {
+      before.set(file, JSON.stringify(state.findings.map((finding) => finding.verification)));
+      for (const finding of state.findings) {
+        if (finding.verification?.source !== 'global') {
+          continue;
+        }
+        finding.verification = finding.verification.prior
+          ? { ...finding.verification.prior, source: 'file' }
+          : undefined;
+      }
+    }
+
+    for (const verdict of report.verdicts) {
+      if (
+        (verdict.kind !== 'flip' && verdict.kind !== 'confirmed')
+        || !verdict.file
+        || !verdict.findingRef
+        || (onlyFile && verdict.file !== onlyFile)
+      ) {
+        continue;
+      }
+      const finding = this.findingByContentRef(verdict.file, verdict.findingRef);
+      if (!finding) {
+        continue;
+      }
+      const status = verdict.kind === 'flip' ? 'overturned' : 'repo-confirmed';
+      if (
+        finding.verification?.status === status
+        && finding.verification.rationale === verdict.after
+      ) {
+        continue;
+      }
+      finding.verification = {
+        status,
+        rationale: verdict.after,
+        evidence: finding.verification?.evidence ?? [],
+        source: 'global',
+        prior: finding.verification
+          ? {
+              status: finding.verification.status === 'unresolved'
+                ? 'unresolved'
+                : 'repo-confirmed',
+              rationale: finding.verification.rationale,
+              evidence: finding.verification.evidence,
+            }
+          : undefined,
+      };
+    }
+
+    const changedFiles: string[] = [];
+    for (const [file, state] of states) {
+      const after = JSON.stringify(state.findings.map((finding) => finding.verification));
+      if (before.get(file) !== after) {
+        changedFiles.push(file);
+        if (persist) {
+          this.persistFile(file);
+        }
+      }
+    }
+    return changedFiles;
   }
 
   /**
@@ -501,9 +1000,20 @@ export class ReviewSession {
   resolveFixSpotFinding(file: string, line: number, anchor?: string): Finding | undefined {
     const findings = this.findings(file);
     if (anchor && anchor.trim()) {
-      const byAnchor = findings.find((f) => f.anchor && f.anchor.trim() === anchor.trim());
-      if (byAnchor) {
-        return byAnchor;
+      const byAnchor = findings.filter(
+        (finding) => finding.anchor?.trim() === anchor.trim(),
+      );
+      if (byAnchor.length === 1) {
+        return byAnchor[0];
+      }
+      if (byAnchor.length > 1) {
+        const atLine = byAnchor.filter((finding) => {
+          const end = finding.endLine && finding.endLine > finding.line
+            ? finding.endLine
+            : finding.line;
+          return line >= finding.line && line <= end;
+        });
+        return atLine.length === 1 ? atLine[0] : undefined;
       }
     }
     return findings.find((f) => {
@@ -659,7 +1169,7 @@ export class ReviewSession {
     let total = 0;
     let filesReady = this.deletedPaths.size;
     for (const [filePath, state] of Object.entries(this.snapshot?.perFile ?? {})) {
-      if (this.deletedPaths.has(filePath)) {
+      if (!this.reviewFilesByPath.has(filePath) || this.deletedPaths.has(filePath)) {
         continue;
       }
       const fileSeen = state.seenLines.length;
@@ -667,7 +1177,9 @@ export class ReviewSession {
       total += state.totalLines;
       if (
         state.analyzed
-        && state.findings.every((finding) => !!state.dispositions?.[finding.id])
+        && state.findings
+          .filter(isActionableFinding)
+          .every((finding) => !!state.dispositions?.[finding.id])
       ) {
         filesReady++;
       }
@@ -776,15 +1288,70 @@ export class ReviewSession {
   }
 }
 
-/**
- * Content-based identity for a finding, used to carry dispositions across
- * re-analysis (where positional ids change). Prefers the verbatim source
- * `anchor` (stable while the offending code is unchanged); falls back to the
- * detail text. Combined with severity + title to avoid collisions.
- */
-function findingSignature(f: Finding): string {
-  const body = (f.anchor ?? f.detail ?? '').trim();
-  return `${f.severity}\u0000${f.title.trim()}\u0000${body}`;
+function rootedFindingKey(finding: Finding): string {
+  return [
+    finding.line,
+    finding.endLine ?? finding.line,
+    finding.severity,
+    (finding.anchor ?? '').trim(),
+    finding.title.trim().replace(/\s+/g, ' ').toLowerCase(),
+    finding.detail.trim().replace(/\s+/g, ' ').toLowerCase(),
+  ].join('\u0000');
+}
+
+function mergeFindingVerification(
+  current: Finding['verification'],
+  incoming: Finding['verification'],
+): Finding['verification'] {
+  if (!current) {
+    return incoming;
+  }
+  if (!incoming) {
+    return current;
+  }
+  const evidence = [...current.evidence];
+  const keys = new Set(
+    evidence.map((item) =>
+      `${item.kind}\u0000${item.file}\u0000${item.line}\u0000${item.endLine ?? item.line}`,
+    ),
+  );
+  for (const item of incoming.evidence) {
+    const key =
+      `${item.kind}\u0000${item.file}\u0000${item.line}\u0000${item.endLine ?? item.line}`;
+    if (!keys.has(key)) {
+      keys.add(key);
+      evidence.push(item);
+    }
+  }
+  return {
+    ...incoming,
+    evidence,
+  };
+}
+
+function rekeyFindings(
+  previous: Finding[],
+  next: Finding[],
+  previousDispositions: Record<string, FindingDisposition>,
+): { findings: Finding[]; dispositions: Record<string, FindingDisposition> } {
+  const bySignature = new Map<string, FindingDisposition>();
+  const previousSignatures = findingContentSignatures(previous);
+  for (let index = 0; index < previous.length; index++) {
+    const disposition = previousDispositions[previous[index].id];
+    if (disposition) {
+      bySignature.set(previousSignatures[index], disposition);
+    }
+  }
+  const findings = next.map((finding, index) => ({ ...finding, id: `f${index}` }));
+  const dispositions: Record<string, FindingDisposition> = {};
+  const nextSignatures = findingContentSignatures(findings);
+  for (let index = 0; index < findings.length; index++) {
+    const disposition = bySignature.get(nextSignatures[index]);
+    if (disposition) {
+      dispositions[findings[index].id] = disposition;
+    }
+  }
+  return { findings, dispositions };
 }
 
 /**
@@ -797,7 +1364,17 @@ function normaliseFileState(s: PerFileState | undefined): PerFileState {
     seenLines: Array.isArray(s?.seenLines) ? [...s!.seenLines] : [],
     totalLines: s?.totalLines ?? 0,
     analyzed: s?.analyzed ?? false,
-    findings: Array.isArray(s?.findings) ? [...s!.findings] : [],
+    // Older repository-aware builds persisted evidence-insufficient candidates
+    // as manual-review cards. The rooted analyzer now reports only independently
+    // confirmed bugs, so drop those legacy non-findings during migration.
+    findings: Array.isArray(s?.findings)
+      ? s!.findings
+          .filter((finding) => finding.verification?.status !== 'unresolved')
+          .map((finding) => ({ ...finding }))
+      : [],
+    analysisSummary: s?.analysisSummary
+      ? { ...s.analysisSummary }
+      : undefined,
     confirmedFindings: [],
     dispositions: { ...(s?.dispositions ?? {}) },
     annotations: Array.isArray(s?.annotations) ? [...s!.annotations] : [],

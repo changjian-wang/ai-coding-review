@@ -1,6 +1,6 @@
 # AI Coding Review
 
-> Distrust-driven code review: **every line must be looked at**. "Review = distrust" turned into a hard gate — read line-by-line + file-level AI analysis + dispose of every finding + cross-file global analysis. Only when all of that is done are you allowed to submit a conclusion.
+> Distrust-driven code review: **every line must be looked at**. "Review = distrust" turned into a hard gate — read line-by-line + repository analysis rooted at each file + dispose of every verified finding + cross-file global analysis. Only when all of that is done are you allowed to submit a conclusion.
 
 [![VS Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/changjian-wang.ai-coding-review?label=Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=changjian-wang.ai-coding-review)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/changjian-wang.ai-coding-review)](https://marketplace.visualstudio.com/items?itemName=changjian-wang.ai-coding-review)
@@ -45,8 +45,10 @@ English | [简体中文](README.zh-CN.md)
 - PR and other diff-backed scopes open in an uncollapsed, full-file inline Diff by default, with
   old/new line numbers and added/deleted rows; switch to the clean head file at any time
 - Per-line coverage tracking and "jump to next unseen line"
-- File-level AI analysis → findings with severity levels
-- Every finding must be disposed: **fixed / commented / ignored (reason required)**
+- **Analyze from this file** recursively follows related definitions, callers, configuration, and tests under explicit depth/file/token/time budgets
+- Every candidate bug receives an independent second model review against the same repository context; only confirmed bugs are shown, while disproved or unverified candidates are reported only in the completion summary
+- Confirmed bugs may land in related files; out-of-scope bug locations are automatically added to the active review and must be reviewed normally
+- Every actionable finding must be disposed: **fixed / commented / ignored (reason required)**
 - Fix proposals: Copilot generates mutually-exclusive "multi-edit = one complete solution" candidates, one-click apply + one-click undo, with applied snapshots persisted
 - **Reviewer context before a fix**: when the model's read of a finding is off, add a supplementary note in the fix panel; it overrides the finding when generating proposals and is persisted per finding
 - Selection translation / code explanation annotations
@@ -66,7 +68,7 @@ English | [简体中文](README.zh-CN.md)
 
 ```text
 gatePassed = all files ready && global analysis confirmed
-file ready  = file-level analysis done && every finding in the file disposed
+file ready  = file-level analysis done && every actionable finding in the file disposed
 ```
 
 Per-line coverage is shown as a live progress signal (per-file / overall `seen/total`) to push "actually read it", displayed alongside the gate verdict.
@@ -92,7 +94,7 @@ AI Coding Review is fully bilingual (English / 简体中文), **English by defau
 | `codereview.openInNewWindow` | Open the review workbench in a separate window |
 | `codereview.startReview` | Pick a scope and start a review |
 | `codereview.openWorkbench` | Open the review workbench |
-| `codereview.analyzeFile` | Analyze the current file |
+| `codereview.analyzeFile` | Analyze repository behavior rooted at the current file |
 | `codereview.globalAnalysis` | Run global analysis |
 | `codereview.showGlobalReport` | Show the global report |
 | `codereview.submitConclusion` | Submit the review conclusion |
@@ -106,6 +108,8 @@ AI Coding Review is fully bilingual (English / 简体中文), **English by defau
 |---------|---------|-------------|
 | `codereview.language` | `en` | Language for the whole experience (UI + LLM output): `en` / `zh-CN` / `auto` |
 | `codereview.focusedWorkbench` | `false` | When opening the workbench, hide the side bar / activity bar so it takes over the main editor area; restored on close |
+| `codereview.repositoryAwareAnalysis` | `auto` | `auto` recursively builds related repository context and self-reviews candidate bugs; `off` keeps legacy single-file behavior |
+| `codereview.repositoryContextTokenBudget` | `28000` | Maximum estimated repository-context input tokens; lower-value related excerpts are removed first |
 
 ## Architecture
 

@@ -1,4 +1,4 @@
-import type { Finding, GlobalReport } from '../ai/types';
+import { isActionableFinding, type Finding, type GlobalReport } from '../ai/types';
 import type { Annotation, FindingDisposition, ReviewConclusion } from '../review/reviewStore';
 import type { Messages } from '../i18n/en';
 
@@ -26,9 +26,17 @@ function sevLabel(t: Messages['report'], s: Finding['severity']): string {
   return s === 'bug' ? t.sevBug : s === 'conditional' ? t.sevConditional : t.sevSuggestion;
 }
 
-function dispLabel(t: Messages['report'], d: FindingDisposition | undefined): string {
+function dispLabel(
+  t: Messages['report'],
+  finding: Finding,
+  d: FindingDisposition | undefined,
+): string {
   if (!d) {
-    return t.dispositionOpen;
+    return finding.verification?.status === 'unresolved'
+      ? t.verificationUnresolved
+      : finding.verification?.status === 'overturned'
+        ? t.verificationOverturned
+      : t.dispositionOpen;
   }
   return d.kind === 'fixed'
     ? t.dispositionFixed
@@ -58,7 +66,8 @@ export function buildReviewReportMarkdown(data: ReportData, t: Messages['report'
   const lines: string[] = [];
   const totalFindings = data.files.reduce((n, f) => n + f.findings.length, 0);
   const unhandled = data.files.reduce(
-    (n, f) => n + f.findings.filter((x) => !f.disposition(x.id)).length,
+    (n, f) =>
+      n + f.findings.filter((x) => isActionableFinding(x) && !f.disposition(x.id)).length,
     0,
   );
 
@@ -90,8 +99,23 @@ export function buildReviewReportMarkdown(data: ReportData, t: Messages['report'
       for (const finding of f.findings) {
         const d = f.disposition(finding.id);
         lines.push(
-          `- **[${sevLabel(t, finding.severity)}] ${finding.title}** — ${t.line(finding.line)} · _${dispLabel(t, d)}_`,
+          `- **[${sevLabel(t, finding.severity)}] ${finding.title}** — ${t.line(finding.line)} · _${dispLabel(t, finding, d)}_`,
         );
+        if (finding.verification) {
+          const verificationLabel = finding.verification.status === 'repo-confirmed'
+            ? t.verificationRepoConfirmed
+            : finding.verification.status === 'overturned'
+              ? t.verificationOverturned
+              : t.verificationUnresolved;
+          lines.push(
+            `  - ${verificationLabel}: ${finding.verification.rationale.replace(/\n+/g, ' ')}`,
+          );
+          for (const evidence of finding.verification.evidence) {
+            lines.push(
+              `    - \`${evidence.file}:${evidence.line}${evidence.endLine && evidence.endLine !== evidence.line ? `-${evidence.endLine}` : ''}\``,
+            );
+          }
+        }
         if (finding.detail) {
           lines.push(`  - ${finding.detail.replace(/\n+/g, ' ')}`);
         }

@@ -9,6 +9,8 @@ export interface ReviewFile {
   /** Deleted lines, when the scope was defined by a diff. */
   deletions?: number;
   status?: 'added' | 'modified' | 'deleted' | 'renamed';
+  /** Added automatically because rooted analysis confirmed a bug in this related file. */
+  context?: boolean;
 }
 
 /** The immutable endpoints used to render a full-file diff. */

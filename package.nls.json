@@ -6,7 +6,7 @@
   "cmd.pickLanguage": "AI Coding Review: Switch Language",
   "cmd.openWorkbench": "AI Coding Review: Open Workbench",
   "cmd.openFile": "AI Coding Review: Open Changed File",
-  "cmd.analyzeFile": "AI Coding Review: Analyze Current File",
+  "cmd.analyzeFile": "AI Coding Review: Analyze from Current File",
   "cmd.globalAnalysis": "AI Coding Review: Run Global Analysis",
   "cmd.showGlobalReport": "AI Coding Review: Show Global Report",
   "cmd.submitConclusion": "AI Coding Review: Submit Conclusion",
@@ -20,6 +20,10 @@
   "config.language.en": "Always use English",
   "config.language.description": "Language for the whole AI Coding Review experience — both the extension UI (status bar, prompts, panels) and all LLM output (findings, fix proposals, explanations, global conclusions). Command titles in the Command Palette follow the VS Code display language.",
   "config.focusedWorkbench.description": "When opening the AI Coding Review workbench, close the side bar and hide the activity bar so the workbench takes over the main editor area; restored automatically when the workbench is closed.",
+  "config.repositoryAwareAnalysis.auto": "Recursively analyze repository behavior rooted at the selected file, then independently self-review every candidate bug.",
+  "config.repositoryAwareAnalysis.off": "Use single-file analysis only; do not run repository evidence verification.",
+  "config.repositoryAwareAnalysis.description": "Controls Analyze from This File. Auto builds bounded related repository context, finds candidate bugs, and makes one additional Copilot model call to self-review candidates when any are found.",
+  "config.repositoryContextTokenBudget.description": "Maximum estimated input tokens for repository context used by Analyze from This File. Lower-value related excerpts are removed first when the budget is exceeded.",
   "config.autoAccount.description": "Automatically use the GitHub CLI account that can access the current repository (matched by its owner) for that repo's GitHub calls, without changing your global active gh account. Turn this off to always use the active gh account.",
   "config.accountByOwner.description": "Optional override mapping a repository owner (organization or user) to a specific GitHub CLI account login, for example `{ \"my-org\": \"work-account\" }`. Takes precedence over automatic detection."
 }

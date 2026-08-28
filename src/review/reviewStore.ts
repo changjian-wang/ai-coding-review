@@ -1,5 +1,5 @@
 import type * as vscode from 'vscode';
-import type { Finding, GlobalReport } from '../ai/types';
+import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
 
 /** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
 export interface Annotation {
@@ -25,6 +25,8 @@ export interface PerFileState {
   analyzed: boolean;
   /** Findings raised by file-level analysis. */
   findings: Finding[];
+  /** Aggregate from the latest repository-aware file analysis. */
+  analysisSummary?: FileAnalysisSummary;
   /** Legacy: finding ids the reviewer marked as "read". Migrated to dispositions on load. */
   confirmedFindings: string[];
   /** How each finding has been disposed of: fixed, commented out to a PR, or ignored with a reason. */
@@ -85,6 +87,10 @@ export interface ReviewSnapshot {
   headSha: string;
   activeFile?: string;
   perFile: Record<string, PerFileState>;
+  /** Related files automatically added by rooted repository analysis. */
+  contextFiles?: string[];
+  /** Related repository files used by each entry-file analysis. */
+  analysisDependencies?: Record<string, string[]>;
   /** Cross-file analysis report, once global analysis has run. */
   globalReport?: GlobalReport;
   globalDone: boolean;
@@ -184,6 +190,8 @@ export interface ReviewStore {
   ): Promise<Map<string, PerFileState>>;
   /** Saves a single file's progress (per-file storage). */
   saveFile?(repo: string, filePath: string, state: PerFileState): Promise<void>;
+  /** Intentionally removes a per-file record; unlike blank-save protection, this is explicit. */
+  clearFile?(repo: string, filePath: string): Promise<void>;
   /**
    * Migration helper: builds a path→PerFileState index from all legacy per-scope
    * snapshots for the repo in a SINGLE pass (most-recently-updated wins). Lets
@@ -264,6 +272,10 @@ export class WorkspaceStateReviewStore implements ReviewStore {
       }
     }
     await this.memento.update(fileStorageKey(repo, filePath), state);
+  }
+
+  async clearFile(repo: string, filePath: string): Promise<void> {
+    await this.memento.update(fileStorageKey(repo, filePath), undefined);
   }
 
   async buildLegacyFileIndex(repo: string): Promise<Map<string, PerFileState>> {

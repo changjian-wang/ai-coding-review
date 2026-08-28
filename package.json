@@ -159,6 +159,26 @@
           "default": false,
           "description": "%config.focusedWorkbench.description%"
         },
+        "codereview.repositoryAwareAnalysis": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off"
+          ],
+          "enumDescriptions": [
+            "%config.repositoryAwareAnalysis.auto%",
+            "%config.repositoryAwareAnalysis.off%"
+          ],
+          "default": "auto",
+          "description": "%config.repositoryAwareAnalysis.description%"
+        },
+        "codereview.repositoryContextTokenBudget": {
+          "type": "number",
+          "default": 28000,
+          "minimum": 8000,
+          "maximum": 64000,
+          "description": "%config.repositoryContextTokenBudget.description%"
+        },
         "codereview.autoAccount": {
           "type": "boolean",
           "default": true,
