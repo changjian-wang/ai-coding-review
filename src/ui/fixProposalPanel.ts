@@ -51,8 +51,13 @@ export interface FixProposalRequest {
   onSplices?: (splices: { startLine: number; oldLineCount: number; newLineCount: number }[]) => void;
   /** Called whenever the file content changes via this panel (apply or undo). */
   onFileChanged?: () => void;
+  /** Brackets extension-owned edits so workspace listeners do not invalidate too early. */
+  onWillChangeFile?: () => void;
+  onFileChangeFinished?: () => void;
   /** Called when the user reverts via the panel's own undo button. */
   onUndone?: () => void;
+  /** Revalidates that the finding is still actionable immediately before writing. */
+  canApply?: () => boolean;
 }
 
 interface ProposalView {
@@ -174,6 +179,13 @@ export class FixProposalPanel {
    */
   static closeIfFile(rel: string): void {
     if (FixProposalPanel.instance?.request.rel === rel) {
+      FixProposalPanel.instance.panel.dispose();
+    }
+  }
+
+  /** Closes only a global-analysis proposal, leaving unrelated file panels alone. */
+  static closeIfGlobal(): void {
+    if (FixProposalPanel.instance?.request.localizationScope.kind === 'global') {
       FixProposalPanel.instance.panel.dispose();
     }
   }
@@ -504,6 +516,11 @@ export class FixProposalPanel {
     if (proposal.applied) {
       return;
     }
+    if (this.request.canApply && !this.request.canApply()) {
+      void vscode.window.showWarningMessage(m().fixPanel.findingNoLongerActionable);
+      this.panel.dispose();
+      return;
+    }
     // These proposals are mutually-exclusive alternatives: at most one may be
     // applied at a time. If another is already applied, refuse and tell the user
     // to undo it first (rather than silently stacking two alternatives).
@@ -664,20 +681,25 @@ export class FixProposalPanel {
       });
       edit.replace(this.request.fileUri, new vscode.Range(start, end), r.replacement);
     }
-    const ok = await vscode.workspace.applyEdit(edit);
-    if (ok) {
-      // Remap coverage BEFORE the downstream reload re-measures totalLines, so the
-      // new lines read as unread and shifted lines keep their state.
-      this.request.onSplices?.(splices);
-      // Auto-save so downstream tools (linters, watchers, the next analysis pass)
-      // see the change immediately. Users can still revert via 「撤销修改」 or VCS.
-      try {
-        await doc.save();
-      } catch {
-        // ignore save failures; leaving the file dirty is the prior behaviour.
+    this.request.onWillChangeFile?.();
+    try {
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (ok) {
+        // Remap coverage BEFORE the downstream reload re-measures totalLines, so the
+        // new lines read as unread and shifted lines keep their state.
+        this.request.onSplices?.(splices);
+        // Auto-save so downstream tools (linters, watchers, the next analysis pass)
+        // see the change immediately. Users can still revert via 「撤销修改」 or VCS.
+        try {
+          await doc.save();
+        } catch {
+          // ignore save failures; leaving the file dirty is the prior behaviour.
+        }
       }
+      return ok;
+    } finally {
+      this.request.onFileChangeFinished?.();
     }
-    return ok;
   }
 
   private async currentFileText(fileUri: vscode.Uri = this.request.fileUri): Promise<string> {

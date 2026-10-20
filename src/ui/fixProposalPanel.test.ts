@@ -193,4 +193,48 @@ describe('FixProposalPanel', () => {
     });
     expect(staleGenerate).not.toHaveBeenCalled();
   });
+
+  it('revalidates actionability immediately before applying a proposal', async () => {
+    FixProposalPanel.init({
+      get: () => ({
+        guarded: {
+          proposals: [{
+            title: 'proposal',
+            rationale: 'rationale',
+            edits: [{ oldText: 'old', newText: 'new' }],
+            applied: false,
+          }],
+          generatedAt: 1,
+        },
+      }),
+      update: async () => undefined,
+    } as unknown as vscode.Memento);
+    vscodeMockState.openTextDocument = async () => ({ getText: () => 'old' });
+    const onApplied = vi.fn();
+
+    FixProposalPanel.show({
+      rel: 'src/example.ts',
+      localizationScope: { kind: 'file', rel: 'src/example.ts' },
+      cacheKey: 'guarded',
+      fileUri: { fsPath: 'src/example.ts' } as vscode.Uri,
+      finding: { id: 'f0', line: 1, title: 'finding', detail: 'detail' },
+      getDisplayFinding: () => ({ title: 'finding', detail: 'detail' }),
+      generate: async () => [],
+      onApplied,
+      canApply: () => false,
+    });
+    await vi.waitFor(() => {
+      expect(vscodeMockState.panel?.webview.messages).toContainEqual(
+        expect.objectContaining({
+          type: 'state',
+          state: expect.objectContaining({ kind: 'ready' }),
+        }),
+      );
+    });
+
+    vscodeMockState.panel?.webview.receiveMessage({ type: 'apply', idx: 0 });
+    await vi.waitFor(() => expect(vscodeMockState.warnings).toHaveLength(1));
+
+    expect(onApplied).not.toHaveBeenCalled();
+  });
 });

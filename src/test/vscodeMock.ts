@@ -50,10 +50,12 @@ export const vscodeMockState: {
   clipboardText: string;
   clipboardReadError?: Error;
   contextKeys: Map<string, unknown>;
+  warnings: string[];
 } = {
   language: 'en',
   clipboardText: '',
   contextKeys: new Map(),
+  warnings: [],
 };
 
 function disposable(): Disposable {
@@ -184,6 +186,7 @@ export function resetVscodeMock(): void {
   vscodeMockState.clipboardText = '';
   vscodeMockState.clipboardReadError = undefined;
   vscodeMockState.contextKeys.clear();
+  vscodeMockState.warnings = [];
   registeredCommands.clear();
 }
 
@@ -205,7 +208,10 @@ export const window = {
   createWebviewPanel: (_viewType: string, title: string) => {
     return createMockWebviewPanel(title);
   },
-  showWarningMessage: async () => undefined,
+  showWarningMessage: async (message: string) => {
+    vscodeMockState.warnings.push(message);
+    return undefined;
+  },
   setStatusBarMessage: () => disposable(),
   createInputBox,
   withProgress: async <T>(
@@ -257,6 +263,19 @@ export const ProgressLocation = { Notification: 15 };
 export class ThemeIcon {
   constructor(readonly id: string) {}
 }
+
+export class Position {
+  constructor(
+    readonly line: number,
+    readonly character: number,
+  ) {}
+}
+
+export const LanguageModelChatMessage = {
+  User: (content: string) => ({ role: 'user', content }),
+};
+
+export class LanguageModelError extends Error {}
 
 export class EventEmitter<T> {
   private readonly listeners = new Set<(value: T) => void>();
