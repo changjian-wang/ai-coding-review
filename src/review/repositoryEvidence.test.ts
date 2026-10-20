@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import * as path from 'node:path';
 import type * as vscode from 'vscode';
 import type { FileFindingCandidate } from '../ai/types';
 import {
@@ -11,34 +12,36 @@ import {
   type RepositoryEvidenceServices,
 } from './repositoryEvidence';
 
+const TEST_ROOT = path.resolve('repository-evidence-fixture');
+
 describe('repository evidence collection', () => {
   it('collects language-service definitions and fallback test evidence', async () => {
     const texts = new Map([
-      ['C:\\repo\\config.py', [
+      [repoFile('config.py'), [
         'class Config:',
         '    def to_public_dict(self):',
         '        return {"default_analyzer": self.default_analyzer}',
       ].join('\n')],
-      ['C:\\repo\\tests\\test_config.py', [
+      [repoFile('tests/test_config.py'), [
         'def test_public_dict_has_default_analyzer():',
         '    assert "default_analyzer" in Config().to_public_dict()',
       ].join('\n')],
     ]);
     const services: RepositoryEvidenceServices = {
       definitions: async () => [{
-        uri: fileUri('C:\\repo\\config.py'),
+        uri: fileUri(repoFile('config.py')),
         startLine: 2,
         endLine: 3,
       }],
       references: async () => [],
       readText: async (uri) => texts.get(uri.fsPath) ?? '',
       listReviewablePaths: async () => ['config.py', 'tests/test_config.py'],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative.replaceAll('/', '\\')}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const bundles = await collectRepositoryEvidence({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'config_cmd.py',
       sourceDocument: sourceDocument(),
       candidates: [candidate()],
@@ -68,12 +71,12 @@ describe('repository evidence collection', () => {
       references: async () => [],
       readText: async () => 'unrelated content',
       listReviewablePaths: async () => ['other.py'],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const bundles = await collectRepositoryEvidence({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'config_cmd.py',
       sourceDocument: sourceDocument(),
       candidates: [candidate()],
@@ -90,13 +93,13 @@ describe('repository evidence collection', () => {
       references: async () => { throw new Error('provider unavailable'); },
       readText: async () => 'def to_public_dict(self):\n    return {"default_analyzer": None}',
       listReviewablePaths: async () => ['config.py'],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     try {
       const bundles = await collectRepositoryEvidence({
-        cwd: 'C:\\repo',
+        cwd: TEST_ROOT,
         sourcePath: 'config_cmd.py',
         sourceDocument: sourceDocument(),
         candidates: [candidate()],
@@ -119,12 +122,12 @@ describe('repository evidence collection', () => {
       references: async () => [],
       readText: async () => '',
       listReviewablePaths: async () => [],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const bundles = await collectRepositoryEvidence({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'config_cmd.py',
       sourceDocument: sourceDocument(),
       candidates: [candidate()],
@@ -143,7 +146,7 @@ describe('repository evidence collection', () => {
       references: async () => [],
       readText: async () => '',
       listReviewablePaths: async () => [],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => {
         const current = clock;
         clock = 4_000;
@@ -152,7 +155,7 @@ describe('repository evidence collection', () => {
     };
 
     const bundles = await collectRepositoryEvidence({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'config_cmd.py',
       sourceDocument: sourceDocument(),
       candidates: [candidate()],
@@ -171,7 +174,7 @@ describe('repository evidence collection', () => {
       references,
       readText: async () => '',
       listReviewablePaths: async () => [],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
     const ambiguous = {
@@ -181,7 +184,7 @@ describe('repository evidence collection', () => {
     };
 
     await collectRepositoryEvidence({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'config_cmd.py',
       sourceDocument: sourceDocument([
         'left = cfg.to_public_dict()',
@@ -214,18 +217,18 @@ describe('repository evidence collection', () => {
 
   it('builds a recursive context graph and enriches it with related tests', async () => {
     const texts = new Map([
-      ['C:\\repo\\root.ts', 'export function root() { return dependency(); }'],
-      ['C:\\repo\\dependency.ts', 'export function dependency() { return leaf(); }'],
-      ['C:\\repo\\leaf.ts', 'export function leaf() { return 42; }'],
-      ['C:\\repo\\root.test.ts', 'it("uses dependency", () => expect(dependency()).toBe(42));'],
+      [repoFile('root.ts'), 'export function root() { return dependency(); }'],
+      [repoFile('dependency.ts'), 'export function dependency() { return leaf(); }'],
+      [repoFile('leaf.ts'), 'export function leaf() { return 42; }'],
+      [repoFile('root.test.ts'), 'it("uses dependency", () => expect(dependency()).toBe(42));'],
     ]);
     const services: RepositoryEvidenceServices = {
       definitions: async (uri) => {
         if (uri.fsPath.endsWith('root.ts')) {
-          return [{ uri: fileUri('C:\\repo\\dependency.ts'), startLine: 1, endLine: 1 }];
+          return [{ uri: fileUri(repoFile('dependency.ts')), startLine: 1, endLine: 1 }];
         }
         if (uri.fsPath.endsWith('dependency.ts')) {
-          return [{ uri: fileUri('C:\\repo\\leaf.ts'), startLine: 1, endLine: 1 }];
+          return [{ uri: fileUri(repoFile('leaf.ts')), startLine: 1, endLine: 1 }];
         }
         return [];
       },
@@ -237,16 +240,16 @@ describe('repository evidence collection', () => {
         'leaf.ts',
         'root.test.ts',
       ],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative.replaceAll('/', '\\')}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const context = await collectRelatedRepositoryContext({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'root.ts',
       sourceDocument: sourceDocument(
-        texts.get('C:\\repo\\root.ts') ?? '',
-        'C:\\repo\\root.ts',
+        texts.get(repoFile('root.ts')) ?? '',
+        repoFile('root.ts'),
       ),
       preferredPaths: ['root.ts'],
       token: { isCancellationRequested: false } as vscode.CancellationToken,
@@ -265,7 +268,7 @@ describe('repository evidence collection', () => {
 
   it('reports the file budget when graph expansion exceeds its cap', async () => {
     const dependencies = Array.from({ length: 30 }, (_, index) => ({
-      uri: fileUri(`C:\\repo\\dep${index}.ts`),
+      uri: fileUri(repoFile(`dep${index}.ts`)),
       startLine: 1,
       endLine: 1,
     }));
@@ -277,16 +280,16 @@ describe('repository evidence collection', () => {
         'root.ts',
         ...dependencies.map((_, index) => `dep${index}.ts`),
       ],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const context = await collectRelatedRepositoryContext({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'root.ts',
       sourceDocument: sourceDocument(
         'export function root() { return dependency(); }',
-        'C:\\repo\\root.ts',
+        repoFile('root.ts'),
       ),
       token: { isCancellationRequested: false } as vscode.CancellationToken,
     }, services);
@@ -299,23 +302,23 @@ describe('repository evidence collection', () => {
   it('keeps provider-resolved repository files when the allowlist scan fails', async () => {
     const services: RepositoryEvidenceServices = {
       definitions: async (uri) => uri.fsPath.endsWith('root.ts')
-        ? [{ uri: fileUri('C:\\repo\\dependency.ts'), startLine: 1, endLine: 1 }]
+        ? [{ uri: fileUri(repoFile('dependency.ts')), startLine: 1, endLine: 1 }]
         : [],
       references: async () => [],
       readText: async (uri) => uri.fsPath.endsWith('dependency.ts')
         ? 'export function dependency() { return 1; }'
         : '',
       listReviewablePaths: async () => { throw new Error('scan unavailable'); },
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
 
     const context = await collectRelatedRepositoryContext({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'root.ts',
       sourceDocument: sourceDocument(
         'export function root() { return dependency(); }',
-        'C:\\repo\\root.ts',
+        repoFile('root.ts'),
       ),
       token: { isCancellationRequested: false } as vscode.CancellationToken,
     }, services);
@@ -326,41 +329,41 @@ describe('repository evidence collection', () => {
 
   it('rejects a repository context when a related file changes before persistence', async () => {
     const texts = new Map([
-      ['C:\\repo\\root.ts', 'export function root() { return dependency(); }'],
-      ['C:\\repo\\dependency.ts', 'export function dependency() { return 1; }'],
+      [repoFile('root.ts'), 'export function root() { return dependency(); }'],
+      [repoFile('dependency.ts'), 'export function dependency() { return 1; }'],
     ]);
     const services: RepositoryEvidenceServices = {
       definitions: async (uri) => uri.fsPath.endsWith('root.ts')
-        ? [{ uri: fileUri('C:\\repo\\dependency.ts'), startLine: 1, endLine: 1 }]
+        ? [{ uri: fileUri(repoFile('dependency.ts')), startLine: 1, endLine: 1 }]
         : [],
       references: async () => [],
       readText: async (uri) => texts.get(uri.fsPath) ?? '',
       listReviewablePaths: async () => ['root.ts', 'dependency.ts'],
-      uriForPath: (cwd, relative) => fileUri(`${cwd}\\${relative}`),
+      uriForPath: (_cwd, relative) => fileUri(repoFile(relative)),
       now: () => 100,
     };
     const token = { isCancellationRequested: false } as vscode.CancellationToken;
     const context = await collectRelatedRepositoryContext({
-      cwd: 'C:\\repo',
+      cwd: TEST_ROOT,
       sourcePath: 'root.ts',
       sourceDocument: sourceDocument(
-        texts.get('C:\\repo\\root.ts') ?? '',
-        'C:\\repo\\root.ts',
+        texts.get(repoFile('root.ts')) ?? '',
+        repoFile('root.ts'),
       ),
       token,
     }, services);
 
     expect(await validateRepositoryAnalysisContext(
       context,
-      'C:\\repo',
+      TEST_ROOT,
       token,
       services,
     )).toBe(true);
 
-    texts.set('C:\\repo\\dependency.ts', 'export function dependency() { return 2; }');
+    texts.set(repoFile('dependency.ts'), 'export function dependency() { return 2; }');
     expect(await validateRepositoryAnalysisContext(
       context,
-      'C:\\repo',
+      TEST_ROOT,
       token,
       services,
     )).toBe(false);
@@ -386,7 +389,7 @@ function candidate(): FileFindingCandidate {
 
 function sourceDocument(
   content = 'public = cfg.to_public_dict()',
-  fsPath = 'C:\\repo\\config_cmd.py',
+  fsPath = repoFile('config_cmd.py'),
 ): vscode.TextDocument {
   const lines = content.split(/\r?\n/);
   return {
@@ -406,4 +409,8 @@ function sourceDocument(
 
 function fileUri(fsPath: string): vscode.Uri {
   return { scheme: 'file', fsPath } as vscode.Uri;
+}
+
+function repoFile(relativePath: string): string {
+  return path.join(TEST_ROOT, ...relativePath.split('/'));
 }
