@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Review vNext 审查中心原型：以源码为主场，结合需求、业务链与证据反证。不连接模型或真实仓库。">
+  <meta name="description" content="Review vNext 审查中心原型：选择 Repository 与 PR/分支、提供需求、确认 AI 理解后审查。不连接模型或真实仓库；本地文本可在浏览器读取，不上传。">
   <title>Review vNext · 审查中心</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23182226'/%3E%3Cpath d='m8 16 5 5 11-12' fill='none' stroke='%2376d6b7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./center.css">
   <script defer src="./app.js"></script>
   <script defer src="./sources.js"></script>
+  <script defer src="./markdown.bundle.js"></script>
   <script defer src="./center.js"></script>
 </head>
 <body>
@@ -20,8 +21,8 @@
       <div class="demo-controls">
         <span class="offline-label">虚构案例 / 未连接模型</span>
         <label><span class="sr-only">选择独立演示场景</span><select id="demo-scenario" aria-label="选择独立演示场景">
+          <option value="fresh" selected>准备 · 选择代码与需求</option>
           <option value="standard">审查中 · 关键问题未闭合</option>
-          <option value="fresh">准备 · 从需求确认开始</option>
           <option value="technical">有限技术审查 · 无需求</option>
           <option value="partial">部分完成 · 证据受限</option>
           <option value="ready">结论 · 已处理的独立示例</option>
@@ -30,7 +31,7 @@
       </div>
     </div>
     <header class="command-bar">
-      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span>checkout-service <i>·</i> 本地工作区示例</span></div></div>
+      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">demo/checkout-service · 演示 Repository</span></div></div>
       <nav id="stage-navigation" class="stage-navigation" aria-label="审查阶段"></nav>
       <div class="command-actions">
         <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
@@ -48,6 +49,6 @@
   </div>
   <dialog id="center-modal" aria-labelledby="center-modal-title"></dialog>
   <div id="center-toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <noscript><div class="noscript">交互原型需要启用 JavaScript。所有脚本、样式与示例均在本地，无外部服务依赖。</div></noscript>
+  <noscript><div class="noscript">交互原型需要启用 JavaScript。脚本、样式与演示均在本地；文件只在浏览器内读取，不调用外部服务。</div></noscript>
 </body>
 </html>
