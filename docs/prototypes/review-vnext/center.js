@@ -3,8 +3,10 @@
 
   const demo = typeof module !== 'undefined' && module.exports ? require('./app.js') : window.ReviewDemoModel;
   const sources = typeof module !== 'undefined' && module.exports ? require('./sources.js') : window.ReviewSourceModel;
+  const feedback = typeof module !== 'undefined' && module.exports ? require('./feedback.js') : window.ReviewFeedbackModel;
   if (!demo) throw new Error('审查中心的示例状态模块未加载');
   if (!sources) throw new Error('需求来源模块未加载');
+  if (!feedback) throw new Error('PR 反馈模块未加载');
 
   const scenarioLabels = {
     standard: '关键问题未闭合', fresh: '从需求确认开始', technical: '无需求的技术审查',
@@ -80,6 +82,63 @@
     return scopeForSelection(state.scopeReview.selection);
   }
 
+  function syncFeedbackContext(state) {
+    const scope = scopeState(state);
+    const pr = scope.pr || (state.center.linkedFeedbackPr ? scope.repository.prs.find((item) => item.id === state.center.linkedFeedbackPr) : null);
+    if (!pr) return feedback.bind(state, null);
+    if (!scope.pr && pr.head !== scope.head.name) throw new Error('关联 PR 的 head 分支与当前审查分支不一致');
+    return feedback.bind(state, {
+      repositoryId: scope.repository.id, repositoryName: scope.repository.name, prId: pr.id,
+      headRef: pr.head, headVersion: branches.find((item) => item.name === pr.head).version,
+      key: JSON.stringify([scope.key, pr.id, state.scopeReview.selection.snapshot]),
+    });
+  }
+
+  function linkFeedbackPr(state, id) {
+    if (state.runStatus === 'running') throw new Error('请先结束或取消模拟审查，再修改 PR 反馈关联');
+    const scope = scopeState(state);
+    if (scope.pr) throw new Error('PR 模式直接读取所选 PR，不需要额外关联');
+    if (id && !scope.repository.prs.some((pr) => pr.id === id && pr.head === scope.head.name)) throw new Error('请选择当前 Repository 且 head 分支匹配的 PR');
+    state.center.linkedFeedbackPr = id || null;
+    state.center.feedbackId = null;
+    syncFeedbackContext(state);
+    invalidate(state);
+    state.history.push(id ? `人工关联演示 PR ${id} 的反馈；不改变代码范围，也不自动纳入需求。` : '人工移除 PR 反馈关联，不猜测其他 PR。');
+  }
+
+  function selectFeedback(state, id) {
+    syncFeedbackContext(state);
+    const item = feedback.get(state, id);
+    Object.assign(state.center, { navigator: 'feedback', feedbackId: id, feedbackReadSource: false, stage: 'review' });
+    if (item.source) state.center.file = item.source;
+    if (item.findingId && state.findings.some((finding) => finding.id === item.findingId)) state.selectedFinding = item.findingId;
+  }
+
+  function importFeedbackRequirement(state, id) {
+    if (state.runStatus === 'running') throw new Error('请先结束或取消模拟审查，再纳入需求建议');
+    syncFeedbackContext(state);
+    if (feedback.session(state)?.syncStatus !== 'ready') throw new Error('反馈未完整同步，请先刷新，再明确纳入需求建议');
+    const item = feedback.get(state, id);
+    if (item.strategy !== 'requirement') throw new Error('这条反馈不是预设的新需求建议');
+    if (item.local.requirementSourceId) {
+      const source = sources.getSource(state, item.local.requirementSourceId);
+      if (source.selected) throw new Error('该建议已经作为材料保留；请在准备页核对或修订，不重复导入');
+      sources.selectSource(state, source.id, true);
+      state.center.stage = 'prepare';
+      item.local.history.push('人工重新选入此前保留的需求材料；沿用原始快照与来源 ID，不重复创建或自动确认。');
+      return source.id;
+    }
+    const current = feedback.session(state);
+    const sourceId = sources.addReviewSource(state, `Reviewer 建议 · ${item.title}`, item.comments[0].body, {
+      repository: current.context.repositoryName, prId: current.context.prId,
+      threadId: item.remoteId, commentId: item.rootCommentId, author: item.comments[0].author,
+    });
+    item.local.requirementSourceId = sourceId;
+    item.local.history.push('人工明确纳入需求材料，原文与出处保留；仍待确认，未修复代码、未回复或 Resolve。');
+    state.center.stage = 'prepare';
+    return sourceId;
+  }
+
   function changeScope(state, patch) {
     if (state.runStatus === 'running') throw new Error('请先结束或取消模拟审查，再修改范围');
     const previous = scopeState(state);
@@ -121,11 +180,13 @@
     state.runStatus = 'idle';
     state.completedStages = 0;
     state.pending = {};
-    Object.assign(state.center, { stage: 'prepare', file: next.files[0], patches: {}, fixSnapshots: {}, stageIndex: 0 });
+    const linkedFeedbackPr = !previous.pr && selection.kind === 'branch' && previous.repository.id === next.repository.id && previous.head.name === next.head.name ? state.center.linkedFeedbackPr : null;
+    Object.assign(state.center, { stage: 'prepare', file: next.files[0], patches: {}, fixSnapshots: {}, stageIndex: 0, feedbackId: null, feedbackReadSource: false, linkedFeedbackPr });
     state.baselineConfirmed = false;
     state.baselineDirty = true;
     sources.organize(state);
     invalidate(state);
+    syncFeedbackContext(state);
     state.history.push(`审查对象改为 ${next.repository.name} / ${next.label}，快照 ${selection.snapshot}。旧发现与示例补丁已移出；保留材料，但需重新确认适用范围。`);
     return true;
   }
@@ -231,7 +292,7 @@
       stage: scenario === 'fresh' ? 'prepare' : scenario === 'ready' ? 'conclusion' : 'review',
       navigator: 'business', search: '', inspector: 'judgment', file: 'restore', codeView: 'diff',
       related: true, focus: false, patches: {}, fixSnapshots: {}, stageIndex: 0,
-      findingMode: state.mode,
+      findingMode: state.mode, patchRevision: 0, feedbackId: null, feedbackReadSource: false, feedbackFilter: 'open', linkedFeedbackPr: null,
     };
     if (scenario === 'ready') {
       state.center.patches['F-01'] = true;
@@ -255,6 +316,8 @@
       state.sources.forEach((source) => { source.selected = false; });
       sources.organize(state);
     }
+    feedback.initialize(state);
+    syncFeedbackContext(state);
     return state;
   }
 
@@ -269,6 +332,8 @@
     state.center.file = primaryFiles[id];
     state.center.stage = 'review';
     state.center.inspector = 'judgment';
+    state.center.feedbackId = null;
+    if (state.center.navigator === 'feedback') state.center.navigator = 'findings';
   }
 
   function switchMode(state, mode) {
@@ -392,6 +457,7 @@
     };
     demo.markFixed(state, id, '人工接受预设修复，修改的只是浏览器内虚构代码；没有执行测试。');
     state.center.patches[id] = true;
+    state.center.patchRevision += 1;
     state.center.file = primaryFiles[id];
     state.history.push(`${id} 仅应用示例补丁，可撤销；未修改真实源码。`);
   }
@@ -406,6 +472,7 @@
     if (requirement && snapshot.check) requirement.check = snapshot.check;
     delete state.center.fixSnapshots[id];
     delete state.center.patches[id];
+    state.center.patchRevision += 1;
     invalidate(state);
     state.history.push(`${id} 已撤销本次示例修复；原问题恢复，旧结论失效。`);
   }
@@ -567,12 +634,14 @@
   }
 
   function summaryText(state, verdict = state.verdict) {
+    syncFeedbackContext(state);
     const gate = approvalGate(state);
     const scope = scopeState(state);
     const understanding = understandingChecks(state.requirements, state.hasResults && !state.stale ? state.findings : []);
     const sourceSummary = (sources.selectedSources(state).map((source) => `- [${sources.kindLabels[source.kind]} / ${sources.purposeLabels[source.purpose]}] ${source.location} · 原文 v${source.version}`).join('\n') || '未提供需求来源。') + (state.sourceReview.excluded.length ? `\n排除记录：\n${state.sourceReview.excluded.map((item) => `- ${item.id}：${item.reason}`).join('\n')}` : '');
     const origins = state.requirements.map((item) => `- ${item.id}${state.baselineConfirmed && state.mode === 'requirements' ? '' : '（非本次已确认需求）'}：${item.origins?.map((origin) => `${sources.labelOrigin(state, origin)} [${sources.originStatus(state, origin)}]`).join('；') || '缺少原文引用'}${item.manualRevision ? '；人工修订与原文分别保存' : ''}`).join('\n');
-    return `Review vNext · 审查中心原型 · ${verdictLabels[verdict]}\n\n代码、业务发现与裁决为预设示例；需求材料可来自示例、粘贴或本地读取，只存页面内存。未连接模型、真实仓库或 GitHub。\nRepository：${scope.repository.name}\n范围：${scope.label}；${scope.files.length} 个审查文件及按需关联核查。\n代码快照：${scope.head.version}${scope.base ? ` / 比较基线 ${scope.base.name} (${scope.base.version})` : ' / 全量快照，不以 Diff 定义范围'}；演示快照 ${state.scopeReview.selection.snapshot}。\n需求：${state.mode === 'technical' ? '有限技术审查，需求一致性未评审；不代表业务需求已满足。' : `基线 v${state.baselineVersion}，${state.baselineConfirmed ? '已人工确认理解' : '待确认'}。确认不等于需求正确或其假设已证实。`}\n执行：${runLabels[state.runStatus]}${state.stale ? '；依据已变化，旧结果待重审。' : '。'}\n\n本次材料：\n${sourceSummary}\n\n需求出处：\n${origins || '无已确认需求。'}\n\n推导检查点（不新增验收门槛）：\n${understanding.checks.map((item) => `- ${item.requirement}：${item.text}`).join('\n') || '无预设推导。'}\n需核实前提（确认不证明成立，当前状态以裁决为准）：\n${understanding.questions.map((item) => `- ${item.requirement} [${item.status === 'clarified' ? '已在预设裁决中澄清' : '待核实'}]：${item.text}`).join('\n') || '未生成预设前提，不代表不存在未知。'}\n\n${gate.reasons.length ? `通过限制：\n${gate.reasons.map((reason) => `- ${reason}`).join('\n')}` : `未发现当前演示规则下的批准阻断；${state.humanConfirmed ? '人工已确认边界。' : '仍需人工确认。'}`}\n\n审查发现：\n${state.hasResults ? state.findings.map((finding) => `- ${finding.id} [${typeLabels[finding.type]} / ${finding.resolved ? '示例已处理或排除' : finding.status === 'unresolved' ? '待核实' : '已确认'}] ${finding.title}`).join('\n') : '尚无有效结果，空列表不代表没有问题。'}\n\n验证边界：没有执行测试、实际复现或修改真实代码；应用预设补丁不等于运行验证通过。${state.sourceReview.limited ? '新增或排除需求尚未语义评审；旧示例发现不能被称为新基线的验证结果。' : ''}\n${state.notes.trim() ? `\n人工补充：\n${state.notes.trim()}` : ''}`;
+    const report = `Review vNext · 审查中心原型 · ${verdictLabels[verdict]}\n\n代码、业务发现与裁决为预设示例；需求材料可来自示例、粘贴或本地读取，只存页面内存。未连接模型、真实仓库或 GitHub。\nRepository：${scope.repository.name}\n范围：${scope.label}；${scope.files.length} 个审查文件及按需关联核查。\n代码快照：${scope.head.version}${scope.base ? ` / 比较基线 ${scope.base.name} (${scope.base.version})` : ' / 全量快照，不以 Diff 定义范围'}；演示快照 ${state.scopeReview.selection.snapshot}。\n需求：${state.mode === 'technical' ? '有限技术审查，需求一致性未评审；不代表业务需求已满足。' : `基线 v${state.baselineVersion}，${state.baselineConfirmed ? '已人工确认理解' : '待确认'}。确认不等于需求正确或其假设已证实。`}\n执行：${runLabels[state.runStatus]}${state.stale ? '；依据已变化，旧结果待重审。' : '。'}\n\n本次材料：\n${sourceSummary}\n\n需求出处：\n${origins || '无已确认需求。'}\n\n推导检查点（不新增验收门槛）：\n${understanding.checks.map((item) => `- ${item.requirement}：${item.text}`).join('\n') || '无预设推导。'}\n需核实前提（确认不证明成立，当前状态以裁决为准）：\n${understanding.questions.map((item) => `- ${item.requirement} [${item.status === 'clarified' ? '已在预设裁决中澄清' : '待核实'}]：${item.text}`).join('\n') || '未生成预设前提，不代表不存在未知。'}\n\n${gate.reasons.length ? `通过限制：\n${gate.reasons.map((reason) => `- ${reason}`).join('\n')}` : `未发现当前演示规则下的批准阻断；${state.humanConfirmed ? '人工已确认边界。' : '仍需人工确认。'}`}\n\n审查发现：\n${state.hasResults ? state.findings.map((finding) => `- ${finding.id} [${typeLabels[finding.type]} / ${finding.resolved ? '示例已处理或排除' : finding.status === 'unresolved' ? '待核实' : '已确认'}] ${finding.title}`).join('\n') : '尚无有效结果，空列表不代表没有问题。'}\n\n验证边界：没有执行测试、实际复现或修改真实代码；应用预设补丁不等于运行验证通过。${state.sourceReview.limited ? '新增或排除需求尚未语义评审；旧示例发现不能被称为新基线的验证结果。' : ''}\n${state.notes.trim() ? `\n人工补充：\n${state.notes.trim()}` : ''}`;
+    return `${report}\n\nPR 反馈与会话状态（演示）：\n${feedback.summary(state)}`;
   }
 
   function statusLabel(finding) {
@@ -583,7 +652,7 @@
   }
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { createCenterState, currentFinding, currentChain, switchMode, selectFinding, completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, approvalGate, confirmBaseline, submitVerdict, statusLabel, preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, repositories, branches, scopeState, changeScope, understandingChecks };
+    module.exports = { createCenterState, currentFinding, currentChain, switchMode, selectFinding, completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, approvalGate, confirmBaseline, submitVerdict, statusLabel, preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, repositories, branches, scopeState, changeScope, understandingChecks, syncFeedbackContext, linkFeedbackPr, selectFeedback, importFeedbackRequirement };
     return;
   }
 
@@ -618,13 +687,13 @@
   const markdown = window.ReviewMarkdown;
   if (!markdown) throw new Error('Markdown 渲染模块未加载，不能提供格式预览');
 
-  function markdownEditor(id, text = '', rows = 6) {
+  function markdownEditor(id, text = '', rows = 6, required = true) {
     return `<div class="markdown-editor" data-markdown-editor>
       <div class="markdown-toolbar"><span>Markdown</span><div class="markdown-controls" role="group" aria-label="内容编辑方式">
         <button class="markdown-mode-button active" type="button" data-action="markdown-edit-mode" data-mode="edit" aria-pressed="true">编辑</button>
         <button class="markdown-mode-button" type="button" data-action="markdown-edit-mode" data-mode="preview" aria-pressed="false">预览</button>
       </div></div>
-      <textarea required id="${id}" class="textarea markdown-input" rows="${rows}" data-markdown-input aria-describedby="${id}-help" placeholder="# 业务目标&#10;&#10;- **必须满足的条件**&#10;- [ ] 尚待核实的前提">\n${escape(text)}</textarea>
+      <textarea ${required ? 'required' : ''} id="${id}" class="textarea markdown-input" rows="${rows}" data-markdown-input aria-describedby="${id}-help" placeholder="# 业务目标&#10;&#10;- **必须满足的条件**&#10;- [ ] 尚待核实的前提">\n${escape(text)}</textarea>
       <div class="markdown-body markdown-preview" data-markdown-preview tabindex="0" aria-label="Markdown 预览" hidden></div>
       <p class="form-hint markdown-help" id="${id}-help">支持标题、粗体、列表、任务清单、代码块、表格、引用和链接。预览不改变原文，HTML 不执行，图片不自动加载。</p>
       </div>`;
@@ -697,6 +766,104 @@
     return state.hasResults ? state.findings : [];
   }
 
+  function currentFeedback() {
+    if (state.center.navigator !== 'feedback') return null;
+    return feedback.session(state)?.items.find((item) => item.id === state.center.feedbackId) || null;
+  }
+
+  function showFeedback(id) {
+    syncFeedbackContext(state);
+    const current = feedback.session(state);
+    if (modal.open) modal.close();
+    if (current) selectFeedback(state, id || current.items.find((item) => item.id === state.center.feedbackId)?.id || current.items.find((item) => !item.isResolved)?.id || current.items[0].id);
+    else Object.assign(state.center, { navigator: 'feedback', feedbackId: null, stage: 'review' });
+    render(false);
+  }
+
+  function feedbackScopeLink() {
+    const current = feedback.session(state);
+    if (!current) return '<button class="text-button feedback-scope-link" data-action="feedback-link">关联 PR 反馈（可选）</button>';
+    const unresolved = current.items.filter((item) => item.kind === 'thread' && !item.isResolved).length;
+    return `<button class="text-button feedback-scope-link" data-action="feedback-open">${current.syncStatus === 'ready' ? `${unresolved} 个待解决会话 · PR 反馈` : '反馈同步失败 · 查看'}</button>${!scopeState(state).pr ? '<button class="text-button feedback-scope-link" data-action="feedback-link">更改关联</button>' : ''}`;
+  }
+
+  function renderFeedbackList() {
+    const current = feedback.session(state);
+    if (!current) return `<div class="feedback-empty"><h3>尚未关联 PR</h3><p>当前分支不会自动猜测对应 PR。显式关联只读取反馈，不改变代码审查范围。</p><button class="button small" data-action="feedback-link">选择关联 PR</button></div>`;
+    const search = state.center.search.toLowerCase();
+    const items = current.items.filter((item) => {
+      const newMessage = item.reviewerRevision > 0 && !feedback.readiness(state, item.id).analyzed;
+      const handled = (item.isResolved || item.local.handled) && !newMessage;
+      return (state.center.feedbackFilter === 'all' || (state.center.feedbackFilter === 'done' ? handled : !handled))
+        && `${item.title} ${item.topic} ${item.comments.map((comment) => `${comment.author} ${comment.body}`).join(' ')}`.toLowerCase().includes(search);
+    });
+    const ready = feedback.readyFixes(state).length;
+    return `<div class="feedback-nav-tools"><p>演示 PR ${escape(current.context.prId)} · ${current.items.length} 项反馈 / ${current.items.reduce((count, item) => count + item.comments.length, 0)} 条公开消息</p>
+      <label class="sr-only" for="feedback-filter">反馈筛选</label><select id="feedback-filter" class="text-field">${[['open', '需处理 / 新回复'], ['all', '全部反馈'], ['done', '已处理 / 已解决']].map(([value, label]) => `<option value="${value}" ${state.center.feedbackFilter === value ? 'selected' : ''}>${label}</option>`).join('')}</select>
+      <div><button class="text-button" data-action="feedback-refresh">刷新演示快照</button><button class="text-button" data-action="feedback-assess-all">批量分析（演示）</button></div>
+      ${ready ? `<button class="button small" data-action="feedback-batch">批量预览已验证修复（${ready}）</button>` : ''}
+      ${current.syncStatus !== 'ready' ? '<p class="input-error" role="alert">同步失败，旧记录仍保留，不能据此发布或解决。</p>' : '<p class="form-hint">完整预设快照 · 未读取真实 GitHub</p>'}</div>
+      ${[...new Set(items.map((item) => item.topic))].map((topic) => `<div class="nav-group-title">${escape(topic)}</div>${items.filter((item) => item.topic === topic).map((item) => `<button class="feedback-card ${state.center.feedbackId === item.id ? 'active' : ''}" data-action="feedback-select" data-id="${item.id}" aria-pressed="${state.center.feedbackId === item.id}"><span class="feedback-card-meta">${item.id} · ${feedback.kindLabels[item.kind]}${item.isOutdated ? ' · Outdated' : ''}</span><strong>${escape(item.title)}</strong><small>${escape(feedback.status(state, item))}</small><span>${badge(item.kind === 'thread' ? item.isResolved ? 'Resolved' : '未解决' : '无 Resolve', item.isResolved ? 'blue' : '')}${item.reviewerRevision > 0 && !feedback.readiness(state, item.id).analyzed ? badge('有新回复', 'amber') : ''}</span></button>`).join('')}`).join('') || '<p class="small-copy">没有匹配项；不代表其他筛选或未同步部分没有反馈。</p>'}
+      <div class="mini-principle">Review 总体状态：${escape(current.reviewState)}。解决会话不等于 Reviewer 批准，也不自动撤销 Request changes。</div>`;
+  }
+
+  function feedbackComment(comment) {
+    return `<article class="feedback-comment"><div><strong>${escape(comment.author)}</strong>${badge(comment.isToolReply ? '本工具回复 · 模拟已发布' : '原始讨论', comment.isToolReply ? 'blue' : '')}${comment.quotedCommentId ? badge('引用回复 · 非 thread') : ''}${comment.edits?.length ? badge(`已编辑 ${comment.edits.length} 次`) : ''}</div><div class="markdown-body">${markdown.render(comment.body)}</div></article>`;
+  }
+
+  function renderFeedbackOverview() {
+    const item = currentFeedback();
+    const current = feedback.session(state);
+    return `<div class="editor-tabs"><div class="editor-tab active">${icon('message')}PR 反馈<span class="tab-kind">原文与上下文</span></div></div><div class="editor-scroll feedback-overview">
+      <h1>${item ? escape(item.title) : '选择 PR 反馈'}</h1><p class="small-copy">${current ? `${escape(current.context.repositoryName)} · 演示 PR ${escape(current.context.prId)} · ${escape(current.context.headRef)}` : '尚未关联 PR，不自动猜测或读取。'}</p>
+      ${item ? `<div class="inline-notice blue">${icon('info')}<div><strong>${feedback.kindLabels[item.kind]} · 不伪造代码行或 Resolve</strong><p>发布时引用原评论；本地已回复不改变整份 Review 状态。</p></div></div>${feedbackComment(item.comments[0])}<button class="button small" data-action="source" data-source="${scopeState(state).files[0]}">阅读当前范围示例代码</button>` : '<p class="small-copy">分支模式需要明确关联 Repository 与 head 分支匹配的 PR。准备阶段仍然只有三块。</p><button class="button" data-action="feedback-link">关联 PR</button>'}
+      <p class="form-hint">所有讨论、账号、ID 与发布结果均为虚构；原型不读取或写入真实 GitHub。</p></div>`;
+  }
+
+  function publicationLabel(operation) {
+    const labels = { published: '回复已模拟发布，尚未 Resolve', resolved: '已模拟发布并 Resolve', 'reply-failed': '回复发布失败，未 Resolve', 'resolve-failed': '回复已发布，但 Resolve 失败', pending: '回复仍在未发布的 Review 草稿中', unknown: '发布结果未知，禁止重复发送', 'not-published': '回读明确未发布，可重新预览' };
+    return labels[operation.status] || '发布状态需要核对';
+  }
+
+  function renderFeedbackInspector() {
+    const item = currentFeedback();
+    if (!item) return `<div class="inspector-heading">PR 反馈</div><div class="inspector-scroll"><div class="empty-state">${icon('message')}<h2>先明确关联 PR</h2><p>不会把当前分支自动绑定到某个 PR。</p><button class="button" data-action="feedback-link">选择关联 PR</button></div></div>`;
+    const current = feedback.session(state);
+    const ready = feedback.readiness(state, item.id);
+    const patch = !!state.center.patches[item.findingId];
+    const operation = item.local.operation;
+    const uncertain = ['pending', 'unknown'].includes(operation?.status);
+    const importedSource = item.local.requirementSourceId ? sources.getSource(state, item.local.requirementSourceId) : null;
+    let primary;
+    if (current.syncStatus !== 'ready') primary = '<button class="button primary small" data-action="feedback-refresh">重新同步（演示）</button>';
+    else if (uncertain) primary = `<button class="button primary small" data-action="feedback-check" data-id="${item.id}">核对发布状态（演示）</button>`;
+    else if (item.isResolved) primary = `<button class="button small" data-action="feedback-reopen" data-id="${item.id}" ${item.canUnresolve ? '' : 'disabled'}>明确重新打开（演示）</button>`;
+    else if (!ready.analyzed) primary = `<button class="button primary small" data-action="feedback-assess" data-id="${item.id}">分析这条反馈（演示）</button>`;
+    else if (ready.canRetryResolve) primary = `<button class="button primary small" data-action="feedback-resolve" data-id="${item.id}">${operation?.status === 'resolve-failed' ? '仅重试 Resolve' : '解决会话'}（演示）</button>`;
+    else if (item.strategy === 'fix' && !patch) primary = `<button class="button primary small" data-action="fix-preview" data-id="${item.findingId}" ${state.findings.some((finding) => finding.id === item.findingId) ? '' : 'disabled'}>查看示例修复</button>`;
+    else if (item.strategy === 'fix' && !ready.verified) primary = `<button class="button primary small" data-action="feedback-verify" data-id="${item.id}">模拟验证</button>`;
+    else if (item.strategy === 'fix' && !ready.delivered) primary = `<button class="button primary small" data-action="feedback-deliver" data-id="${item.id}">模拟提交并推送</button>`;
+    else primary = `<button class="button primary small" data-action="feedback-preview" data-id="${item.id}">${feedback.ownReply(state, item) ? '更新本工具回复' : '预览回复'}</button>`;
+    const showSecondary = ready.canGenerate && (ready.canRetryResolve || item.strategy === 'fix' && !ready.proofReady);
+    const files = sourceFiles(state);
+    return `<div class="inspector-heading"><span>Reviewer 反馈处置</span>${badge('模拟 · 未连接 GitHub', 'blue')}</div>
+      <div class="inspector-scroll" id="feedback-inspector">
+      <div class="feedback-states">${badge(feedback.kindLabels[item.kind])}${badge(item.kind === 'thread' ? item.isResolved ? 'Resolved' : '未解决' : '无 Resolve 状态', item.isResolved ? 'blue' : '')}${item.isOutdated ? badge('Outdated ≠ Resolved', 'amber') : ''}</div>
+      <h2 class="inspector-title">${escape(item.title)}</h2><p class="form-hint">${escape(current.context.repositoryName)} / 演示 PR ${escape(current.context.prId)}<br>${item.source ? `${escape(files[item.source].path)} · 原评论 L${item.line}${item.isOutdated ? '（已过时，未自动重定位）' : '（演示锚点）'}` : 'PR 总体讨论，不绑定代码行'}</p>
+      <section class="feedback-section"><h3>完整讨论 · ${item.comments.length} 条</h3>${item.comments.map(feedbackComment).join('')}</section>
+      ${uncertain ? `<div class="feedback-notice amber" role="status"><strong>${publicationLabel(operation)}</strong><p>${operation.status === 'pending' ? '不擅自提交、替换或丢弃用户已有的 Pending Review；在外部明确发布后再同步。' : '先核对远端是否已发布，不能因超时就再次发送。'}当前没有 Resolve。</p></div>` : operation ? `<div class="feedback-notice ${operation.status.includes('failed') ? 'error' : 'blue'}" role="status"><strong>上次发布：${publicationLabel(operation)}</strong><p>当前会话状态以上方标记为准。Reply 与 Resolve 分步记录；Review 仍为 ${escape(current.reviewState)}。</p></div>` : ''}
+      ${item.local.analysis ? `<section class="feedback-section"><h3>${feedback.decisions[item.local.analysis.decision]}${ready.analyzed ? ' · 预设分析' : ' · 已过期'}</h3><p class="small-copy">${escape(item.local.analysis.message)}</p><div class="feedback-related">${item.related.filter((key) => files[key]).map((key) => `<button class="text-button" data-action="source" data-source="${key}">${icon('link')}${escape(files[key].name)}</button>`).join('')}</div></section>` : '<p class="small-copy">先放到相关业务链中核实，不因 Reviewer 提出就直接接受或改代码。</p>'}
+      ${item.strategy === 'fix' ? `<section class="feedback-section"><h3>修改、验证、交付分别记录</h3><ul class="feedback-checks"><li>${patch ? '浏览器示例补丁已应用' : '浏览器示例补丁未应用'}</li><li>${ready.verified ? '当前修改模拟验证通过 · 未运行测试/CI' : item.local.verification?.passed === false ? '上次模拟验证失败，不能宣称修复已完成' : '当前修改尚无有效模拟验证'}</li><li>${ready.delivered ? `${escape(item.local.delivery.commit)} → ${escape(item.local.delivery.headRef)}（仅演示）` : item.local.delivery?.success === false ? '上次模拟推送失败，不能将本地补丁当作已交付' : '尚未模拟推送到 PR head 分支'}</li></ul><p class="form-hint">同根因的 ${current.items.filter((entry) => entry.findingId === item.findingId && entry.strategy === 'fix').length} 个会话可复用一次修复与验证，但分别 Reply / Resolve。</p></section>` : ''}
+      ${item.strategy === 'fix' && ready.analyzed && !patch && !state.findings.some((finding) => finding.id === item.findingId) ? '<p class="form-hint">当前代码范围没有对应的预设修复；可先说明进度，不能套用其他快照的补丁。</p>' : ''}
+      ${item.strategy === 'requirement' ? `<section class="feedback-section"><h3>需求建议，不是已确认标准</h3><p class="small-copy">原评论只作为反馈保留。人工明确纳入后仍需回准备页确认，不能直接声称需求正确或已解决。</p><button class="button small" data-action="feedback-requirement" data-id="${item.id}" ${importedSource?.selected || current.syncStatus !== 'ready' ? 'disabled' : ''}>${importedSource ? importedSource.selected ? '已纳入材料，仍待核对' : '重新选入原需求材料' : '作为需求补充（待确认）'}</button></section>` : ''}
+      ${ready.resolveReasons.length && !item.isResolved ? `<p class="form-hint">${escape(ready.resolveReasons[0])}</p>` : ''}
+      <details class="feedback-identifiers"><summary>原始 ID 与目标</summary><p>会话 / 反馈：${escape(item.remoteId)}<br>原评论：${escape(item.rootCommentId)}<br>发布账号：${escape(state.feedback.viewer)}（演示）</p></details>
+      <details class="feedback-history"><summary>完整处置记录 · ${item.local.history.length}</summary><ol>${item.local.history.map((entry) => `<li>${escape(entry)}</li>`).join('') || '<li>尚无处置记录。</li>'}</ol></details>
+      <details class="feedback-demo-tools"><summary>演示异常与新消息</summary><div><button class="button small" data-action="feedback-new-comment" data-id="${item.id}">模拟 Reviewer 新回复</button>${item.kind === 'thread' ? `<button class="button small" data-action="feedback-permission" data-id="${item.id}">模拟${item.canResolve ? '失去' : '恢复'} Resolve 权限</button>` : ''}<button class="button small" data-action="feedback-sync-fail">模拟同步失败</button></div></details>
+      <p class="verification-caption">代码、验证、推送、发布与 Resolve 全部为页面内模拟；不会访问 GitHub 或修改真实文件。普通评论与总体 Review 不伪装成可 Resolve 会话。</p></div>
+      <div class="inspector-actions"><div class="inspector-action-row">${primary}${showSecondary ? `<button class="button small" data-action="feedback-preview" data-id="${item.id}" data-intent="${item.strategy === 'fix' && !ready.proofReady ? 'progress' : 'final'}">${feedback.ownReply(state, item) ? '更新本工具回复' : item.strategy === 'fix' && !ready.proofReady ? '先回复进度' : '回复预览'}</button>` : ''}${state.center.fixSnapshots[item.findingId] ? `<button class="button small" data-action="undo-fix" data-id="${item.findingId}">撤销示例修复</button>` : ''}</div><p>发布前预览确认；已回复不等于已解决，也不等于 Reviewer 批准。</p></div>`;
+  }
+
   function issueNav(finding) {
     const [, tone] = statusLabel(finding);
     return `<button class="issue-nav ${finding.id === state.selectedFinding ? 'active' : ''}" data-action="finding" data-id="${finding.id}" aria-pressed="${finding.id === state.selectedFinding}"><span class="issue-dot ${tone}"></span><span><strong>${escape(finding.title)}</strong><small>${finding.id} · ${typeLabels[finding.type]}${finding.resolved ? ' · 已处理/排除' : finding.critical ? ' · 关键' : ''}</small></span></button>`;
@@ -708,7 +875,9 @@
     const findings = getFindings().filter((finding) => `${finding.title} ${finding.source} ${finding.id}`.toLowerCase().includes(search));
     const sources = sourceFiles(state);
     let content;
-    if (state.center.navigator === 'files') {
+    if (state.center.navigator === 'feedback') {
+      content = renderFeedbackList();
+    } else if (state.center.navigator === 'files') {
       content = `<div class="nav-group-title">审查对象与关联证据</div>${Object.values(sources).filter((file) => `${file.path} ${file.name}`.toLowerCase().includes(search)).map((file) => `<button class="file-nav ${state.center.file === file.key ? 'active' : ''}" data-action="source" data-source="${file.key}">${icon('file')}<span>${escape(file.name)}</span><small class="file-change">${['submit', 'restore', 'callback'].includes(file.key) ? 'M' : '·'}</small></button>`).join('')}<div class="mini-principle">文件是核实证据的入口，不是业务判断的边界。</div>`;
     } else if (state.center.navigator === 'findings') {
       content = `<div class="nav-group-title">待判断与确认缺陷 <span>${findings.filter((finding) => finding.type !== 'reasonable').length}</span></div>${findings.filter((finding) => finding.type !== 'reasonable').map(issueNav).join('') || '<div class="small-copy">没有匹配的有效结果。</div>'}<div class="nav-group-title" style="margin-top:18px">已排除的局部疑点</div>${findings.filter((finding) => finding.type === 'reasonable').map(issueNav).join('')}`;
@@ -722,7 +891,7 @@
         return `<button class="chain-card ${activeChain.id === chain.id ? 'active' : ''}" data-action="finding" data-id="${defaultFinding}" aria-pressed="${activeChain.id === chain.id}"><div class="chain-card-top">${icon('flow')}<span>${chain.title}</span>${badge(state.hasResults ? `${unresolved || members.length}` : '—', unresolved ? 'amber' : members.length && members.every((finding) => finding.status === 'dismissed') ? 'green' : '')}</div><p>${chain.description}</p></button>${activeChain.id === chain.id && state.hasResults ? `<div class="chain-members">${members.map(issueNav).join('')}</div>` : ''}`;
       }).join('')}<div class="mini-principle"><strong>精准，不等于只报小问题。</strong><br>同一份业务依据，同时支持缺陷发现和局部误报的推翻。</div>`;
     }
-    return `<div class="navigator-heading"><span>审查导航</span><span class="muted">工作区</span></div><div class="nav-segments" role="tablist" aria-label="导航方式">${[['business', '业务', 'flow'], ['findings', '发现', 'bug'], ['files', '文件', 'file']].map(([id, label, symbol]) => `<button class="nav-segment ${state.center.navigator === id ? 'active' : ''}" role="tab" aria-selected="${state.center.navigator === id}" data-action="navigator" data-tab="${id}">${icon(symbol)}${label}</button>`).join('')}</div><div class="navigator-search">${icon('search')}<input id="center-search" type="search" placeholder="搜索业务、问题或文件" aria-label="搜索导航内容" value="${escape(state.center.search)}"></div><div class="navigator-scroll ${state.center.navigator === 'business' ? 'business-nav' : ''}">${content}</div><div class="navigator-footer"><button class="baseline-link" data-action="stage" data-stage="prepare">${icon('file')}<div><strong>${state.mode === 'technical' ? '有限技术审查' : `需求基线 v${state.baselineVersion}`}</strong><small>${state.mode === 'technical' ? '需求一致性未评审' : `${state.requirements.length} 条需求 · ${state.baselineConfirmed ? '已确认' : '待人工确认'}`}</small></div>${icon('chevron')}</button><button class="scope-link" data-action="scope"><span>${scopeState(state).files.length} 个审查文件 · ${state.scopeReview.selection.kind === 'pr' ? 'PR' : '分支'}</span><span>查看范围</span></button></div>`;
+    return `<div class="navigator-heading"><span>审查导航</span><span class="muted">工作区</span></div><div class="nav-segments" role="tablist" aria-label="导航方式">${[['business', '业务', 'flow'], ['findings', '发现', 'bug'], ['feedback', 'PR反馈', 'message'], ['files', '文件', 'file']].map(([id, label, symbol]) => `<button class="nav-segment ${state.center.navigator === id ? 'active' : ''}" role="tab" aria-selected="${state.center.navigator === id}" data-action="navigator" data-tab="${id}">${icon(symbol)}${label}</button>`).join('')}</div><div class="navigator-search">${icon('search')}<input id="center-search" type="search" placeholder="搜索业务、问题、反馈或文件" aria-label="搜索导航内容" value="${escape(state.center.search)}"></div><div class="navigator-scroll ${state.center.navigator === 'business' ? 'business-nav' : state.center.navigator === 'feedback' ? 'feedback-nav' : ''}">${content}</div><div class="navigator-footer"><button class="baseline-link" data-action="stage" data-stage="prepare">${icon('file')}<div><strong>${state.mode === 'technical' ? '有限技术审查' : `需求基线 v${state.baselineVersion}`}</strong><small>${state.mode === 'technical' ? '需求一致性未评审' : `${state.requirements.length} 条需求 · ${state.baselineConfirmed ? '已确认' : '待人工确认'}`}</small></div>${icon('chevron')}</button><button class="scope-link" data-action="scope"><span>${scopeState(state).files.length} 个审查文件 · ${state.scopeReview.selection.kind === 'pr' ? 'PR' : '分支'}</span><span>查看范围</span></button></div>`;
   }
 
   function renderTop() {
@@ -769,8 +938,9 @@
 
   function editorTabs(files) {
     const chain = currentChain(state);
-    const primary = primaryFiles[state.selectedFinding];
-    const keys = [...new Set(currentFinding(state) ? [primary, ...chain.files, state.center.file] : [...scopeState(state).files, state.center.file])].filter((key) => files[key]);
+    const item = currentFeedback();
+    const primary = item ? item.source : primaryFiles[state.selectedFinding];
+    const keys = [...new Set(item ? [primary, ...item.related, state.center.file] : currentFinding(state) ? [primary, ...chain.files, state.center.file] : [...scopeState(state).files, state.center.file])].filter((key) => files[key]);
     return `<div class="editor-tabs" role="tablist" aria-label="当前业务链关联文件">${keys.map((key) => `<button class="editor-tab ${state.center.file === key ? 'active' : ''}" role="tab" aria-selected="${state.center.file === key}" data-action="source" data-source="${key}">${icon(files[key].kind === 'code' ? 'code' : 'file')}${escape(files[key].name)}<span class="tab-kind">${key === primary ? '问题位置' : files[key].kind === 'document' ? '依据' : '关联'}</span></button>`).join('')}</div>`;
   }
 
@@ -805,20 +975,24 @@
   }
 
   function renderEditor() {
+    const item = currentFeedback();
+    if (state.center.navigator === 'feedback' && (!item || !item.source && !state.center.feedbackReadSource)) return renderFeedbackOverview();
     const files = sourceFiles(state);
     const file = files[state.center.file];
     if (!file) throw new Error('找不到当前示例文件');
-    const finding = currentFinding(state);
+    const finding = item ? null : currentFinding(state);
     const source = state.center.codeView === 'source';
     let body;
     if (file.kind === 'document') {
-      body = `<article class="document-copy"><p class="doc-kicker">${escape(file.sourceInfo || '需求 / 契约证据')} · ${file.userProvided ? '用户提供的原文快照 · 仅存页面内存' : '虚构原文 · 非实际仓库文件'}</p><h2>${escape(file.title)}</h2>${typeof file.markdownText === 'string' ? markdownReader(file.markdownText) : file.paragraphs.map(([line, text]) => `<div class="doc-paragraph ${line === file.highlight ? 'highlighted' : ''}"><span class="mono">L${line}</span><p>${escape(text)}</p></div>`).join('')}<div class="inline-notice blue">${icon('info')}<div><strong>阅读原文不会改写需求，也不代表已完成核查</strong><p>${finding ? `右侧仍保留 ${finding.id} 的判断上下文。` : '当前范围尚无有效的审查发现。'}条目可能经过人工修订，不能把其表述当作这里的原文。</p></div></div></article>`;
+      body = `<article class="document-copy"><p class="doc-kicker">${escape(file.sourceInfo || '需求 / 契约证据')} · ${file.userProvided ? '用户提供的原文快照 · 仅存页面内存' : '虚构原文 · 非实际仓库文件'}</p><h2>${escape(file.title)}</h2>${typeof file.markdownText === 'string' ? markdownReader(file.markdownText) : file.paragraphs.map(([line, text]) => `<div class="doc-paragraph ${line === file.highlight ? 'highlighted' : ''}"><span class="mono">L${line}</span><p>${escape(text)}</p></div>`).join('')}<div class="inline-notice blue">${icon('info')}<div><strong>阅读原文不会改写需求，也不代表已完成核查</strong><p>${item ? `右侧仍保留 ${item.id} 的反馈上下文。` : finding ? `右侧仍保留 ${finding.id} 的判断上下文。` : '当前范围尚无有效的审查发现。'}条目可能经过人工修订，不能把其表述当作这里的原文。</p></div></div></article>`;
     } else {
       const primary = !!finding && primaryFiles[state.selectedFinding] === file.key;
-      const lines = file.lines.map((line, index) => `<div class="code-line ${source ? 'source-view' : ''} ${!source && line.change ? line.change : ''} ${line.highlighted ? 'emphasized' : ''}" id="sample-line-${line.number}">${source ? '' : `<span class="line-no">${line.change ? '' : line.number}</span>`}<span class="line-no">${line.number}</span><span class="change">${source ? '' : line.change === 'added' ? '+' : line.change === 'removed' ? '−' : ''}</span><code>${syntax(line.text) || ' '}</code></div>${primary && index === Math.min(file.lines.length - 1, file.lines.findIndex((item) => item.highlighted) + 2) ? inlineFinding(finding) : ''}`).join('');
-      body = `<div class="code-caption"><span>旧 / 新行号 · ${source ? '当前源码' : '行内 Diff（预设差异）'}</span><strong>上下文片段 ${file.start}–${file.lines.at(-1).number} · 非完整文件</strong></div><div class="code-table">${lines}</div>${relatedContext(files)}`;
+      const lines = file.lines.map((line, index) => `<div class="code-line ${source ? 'source-view' : ''} ${!source && line.change ? line.change : ''} ${(item ? item.source === file.key && !item.isOutdated && line.number === item.line : line.highlighted) ? 'emphasized' : ''}" id="sample-line-${line.number}">${source ? '' : `<span class="line-no">${line.change ? '' : line.number}</span>`}<span class="line-no">${line.number}</span><span class="change">${source ? '' : line.change === 'added' ? '+' : line.change === 'removed' ? '−' : ''}</span><code>${syntax(line.text) || ' '}</code></div>${primary && index === Math.min(file.lines.length - 1, file.lines.findIndex((item) => item.highlighted) + 2) ? inlineFinding(finding) : ''}`).join('');
+      body = `<div class="code-caption"><span>旧 / 新行号 · ${source ? '当前源码' : '行内 Diff（预设差异）'}</span><strong>上下文片段 ${file.start}–${file.lines.at(-1).number} · 非完整文件</strong></div><div class="code-table">${lines}</div>${item ? '' : relatedContext(files)}`;
     }
-    return `<h1 class="sr-only">源码与证据审查</h1>${editorTabs(files)}<div class="editor-tools"><div class="editor-breadcrumb">${escape(scopeState(state).repository.name)} <span class="muted">/</span> <strong>${escape(file.path)}</strong></div><div class="editor-view-controls">${file.kind === 'code' ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge('需求 / 契约原文', 'blue')}<button class="icon-button focus-button" data-action="focus" aria-label="${state.center.focus ? '恢复业务导航' : '收起导航，专注代码'}" title="收起/恢复导航">${icon('focus')}</button></div></div>${progressStrip()}${finding ? journey() : '<div class="progress-strip">范围与阅读交互预览 · 无本次有效发现，片段不代表这个版本的完整源码。</div>'}<div class="editor-scroll">${body}</div><div class="editor-bottom"><span>${state.center.patches[state.selectedFinding] ? '示例补丁已应用 · 未执行验证' : '只读示例 · 不接触真实仓库'}</span>${finding ? `<button class="text-button" data-action="related">${state.center.related ? '收起' : '展开'}关联上下文</button><button class="text-button" data-action="recheck">${icon('refresh')}重审关联范围</button><button class="text-button" data-action="next">${icon('arrow')}下一问题 <span class="mono">F8</span></button>` : '<button class="text-button" data-action="stage" data-stage="prepare">返回准备阶段</button>'}</div>`;
+    const context = item ? `<div class="feedback-location"><strong>${item.id} · ${escape(item.title)}</strong><span>${!item.source ? '此反馈没有代码行锚点，阅读代码不改变回复目标。' : item.isOutdated ? '原位置 Outdated；当前代码只作对照，未自动重定位。' : `原评论 L${item.line} · 演示锚点，不是模型推断位置。`}</span>${item.originalDiff ? `<button class="text-button" data-action="feedback-original" data-id="${item.id}">查看评论时的 Diff</button>` : ''}</div>` : finding ? journey() : '<div class="progress-strip">范围与阅读交互预览 · 无本次有效发现，片段不代表这个版本的完整源码。</div>';
+    const footer = item ? `<span>右侧保留 ${item.id} · Reply 目标不会因阅读关联文件而改变</span><button class="text-button" data-action="feedback-select" data-id="${item.id}">回到评论位置</button><button class="text-button" data-action="next">下一反馈 · F8</button>` : `<span>${state.center.patches[state.selectedFinding] ? '示例补丁已应用 · 未执行验证' : '只读示例 · 不接触真实仓库'}</span>${finding ? `<button class="text-button" data-action="related">${state.center.related ? '收起' : '展开'}关联上下文</button><button class="text-button" data-action="recheck">${icon('refresh')}重审关联范围</button><button class="text-button" data-action="next">${icon('arrow')}下一问题 <span class="mono">F8</span></button>` : '<button class="text-button" data-action="stage" data-stage="prepare">返回准备阶段</button>'}`;
+    return `<h1 class="sr-only">源码与证据审查</h1>${editorTabs(files)}<div class="editor-tools"><div class="editor-breadcrumb">${escape(scopeState(state).repository.name)} <span class="muted">/</span> <strong>${escape(file.path)}</strong></div><div class="editor-view-controls">${file.kind === 'code' ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge('需求 / 契约原文', 'blue')}<button class="icon-button focus-button" data-action="focus" aria-label="${state.center.focus ? '恢复业务导航' : '收起导航，专注代码'}" title="收起/恢复导航">${icon('focus')}</button></div></div>${progressStrip()}${context}<div class="editor-scroll">${body}</div><div class="editor-bottom">${footer}</div>`;
   }
 
   function requirementMarkup(requirement) {
@@ -863,7 +1037,7 @@
       ${selection.kind === 'pr'
         ? `<label class="scope-field scope-wide" for="scope-pr"><span>PR</span><select id="scope-pr" class="text-field" ${disabled}>${scope.repository.prs.map((pr) => `<option value="${pr.id}" ${selection.pr === pr.id ? 'selected' : ''}>PR ${pr.id} · ${pr.title}</option>`).join('')}</select></label>`
         : `<label class="scope-field" for="scope-branch"><span>被审查分支</span><select id="scope-branch" class="text-field" ${disabled}>${branchOptions(selection.branch)}</select></label><label class="scope-field" for="scope-mode"><span>分支范围</span><select id="scope-mode" class="text-field" ${disabled}><option value="changes" ${selection.mode === 'changes' ? 'selected' : ''}>分支变更（默认）</option><option value="full" ${selection.mode === 'full' ? 'selected' : ''}>分支全量代码</option></select></label>${selection.mode === 'changes' ? `<label class="scope-field scope-wide" for="scope-base"><span>比较基线</span><select id="scope-base" class="text-field" ${disabled}>${branchOptions(selection.base, selection.branch)}</select></label>` : ''}`}
-      </div><p class="scope-caption">${icon('branch')}<span>${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 全量快照，不以 Diff 定义范围'}<strong>${scope.files.length} 个审查文件 · 整文件及相关业务链核查</strong></span></p>
+      </div><p class="scope-caption">${icon('branch')}<span>${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 全量快照，不以 Diff 定义范围'}<strong>${scope.files.length} 个审查文件 · 整文件及相关业务链核查</strong>${feedbackScopeLink()}</span></p>
       <p class="form-hint">${scope.pr ? '文件来自 PR 演示变更列表；描述不自动成为需求。' : scope.mode === 'full' ? '所选分支的全量演示清单，不实际扫描仓库。' : '文件来自分支相对基线的演示差异，不限于新增行。'} ${!scope.supportsFindings ? '此范围暂无预设分析结果。' : '未连接真实仓库。'}</p>
       ${state.scopeReview.discardedResults || state.scopeReview.reincluded ? `<p class="form-hint scope-changed">范围已变更：旧发现与补丁不再沿用，需求需重新核对适用范围。${state.scopeReview.reincluded ? `旧范围 ${state.scopeReview.reincluded} 项不适用记录已归档并重新纳入，不静默跳过。` : ''}</p>` : ''}`;
   }
@@ -1006,6 +1180,7 @@
         <section class="summary-box"><h2>已排除的局部疑点</h2>${dismissed.map((finding) => `<button class="summary-row" data-action="finding" data-id="${finding.id}">${badge('合理取舍', 'green')}<span><strong>${escape(finding.title)}</strong><p>${escape(finding.summary)}</p></span></button>`).join('')}</section>
         <section class="summary-box"><div class="section-heading"><h2>来源与范围边界</h2><button class="text-button" data-action="scope">查看范围</button></div><p class="small-copy">${escape(scope.repository.name)} · ${escape(scope.label)}<br>${scope.files.length} 个审查文件，相关业务链按需核查；代码快照 ${escape(scope.head.version)} / 演示快照 ${state.scopeReview.selection.snapshot}。<br>${state.mode === 'technical' ? '需求一致性未评审，不代表业务需求已满足。' : `需求基线 v${state.baselineVersion}，${state.baselineConfirmed ? '人工已确认理解' : '仍待确认'}。确认不等于需求或其假设已证实。`}<br>${boundary}</p><div class="conclusion-sources">${sources.selectedSources(state).map((source) => `<button class="text-button origin-button" data-action="material" data-source-id="${source.id}">${icon('link')}${escape(source.name)} · ${sources.purposeLabels[source.purpose]} · v${source.version}</button>`).join('') || '<p class="form-hint">没有选入需求材料。</p>'}</div></section>
       </div>
+      <section class="prepare-section summary-box"><div class="section-heading"><h2>PR 反馈与会话状态（演示）</h2><button class="text-button" data-action="feedback-open">查看反馈</button></div><pre class="summary-text">${escape(feedback.summary(state))}</pre><p class="form-hint">既有反馈的 Reply / Resolve 与提交新的 Review 是不同操作。是否允许合并由 GitHub 仓库规则决定；本地不伪造 Review 批准。</p></section>
       <section class="prepare-section"><label class="field-label" for="center-notes">人工补充</label><textarea class="textarea" id="center-notes" placeholder="补充业务判断、风险或需要协调的事项…">${escape(state.notes)}</textarea><p class="form-hint">仅保存在本次页面内存；切换独立场景或刷新会清除。</p></section>
       <section class="prepare-section"><div class="prepare-section-title"><h2>对外摘要预览</h2><button class="text-button" data-action="summary">${icon('download')}查看 / 复制 / 下载</button></div><pre class="summary-text" id="center-summary">${escape(summaryText(state))}</pre></section>
       </div>`;
@@ -1018,6 +1193,7 @@
   }
 
   function render(preserve = true) {
+    syncFeedbackContext(state);
     const focused = document.activeElement;
     const focusId = focused?.id;
     const selection = focused instanceof HTMLInputElement && focused.type === 'search' ? [focused.selectionStart, focused.selectionEnd] : null;
@@ -1025,7 +1201,7 @@
     renderTop();
     navigator.innerHTML = state.center.stage === 'prepare' ? '' : renderNavigator();
     main.innerHTML = state.center.stage === 'prepare' ? renderPrepare() : state.center.stage === 'conclusion' ? renderConclusion() : renderEditor();
-    inspector.innerHTML = state.center.stage === 'prepare' ? '' : state.center.stage === 'conclusion' ? renderConclusionInspector() : renderFindingInspector();
+    inspector.innerHTML = state.center.stage === 'prepare' ? '' : state.center.stage === 'conclusion' ? renderConclusionInspector() : state.center.navigator === 'feedback' ? renderFeedbackInspector() : renderFindingInspector();
     for (const [selector, top] of Object.entries(positions)) {
       const element = document.querySelector(selector);
       if (element) element.scrollTop = top;
@@ -1049,12 +1225,19 @@
     if (!sourceFiles(state)[key]) throw new Error('示例证据位置不存在');
     state.center.file = key;
     state.center.stage = 'review';
+    if (currentFeedback()) state.center.feedbackReadSource = true;
     render();
     const scroll = main.querySelector('.editor-scroll');
     if (scroll) scroll.scrollTop = 0;
   }
 
   function nextFinding() {
+    if (state.center.navigator === 'feedback') {
+      const items = feedback.session(state)?.items;
+      if (!items?.length) return notify('请先明确关联 PR。', true);
+      const index = items.findIndex((item) => item.id === state.center.feedbackId);
+      return showFeedback(items[(index + 1) % items.length].id);
+    }
     const findings = getFindings();
     if (!findings.length) return notify('请先完成模拟审查。', true);
     const index = findings.findIndex((finding) => finding.id === state.selectedFinding);
@@ -1113,6 +1296,156 @@
 
   function linkInput() {
     openModal('读取需求链接', `<form id="requirement-link-form"><div class="modal-body"><label class="field-label" for="requirement-link">需求页面链接</label><input class="text-field" id="requirement-link" type="url" required placeholder="https://…"><p class="form-hint">正式产品需在授权范围内读取并保留原文快照。此离线原型不联网：只提供演示链接的固定快照，其他链接明确报错，不假装读取成功。</p><button class="button small material-example" type="button" data-action="preset-link">填入演示链接</button><p class="form-hint">${escape(sources.exampleLink)}</p><p id="requirement-link-error" class="input-error" role="alert" hidden></p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="requirement-link-form" type="submit">读取并加入（演示）</button>');
+  }
+
+  function feedbackLinkDialog() {
+    const scope = scopeState(state);
+    if (scope.pr) return showFeedback();
+    const choices = scope.repository.prs.filter((pr) => pr.head === scope.head.name);
+    openModal('明确关联 PR 反馈 · 不改变审查范围', `<form id="feedback-link-form"><div class="modal-body"><p>${escape(scope.repository.name)} / ${escape(scope.head.name)}</p><label class="field-label" for="feedback-linked-pr">只列出相同 Repository 与 head 分支的演示 PR</label><select class="text-field" id="feedback-linked-pr"><option value="">不关联 PR</option>${choices.map((pr) => `<option value="${pr.id}" ${state.center.linkedFeedbackPr === pr.id ? 'selected' : ''}>PR ${pr.id} · ${escape(pr.title)}</option>`).join('')}</select><p class="form-hint">${choices.length ? '关联仅用于读取和回复反馈，不改变本次代码范围，也不把评论自动纳入需求。' : '当前分支没有匹配的演示 PR，不会猜测其他 PR。'}</p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="feedback-link-form" type="submit">确认关联</button>');
+  }
+
+  function feedbackPreview(id, intent = 'final') {
+    const item = feedback.get(state, id);
+    const draft = feedback.makeDraft(state, id, intent);
+    const ready = feedback.readiness(state, id);
+    const current = feedback.session(state);
+    const previous = feedback.ownReply(state, item);
+    openModal('回复预览 · 不发送到真实 GitHub', `<form id="feedback-reply-form"><div class="modal-body">
+      <input name="feedback-id" type="hidden" value="${id}"><input name="feedback-draft-id" type="hidden" value="${draft.id}">
+      <p><strong>${escape(current.context.repositoryName)} / 演示 PR ${escape(current.context.prId)}</strong><br>${escape(item.title)}</p>
+      <details class="feedback-identifiers"><summary>核对原会话与评论 ID</summary><p>${escape(item.remoteId)}<br>${escape(item.rootCommentId)}</p></details>
+      <label class="field-label" for="feedback-reply-mode">发布方式</label><select class="text-field" id="feedback-reply-mode">${previous ? '<option value="update" selected>更新本工具自己已发布的回复</option>' : ''}<option value="append">追加${item.kind === 'thread' ? '原会话回复' : '引用原评论的新回复'}</option></select>
+      ${previous ? `<details class="feedback-history"><summary>此前本工具已发布的回复 · 只读对照</summary><div class="markdown-body">${markdown.render(previous.body)}</div></details>` : ''}
+      <label class="field-label" for="feedback-reply-text">回复内容 · 请核对修改、提交与验证边界</label>${markdownEditor('feedback-reply-text', draft.body, 7)}
+      <label class="feedback-resolve-option"><input type="checkbox" id="feedback-resolve" ${ready.canResolve ? '' : 'disabled'}><span>回复发布后，同时解决此会话（模拟）</span></label>
+      <p class="form-hint">${ready.canResolve ? '先确认回复已发布，再 Resolve 并回读状态；不是一个原子事务。' : escape(ready.resolveReasons.join('；'))}</p>
+      <label class="field-label" for="feedback-publish-outcome">发布分支（演示，用于检查异常恢复）</label><select class="text-field" id="feedback-publish-outcome">${Object.entries(feedback.outcomes).filter(([key]) => key !== 'resolve-failed' || ready.canResolve).map(([value, text]) => `<option value="${value}">${text}</option>`).join('')}</select>
+      <p class="form-hint">Pending Review 草稿不会自动提交、丢弃或替换。超时先核对结果；只更新本工具自己的回复，不改 Reviewer 原文。</p><p id="feedback-form-error" class="input-error" role="alert" hidden></p>
+      </div></form>`, '<button class="button" data-action="close">保留草稿 / 返回</button><button class="button primary" form="feedback-reply-form" type="submit">确认模拟发布</button>');
+  }
+
+  function feedbackStepDialog(step, id) {
+    const item = feedback.get(state, id);
+    const current = feedback.session(state);
+    const verify = step === 'verify';
+    openModal(verify ? '验证分支 · 未执行真实测试' : '提交与推送分支 · 不执行 Git 命令', `<form id="feedback-step-form"><div class="modal-body"><input name="feedback-id" type="hidden" value="${id}"><input name="feedback-remote-id" type="hidden" value="${item.remoteId}"><input name="feedback-context" type="hidden" value="${escape(current.context.key)}"><input name="feedback-step" type="hidden" value="${step}">
+      <p>${escape(item.title)}</p><p class="form-hint">${verify ? '演示正常恢复、取消后恢复及并发预留的验证记录；不能把模型推演当成测试通过。' : `目标为 ${escape(current.context.repositoryName)} / PR ${escape(current.context.prId)} 的 head 分支 ${escape(current.context.headRef)}，不是 main 或比较基线。演示修复快照不是实际 Git 提交。`}</p>
+      <label class="field-label" for="feedback-step-result">${verify ? '模拟验证结果' : '模拟提交 / 推送结果'}</label><select class="text-field" id="feedback-step-result"><option value="success">${verify ? '验证通过（模拟）' : '推送成功（模拟）'}</option><option value="failed">${verify ? '验证失败（模拟）' : '推送失败（模拟）'}</option></select><p id="feedback-form-error" class="input-error" role="alert" hidden></p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="feedback-step-form" type="submit">记录演示结果</button>');
+  }
+
+  function feedbackCheckDialog(id) {
+    const item = feedback.get(state, id);
+    openModal('核对发布状态 · 不盲目重试', `<form id="feedback-check-form"><div class="modal-body"><input name="feedback-id" type="hidden" value="${id}"><input name="feedback-remote-id" type="hidden" value="${item.remoteId}"><p>${escape(item.title)}</p><p class="small-copy">这里模拟外部发布后的回读，不会提交或丢弃用户已有的 Review 草稿，也不自动 Resolve。</p><label class="field-label" for="feedback-observed">模拟远端回读结果</label><select class="text-field" id="feedback-observed"><option value="pending">仍是草稿 / 尚未确认</option><option value="published">确认这条回复已经发布</option><option value="not-published">明确未发布，允许重新预览</option></select><p id="feedback-form-error" class="input-error" role="alert" hidden></p></div></form>`, '<button class="button" data-action="close">返回</button><button class="button primary" form="feedback-check-form" type="submit">核对演示状态</button>');
+  }
+
+  function feedbackBatchDialog() {
+    const items = feedback.readyFixes(state);
+    if (!items.length) throw new Error('没有已经核对、验证并模拟推送的待发布修复会话');
+    const current = feedback.session(state);
+    openModal('批量回复预览 · 每个会话分别记录结果', `<form id="feedback-batch-form"><div class="modal-body"><p>${escape(current.context.repositoryName)} / 演示 PR ${escape(current.context.prId)}</p><p class="form-hint">同一根因可复用修复、验证和提交，但不会把多个原会话混成一条。只处理明确选中的会话，部分失败不冒充全部成功。</p>
+      ${items.map((item) => {
+        const draft = feedback.makeDraft(state, item.id);
+        return `<article class="feedback-batch-entry" data-id="${item.id}" data-draft-id="${draft.id}"><label><input type="checkbox" name="feedback-batch-select" value="${item.id}" checked> ${item.id} · ${escape(item.title)}</label><p class="form-hint">${escape(item.remoteId)}<br>${escape(item.rootCommentId)}</p><label class="field-label" for="feedback-batch-body-${item.id}">回复预览</label>${markdownEditor(`feedback-batch-body-${item.id}`, draft.body, 5, false)}<label class="feedback-resolve-option"><input type="checkbox" name="feedback-batch-resolve" value="${item.id}" ${feedback.readiness(state, item.id).canResolve ? '' : 'disabled'}> 回复发布后 Resolve（模拟，默认不勾选）</label><label class="field-label" for="feedback-batch-outcome-${item.id}">该会话的演示分支</label><select class="text-field" id="feedback-batch-outcome-${item.id}">${Object.entries(feedback.outcomes).map(([value, text]) => `<option value="${value}">${text}</option>`).join('')}</select></article>`;
+      }).join('')}<p id="feedback-form-error" class="input-error" role="alert" hidden></p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="feedback-batch-form" type="submit">确认模拟发布所选会话</button>');
+  }
+
+  function handleFeedbackAction(action, target) {
+    if (!action.startsWith('feedback-')) return false;
+    try {
+      syncFeedbackContext(state);
+      const id = target.dataset.id;
+      if (action === 'feedback-open' || action === 'feedback-select') { showFeedback(id); return true; }
+      if (action === 'feedback-original') {
+        const item = feedback.get(state, id);
+        if (!item.originalDiff) throw new Error('没有该会话的原始 Diff 快照，不能用当前代码冒充');
+        openModal('评论时的原始 Diff · 非当前代码', `<div class="modal-body"><p>${escape(item.title)}</p><pre class="summary-text">${escape(item.originalDiff)}</pre><p class="form-hint">Outdated 与 Resolve 分别记录；不会猜测当前行号。</p></div>`);
+        return true;
+      }
+      if (state.runStatus === 'running') throw new Error('请先结束或取消模拟审查，再修改反馈处置');
+      if (action === 'feedback-link') { feedbackLinkDialog(); return true; }
+      if (action === 'feedback-preview') { feedbackPreview(id, target.dataset.intent || 'final'); return true; }
+      if (action === 'feedback-batch') { feedbackBatchDialog(); return true; }
+      if (action === 'feedback-verify' || action === 'feedback-deliver') { feedbackStepDialog(action === 'feedback-verify' ? 'verify' : 'deliver', id); return true; }
+      if (action === 'feedback-check') { feedbackCheckDialog(id); return true; }
+      if (action === 'feedback-refresh') feedback.refresh(state, true);
+      else if (action === 'feedback-assess-all') feedback.assessAll(state);
+      else if (action === 'feedback-assess') feedback.assess(state, id);
+      else if (action === 'feedback-resolve') feedback.retryResolve(state, id);
+      else if (action === 'feedback-reopen') feedback.reopen(state, id);
+      else if (action === 'feedback-requirement') importFeedbackRequirement(state, id);
+      else if (action === 'feedback-new-comment') feedback.receiveComment(state, id);
+      else if (action === 'feedback-permission') feedback.setResolvePermission(state, id, !feedback.get(state, id).canResolve);
+      else if (action === 'feedback-sync-fail') feedback.refresh(state, false);
+      else throw new Error('未知的 PR 反馈操作');
+      render();
+      notify(action === 'feedback-resolve' ? '仅模拟 Resolve 并回读，没有重复回复，也没有改变 Review 总体意见。' : action === 'feedback-requirement' ? '建议原文已作为材料保留，仍需确认理解；没有改代码、回复或 Resolve。' : '演示反馈状态已更新，未调用 AI 或写入 GitHub。');
+    } catch (error) {
+      render();
+      notify(error.message, true);
+    }
+    return true;
+  }
+
+  function submitFeedbackForm(form) {
+    const targetId = form.elements.namedItem('feedback-id')?.value;
+    const previousOperation = feedback.session(state)?.items.find((item) => item.id === targetId)?.local.operation;
+    try {
+      syncFeedbackContext(state);
+      const id = form.elements.namedItem('feedback-id')?.value;
+      if (form.id === 'feedback-link-form') {
+        linkFeedbackPr(state, document.getElementById('feedback-linked-pr').value);
+      } else if (form.id === 'feedback-reply-form') {
+        const expectedDraftId = form.elements.namedItem('feedback-draft-id').value;
+        if (feedback.get(state, id).local.draft?.id !== expectedDraftId) throw new Error('回复预览或目标已变化，请重新核对原会话');
+        feedback.editDraft(state, id, document.getElementById('feedback-reply-text').value, document.getElementById('feedback-reply-mode').value);
+        feedback.publish(state, id, {
+          expectedDraftId, confirmed: true, resolve: document.getElementById('feedback-resolve').checked,
+          outcome: document.getElementById('feedback-publish-outcome').value,
+        });
+      } else if (form.id === 'feedback-step-form' || form.id === 'feedback-check-form') {
+        if (feedback.get(state, id).remoteId !== form.elements.namedItem('feedback-remote-id').value) throw new Error('PR 或会话目标已变化，请重新预览');
+        if (form.id === 'feedback-check-form') feedback.checkPublication(state, id, document.getElementById('feedback-observed').value);
+        else {
+          if (feedback.session(state).context.key !== form.elements.namedItem('feedback-context').value) throw new Error('代码范围已变化，不能沿用之前的演示验证或推送操作');
+          const result = document.getElementById('feedback-step-result').value;
+          const step = form.elements.namedItem('feedback-step').value;
+          if (!['success', 'failed'].includes(result) || !['verify', 'deliver'].includes(step)) throw new Error('未知的验证或交付演示分支，未记录成功');
+          const success = result === 'success';
+          if (step === 'verify') feedback.recordVerification(state, id, success);
+          else feedback.recordDelivery(state, id, success);
+        }
+      } else if (form.id === 'feedback-batch-form') {
+        const entries = [...form.querySelectorAll('input[name="feedback-batch-select"]:checked')].map((input) => {
+          const row = input.closest('[data-draft-id]');
+          const item = feedback.get(state, input.value);
+          if (item.local.draft?.id !== row.dataset.draftId) throw new Error('批量预览的目标或草稿已变化，未发布');
+          const body = document.getElementById(`feedback-batch-body-${item.id}`).value;
+          if (!body.trim()) throw new Error(`${item.id} 回复内容不能为空`);
+          return {
+            id: item.id, expectedDraftId: row.dataset.draftId, confirmed: true, body,
+            resolve: form.querySelector(`input[name="feedback-batch-resolve"][value="${item.id}"]`).checked,
+            outcome: document.getElementById(`feedback-batch-outcome-${item.id}`).value,
+          };
+        });
+        entries.forEach((entry) => feedback.editDraft(state, entry.id, entry.body, feedback.get(state, entry.id).local.draft.mode));
+        const results = feedback.publishBatch(state, entries);
+        render();
+        openModal('逐会话发布结果 · 不合并成笼统成功', `<div class="modal-body">${results.map((result) => `<article class="feedback-batch-result ${result.status === 'failed' ? 'error' : ''}"><strong>${result.id} · ${result.status === 'failed' ? '需要恢复' : escape(publicationLabel({ status: result.status }))}</strong><p class="small-copy">${escape(result.message || '状态仅记录在当前页面，没有写入 GitHub。')}</p><button class="text-button" data-action="feedback-select" data-id="${result.id}">查看会话与下一步</button></article>`).join('')}</div>`);
+        return;
+      } else throw new Error('未知的反馈表单');
+      modal.close();
+      render();
+      notify('演示结果已逐步记录；请核对 Reply 与 Resolve 的独立状态。没有对外发送或执行真实测试/Git。');
+    } catch (error) {
+      const id = form.elements.namedItem('feedback-id')?.value;
+      const operation = feedback.session(state)?.items.find((item) => item.id === id)?.local.operation;
+      if (operation !== previousOperation && operation?.status === 'resolve-failed') modal.close();
+      render();
+      const message = document.getElementById('feedback-form-error');
+      if (message) { message.textContent = error.message; message.hidden = false; }
+      notify(error.message, true);
+    }
   }
 
   async function readLocalFile(file) {
@@ -1175,6 +1508,8 @@
     }
     const generation = ++runGeneration;
     state.runStatus = 'running';
+    state.center.navigator = 'business';
+    state.center.feedbackId = null;
     state.center.stageIndex = 0;
     state.center.stage = 'review';
     invalidate(state);
@@ -1210,6 +1545,7 @@
     const target = event.target instanceof Element ? event.target.closest('[data-action]') : null;
     if (!target || target.disabled) return;
     const action = target.dataset.action;
+    if (handleFeedbackAction(action, target)) return;
     if (action === 'markdown-edit-mode') return setMarkdownEditorMode(target.closest('[data-markdown-editor]'), target.dataset.mode);
     if (action === 'markdown-read-mode') return setMarkdownReaderMode(target.closest('[data-markdown-reader]'), target.dataset.mode);
     if (action === 'close') return modal.close();
@@ -1219,7 +1555,7 @@
     if (action === 'reset') { runGeneration += 1; state = createCenterState(state.scenario); if (modal.open) modal.close(); render(false); return notify('已重置到独立演示快照，未改变真实工作区。'); }
     if (action === 'finding') { selectFinding(state, target.dataset.id); return render(false); }
     if (action === 'source') return openSource(target.dataset.source);
-    if (action === 'navigator') { state.center.navigator = target.dataset.tab; return render(); }
+    if (action === 'navigator') { if (target.dataset.tab === 'feedback') return showFeedback(); state.center.navigator = target.dataset.tab; return render(); }
     if (action === 'inspector-tab') { state.center.inspector = target.dataset.tab; render(); return; }
     if (action === 'code-view') { state.center.codeView = target.dataset.view; return render(); }
     if (action === 'related') { state.center.related = !state.center.related; return render(); }
@@ -1312,6 +1648,7 @@
     const form = event.target;
     if (!form.reportValidity()) return;
     if (state.runStatus === 'running') return notify('请先结束或取消模拟审查。', true);
+    if (form.id.startsWith('feedback-')) return submitFeedbackForm(form);
     if (form.id === 'center-requirement-form') {
       const text = document.getElementById('center-requirement-text').value;
       const title = document.getElementById('center-requirement-title').value.trim();
@@ -1402,6 +1739,7 @@
   }, true);
 
   document.addEventListener('change', (event) => {
+    if (event.target.id === 'feedback-filter') { state.center.feedbackFilter = event.target.value; render(); return; }
     if (event.target.id === 'demo-scenario') {
       runGeneration += 1;
       if (modal.open) modal.close();

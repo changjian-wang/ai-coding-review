@@ -2,7 +2,7 @@
   'use strict';
 
   const clone = (value) => JSON.parse(JSON.stringify(value));
-  const kindLabels = { local: '本地需求文档', pr: 'PR Description', issue: '关联需求 Issue', design: '设计与决策记录', manual: '人工输入', link: '需求链接 · 演示快照' };
+  const kindLabels = { local: '本地需求文档', pr: 'PR Description', issue: '关联需求 Issue', design: '设计与决策记录', manual: '人工输入', link: '需求链接 · 演示快照', review: 'Reviewer 建议 · 人工纳入' };
   const purposeLabels = { auto: '按内容识别要求与背景', requirement: '人工明确的要求', context: '事实与背景材料' };
   const exampleLink = 'https://requirements.example/checkout/review';
 
@@ -184,6 +184,14 @@
     return addInputSource(state, name, text, purpose, 'manual', `人工输入 / ${typeof name === 'string' ? name.trim() : ''}`);
   }
 
+  function addReviewSource(state, name, text, origin) {
+    if (!origin || ['repository', 'prId', 'threadId', 'commentId', 'author'].some((key) => typeof origin[key] !== 'string' || !origin[key].trim())) throw new Error('Reviewer 建议缺少可追溯的 PR、会话或评论出处');
+    const location = `${origin.repository} / 演示 PR ${origin.prId} / ${origin.threadId} / ${origin.commentId}`;
+    const id = addInputSource(state, name, text, 'requirement', 'review', location);
+    getSource(state, id).feedbackOrigin = clone(origin);
+    return id;
+  }
+
   function validateFileName(name) {
     if (typeof name !== 'string' || !/\.(md|markdown|txt)$/i.test(name)) throw new Error('原型仅支持 UTF-8 的 .md、.markdown 或 .txt 文件；PDF、Word 等格式尚未接入');
   }
@@ -229,7 +237,8 @@
         const candidate = previous
           ? { id: template.id, kind: template.kind, originKind: source.kind === 'manual' ? '人工输入' : '示例整理', ...clone(previous), check: 'unknown', origins: [], include: true, exclusionReason: '' }
           : { id: template.id, title: template.title, text: template.text, kind: template.kind, check: 'unknown', origins: [], originKind: source.kind === 'manual' ? '人工输入' : '示例整理', include: true, exclusionReason: '' };
-        candidate.basis = candidate.manualRevision || source.purpose === 'requirement' && source.kind === 'manual' ? 'human' : 'explicit';
+        candidate.basis = candidate.manualRevision || source.purpose === 'requirement' && ['manual', 'review'].includes(source.kind) ? 'human' : 'explicit';
+        if (source.kind === 'review') candidate.originKind = 'Reviewer 建议 · 人工纳入，待确认';
         if (source.demoRecognized) candidate.originKind = '预设映射 · 非真实 AI 分析';
         const origin = originFor(source, template.line, template.text);
         const same = candidates.find((item) => item.text === candidate.text);
@@ -356,7 +365,7 @@
 
   const api = {
     kindLabels, purposeLabels, initialize, getSource, snapshot, labelOrigin, originStatus,
-    selectSource, setPurpose, updateSource, addManualSource, addFileSource, validateFileName, addLinkSource, exampleMaterial, exampleLink, needsAnalysis, organize, updateCandidate, reviseCandidate, confirm,
+    selectSource, setPurpose, updateSource, addManualSource, addReviewSource, addFileSource, validateFileName, addLinkSource, exampleMaterial, exampleLink, needsAnalysis, organize, updateCandidate, reviseCandidate, confirm,
     draftConflicts, sourceGate, selectedSources, confirmationState,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
