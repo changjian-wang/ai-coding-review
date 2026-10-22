@@ -12,6 +12,7 @@ import { renderDocument } from '../ui/documentRenderer';
 import { addRequirementMaterial, createRequirementsDraft, currentMaterial } from '../review/requirements';
 import { readRequirementFile } from '../review/requirementSources';
 import { analyzeRequirementUnderstanding } from '../ai/analyzer';
+import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -38,6 +39,8 @@ export async function run(): Promise<void> {
     await git('-c', 'user.name=Host Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'main');
     await git('switch', '-c', 'feature');
     await writeFile(path.join(root, 'src', 'value.ts'), 'export const value = "feature";\n');
+    await writeFile(path.join(root, 'src', 'cancel.ts'), 'export async function cancel(order) {\n  await inventory.release(order.id);\n}\n');
+    await writeFile(path.join(root, 'src', 'restore.ts'), 'export async function restore(order) {\n  await order.restore();\n  return { payable: true };\n}\n');
     await git('add', '.');
     await git('-c', 'user.name=Host Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'feature');
     await git('switch', 'main');
@@ -128,6 +131,7 @@ export async function run(): Promise<void> {
     }, actions);
     assert.ok((await within(seen, 30_000, 'real document rendering and visible-line acknowledgement')).includes(1));
     checks.push('real document webview load and seen acknowledgement');
+    checks.push(...await runBusinessReviewHostChecks(root, set));
     assert.equal(await git('branch', '--show-current'), 'main');
     assert.equal(await git('stash', 'list'), '');
     assert.equal(await readFile(path.join(root, 'src', 'value.ts'), 'utf8'), 'local unsaved work\n');

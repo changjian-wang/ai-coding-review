@@ -24,6 +24,8 @@ import type {
 } from './types';
 import { getOutputLanguage, languageDirective, type OutputLanguage } from './lang';
 import { m } from '../i18n';
+import { businessReviewPrompt } from './businessReviewPrompts';
+import { BUSINESS_REVIEW_LIMITS, type BusinessModelPhase } from '../review/businessReview';
 import {
   currentMaterial, parseRequirementUnderstanding, requirementSourceKey, selectedMaterials, REQUIREMENT_LIMITS,
   type RequirementsDraft, type RequirementUnderstanding,
@@ -33,7 +35,7 @@ import {
 export class AnalysisError extends Error {}
 
 /** The kind of LLM operation, used to bucket token usage by purpose. */
-type LlmOp = 'analyze' | 'verify' | 'global' | 'fix' | 'diff' | 'translate' | 'explain' | 'requirements';
+type LlmOp = 'analyze' | 'verify' | 'global' | 'fix' | 'diff' | 'translate' | 'explain' | 'requirements' | 'business';
 
 /** A single LLM call's estimated token usage. Estimated locally via `countTokens`. */
 export interface TokenUsage {
@@ -271,7 +273,8 @@ async function ask(
       options.op === 'analyze'
       || options.op === 'verify'
       || options.op === 'global'
-      || options.op === 'requirements';
+      || options.op === 'requirements'
+      || options.op === 'business';
     const requestOptions: vscode.LanguageModelChatRequestOptions = reproducible
       ? { modelOptions: { temperature: 0 } }
       : {};
@@ -303,6 +306,31 @@ async function ask(
     else void report();
   }
   return out;
+}
+
+export async function businessReviewInputFits(
+  model: vscode.LanguageModelChat, phase: BusinessModelPhase, payload: unknown, token: vscode.CancellationToken,
+): Promise<boolean> {
+  if (token.isCancellationRequested) return false;
+  const user = JSON.stringify(payload);
+  if (user.length > BUSINESS_REVIEW_LIMITS.inputCharacters) return false;
+  const count = await model.countTokens(`${languageDirective()}\n\n${businessReviewPrompt(phase)}\n\n${user}`, token);
+  if (!Number.isFinite(count) || count < 0 || !Number.isFinite(model.maxInputTokens) || model.maxInputTokens <= 512) throw new AnalysisError(m().businessReview.inputLimit);
+  return !token.isCancellationRequested && count <= model.maxInputTokens - 512;
+}
+
+export async function analyzeBusinessReviewPhase(
+  model: vscode.LanguageModelChat, phase: BusinessModelPhase, payload: unknown,
+  token: vscode.CancellationToken, usage: (record: TokenUsage) => void,
+): Promise<unknown> {
+  if (token.isCancellationRequested) throw new vscode.CancellationError();
+  if (!await businessReviewInputFits(model, phase, payload, token)) {
+    if (token.isCancellationRequested) throw new vscode.CancellationError();
+    throw new AnalysisError(m().businessReview.inputLimit);
+  }
+  const raw = await ask(model, businessReviewPrompt(phase), JSON.stringify(payload), token, { op: 'business', onUsage: usage });
+  if (token.isCancellationRequested) throw new vscode.CancellationError();
+  return parseJson<unknown>(raw);
 }
 
 const REQUIREMENTS_PROMPT = `Organize review requirements from explicitly provided materials, not from code.

@@ -50,6 +50,7 @@ export interface WorkbenchState {
   gatePassed: boolean;
   feedbackAllowed?: boolean;
   requirementStatus?: string;
+  businessReview?: { running: boolean; hasReport: boolean; progress: string; blockers: string[] };
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
@@ -92,6 +93,9 @@ export interface WorkbenchActions {
   globalAnalysis(): void;
   cancelGlobalAnalysis(): void;
   showGlobal(): void;
+  businessReview(): void;
+  cancelBusinessReview(): void;
+  showBusinessReview(): void;
   /** Exports the whole review as a Markdown report document. */
   exportReport(): void;
   submit(): void;
@@ -114,6 +118,7 @@ export interface WorkbenchActions {
   openDynMenu(kind: string): void;
   /** Applies an async menu choice (model / branch). */
   applyDynMenu(kind: string, id: string): void;
+  onRendered?(report: { businessControls: number; running: boolean; showEnabled: boolean; feedbackEnabled: boolean }): void;
 }
 
 interface FilePatch {
@@ -146,6 +151,7 @@ interface WorkbenchPatchSnapshot {
   gatePassed: boolean;
   feedbackAllowed?: boolean;
   requirementStatus?: string;
+  businessReview?: WorkbenchState['businessReview'];
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
@@ -173,6 +179,9 @@ type InboundMessage =
   | { type: 'global' }
   | { type: 'cancelGlobal' }
   | { type: 'showGlobal' }
+  | { type: 'businessReview' }
+  | { type: 'cancelBusinessReview' }
+  | { type: 'showBusinessReview' }
   | { type: 'exportReport' }
   | { type: 'submit' }
   | { type: 'pickModel' }
@@ -185,7 +194,8 @@ type InboundMessage =
   | { type: 'pickLanguageId'; id: string }
   | { type: 'openDynMenu'; kind: string }
   | { type: 'applyDynMenu'; kind: string; id: string }
-  | { type: 'toggleFolder'; path: string };
+  | { type: 'toggleFolder'; path: string }
+  | { type: 'rendered'; businessControls: number; running: boolean; showEnabled: boolean; feedbackEnabled: boolean };
 
 /**
  * The Review Workbench: a full webview panel that renders the prototype-style
@@ -530,6 +540,7 @@ export class WorkbenchPanel {
     gatePassed: boolean;
     feedbackAllowed?: boolean;
     requirementStatus?: string;
+    businessReview?: WorkbenchState['businessReview'];
     globalDone: boolean;
     hasGlobalReport: boolean;
     modelLabel: string;
@@ -549,6 +560,7 @@ export class WorkbenchPanel {
         gatePassed: next.gatePassed,
         feedbackAllowed: next.feedbackAllowed,
         requirementStatus: next.requirementStatus,
+        businessReview: next.businessReview,
         globalDone: next.globalDone,
         hasGlobalReport: next.hasGlobalReport,
         modelLabel: next.modelLabel,
@@ -609,6 +621,7 @@ export class WorkbenchPanel {
     prev.gatePassed = state.gatePassed;
     prev.feedbackAllowed = state.feedbackAllowed;
     prev.requirementStatus = state.requirementStatus;
+    prev.businessReview = state.businessReview;
     prev.globalDone = state.globalDone;
     prev.hasGlobalReport = state.hasGlobalReport;
     prev.modelLabel = state.modelLabel;
@@ -623,6 +636,7 @@ export class WorkbenchPanel {
       gatePassed: state.gatePassed,
       feedbackAllowed: state.feedbackAllowed,
       requirementStatus: state.requirementStatus,
+      businessReview: state.businessReview,
       globalDone: state.globalDone,
       hasGlobalReport: state.hasGlobalReport,
       modelLabel: state.modelLabel,
@@ -634,6 +648,9 @@ export class WorkbenchPanel {
 
   private handle(msg: InboundMessage): void {
     switch (msg.type) {
+      case 'rendered':
+        this.actions.onRendered?.(msg);
+        break;
       case 'select':
         this.actions.open(msg.path);
         break;
@@ -657,6 +674,15 @@ export class WorkbenchPanel {
         break;
       case 'showGlobal':
         this.actions.showGlobal();
+        break;
+      case 'businessReview':
+        this.actions.businessReview();
+        break;
+      case 'cancelBusinessReview':
+        this.actions.cancelBusinessReview();
+        break;
+      case 'showBusinessReview':
+        this.actions.showBusinessReview();
         break;
       case 'exportReport':
         this.actions.exportReport();
@@ -749,11 +775,11 @@ export class WorkbenchPanel {
     const rows = flattenRows(treeRoot);
     const expanded = [...this.expandedFolders];
 
-    const gateReason: string[] = [];
-    if (state.coverage.filesReady < state.coverage.filesTotal) {
+    const gateReason: string[] = state.businessReview ? [...state.businessReview.blockers] : [];
+    if (!state.businessReview && state.coverage.filesReady < state.coverage.filesTotal) {
       gateReason.push(fmt(t.gateReasonFiles, state.coverage.filesTotal - state.coverage.filesReady));
     }
-    if (!state.globalDone) {
+    if (!state.businessReview && !state.globalDone) {
       gateReason.push(t.gateReasonGlobal);
     }
     const gateOk = state.gatePassed;
@@ -946,6 +972,12 @@ export class WorkbenchPanel {
         <div class="scope-menu" id="scopeMenu" hidden></div>
         <p id="requirementStatus" style="font-size:11px;line-height:1.7;overflow-wrap:anywhere;color:var(--dim);">${esc(state.requirementStatus ?? '')}</p>
         <button id="requirementPreparation" class="sb-switch">${esc(m().requirements.openPreparation)}</button>
+        <div class="row" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+          <button id="businessReview" ${state.businessReview?.running ? 'disabled' : ''}>${esc(m().businessReview.start)}</button>
+          <button id="showBusinessReview" ${state.businessReview?.hasReport ? '' : 'disabled'}>${esc(m().businessReview.show)}</button>
+          <button id="cancelBusinessReview" ${state.businessReview?.running ? '' : 'hidden'}>${esc(m().businessReview.cancel)}</button>
+        </div>
+        <p id="businessProgress" role="status" aria-live="polite" style="font-size:11px;line-height:1.7;overflow-wrap:anywhere;color:var(--dim)">${esc(state.businessReview?.progress ?? '')}</p>
       </div>
       <div class="wb-busy" id="wbBusy" hidden>
         <div class="gp-bar"><div class="gp-fill"></div></div>
@@ -1148,14 +1180,18 @@ export class WorkbenchPanel {
     const gateText = byId('gateText'); if (gateText) gateText.textContent = msg.gatePassed ? T.gatePass : T.gateFail;
     const gateReason = byId('gateReason');
     if (gateReason) {
-      const reasons = [];
-      if (msg.coverage.filesReady < msg.coverage.filesTotal) reasons.push(fmt(T.gateReasonFiles, msg.coverage.filesTotal - msg.coverage.filesReady));
-      if (!msg.globalDone) reasons.push(T.gateReasonGlobal);
+      const reasons = msg.businessReview ? [...msg.businessReview.blockers] : [];
+      if (!msg.businessReview && msg.coverage.filesReady < msg.coverage.filesTotal) reasons.push(fmt(T.gateReasonFiles, msg.coverage.filesTotal - msg.coverage.filesReady));
+      if (!msg.businessReview && !msg.globalDone) reasons.push(T.gateReasonGlobal);
       gateReason.textContent = reasons.join(T.listSep);
       gateReason.style.display = msg.gatePassed ? 'none' : '';
     }
     const submit = byId('submit'); if (submit) submit.disabled = !(msg.gatePassed || msg.feedbackAllowed);
     const requirements = byId('requirementStatus'); if (requirements) requirements.textContent = msg.requirementStatus || '';
+    const business = byId('businessReview'); if (business) business.disabled = !!msg.businessReview?.running;
+    const businessShow = byId('showBusinessReview'); if (businessShow) businessShow.disabled = !msg.businessReview?.hasReport;
+    const businessCancel = byId('cancelBusinessReview'); if (businessCancel) businessCancel.hidden = !msg.businessReview?.running;
+    const businessProgress = byId('businessProgress'); if (businessProgress) businessProgress.textContent = msg.businessReview?.progress || '';
     const showGlobal = byId('showGlobal'); if (showGlobal) showGlobal.disabled = !msg.hasGlobalReport;
     const modelLabel = byId('modelLabel');
     if (modelLabel) { modelLabel.title = msg.modelLabel; modelLabel.innerHTML = T.modelPrefix + '<b>' + esc(msg.modelLabel) + '</b>'; }
@@ -1294,6 +1330,9 @@ export class WorkbenchPanel {
   });
   byId('globalCancel')?.addEventListener('click', () => send({ type:'cancelGlobal' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
+  byId('businessReview')?.addEventListener('click', () => send({ type:'businessReview' }));
+  byId('showBusinessReview')?.addEventListener('click', () => send({ type:'showBusinessReview' }));
+  byId('cancelBusinessReview')?.addEventListener('click', () => send({ type:'cancelBusinessReview' }));
   byId('exportReport')?.addEventListener('click', () => send({ type:'exportReport' }));
   byId('requirementPreparation')?.addEventListener('click', () => send({ type:'pickScope' }));
   function bindDynMenu(id, kind) {
@@ -1482,6 +1521,7 @@ export class WorkbenchPanel {
       if (tbCaret) tbCaret.textContent = '\u25BE';
     }
   }
+  send({type:'rendered',businessControls:document.querySelectorAll('#businessReview,#showBusinessReview,#cancelBusinessReview').length,running:byId('cancelBusinessReview')?.hidden===false,showEnabled:byId('showBusinessReview')?.disabled===false,feedbackEnabled:byId('submit')?.disabled===false});
 </script>
 </body>
 </html>`;
@@ -1838,6 +1878,7 @@ function snapshotFor(
     gatePassed: state.gatePassed,
     feedbackAllowed: state.feedbackAllowed,
     requirementStatus: state.requirementStatus,
+    businessReview: state.businessReview,
     globalDone: state.globalDone,
     hasGlobalReport: state.hasGlobalReport,
     modelLabel: state.modelLabel,

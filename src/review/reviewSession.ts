@@ -20,6 +20,10 @@ import {
   requirementBoundary, requirementFingerprint, requirementReadiness,
   requirementScopeKey, restoreRequirementsDraft, type RequirementsDraft,
 } from './requirements';
+import {
+  businessBindingKey, businessBlockers, coverageComplete, restoreBusinessReview,
+  type BusinessReviewRun,
+} from './businessReview';
 
 export interface ReviewSessionChange {
   filePath?: string;
@@ -159,6 +163,14 @@ export class ReviewSession {
     }
 
     const requirements = scopeSnap?.requirements ? restoreRequirementsDraft(scopeSnap.requirements) : undefined;
+    const businessReview = scopeSnap?.businessReview ? restoreBusinessReview(scopeSnap.businessReview) : undefined;
+    if (businessReview?.status === 'running') {
+      businessReview.status = 'cancelled'; businessReview.confirmed = false;
+      businessReview.errors.push(m().businessReview.lostRun);
+    }
+    if (businessReview && (!cwd || businessReview.bindingKey !== businessBindingKey(cwd, reviewSet, requirements))) {
+      businessReview.status = 'stale'; businessReview.confirmed = false;
+    }
     if (generation !== this.startGeneration) return;
     this.cwd = cwd;
     this.repoLabel = label;
@@ -177,6 +189,7 @@ export class ReviewSession {
       source: reviewSet.source,
       comparison: reviewSet.comparison,
       requirements,
+      businessReview,
       repo,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
@@ -187,6 +200,7 @@ export class ReviewSession {
       globalDone: scopeSnap?.globalDone ?? false,
       globalFixDispositions: scopeSnap?.globalFixDispositions,
       conclusion: scopeSnap?.conclusion,
+      postedConclusions: scopeSnap?.postedConclusions,
       pendingComments: scopeSnap?.pendingComments,
       tokenUsage: scopeSnap?.tokenUsage,
       updatedAt: Date.now(),
@@ -202,7 +216,63 @@ export class ReviewSession {
   }
 
   get requirementStatus(): string {
+    const run = this.businessReview;
+    if (run && this.businessReviewCurrent && run.status !== 'stale') {
+      if (run.mode === 'technical') return `${m().businessReview.modeTechnical} · ${m().businessReview[run.status]}`;
+      const unknown = run.requirements.some((item) => item.status === 'unknown') || run.premises.some((item) => item.status === 'unknown');
+      if (run.status === 'completed') return `${m().businessReview.modeRequirements}${unknown ? ` · ${m().businessReview.partialRequirements}` : ''}`;
+      return `${m().businessReview[run.status]} · ${m().businessReview.partialRequirements}`;
+    }
     return requirementBoundary(this.requirements, this.reviewSet && this.cwd ? requirementScopeKey(this.cwd, this.reviewSet) : undefined);
+  }
+
+  get businessReview(): BusinessReviewRun | undefined {
+    return this.snapshot?.businessReview;
+  }
+
+  get businessReviewCurrent(): boolean {
+    return !!this.businessReview && !!this.reviewSet && !!this.cwd
+      && this.businessReview.bindingKey === businessBindingKey(this.cwd, this.reviewSet, this.requirements)
+      && this.businessReview.status !== 'stale';
+  }
+
+  async setBusinessReview(run: BusinessReviewRun): Promise<void> {
+    if (!this.snapshot || !this.reviewSet || !this.cwd || run.bindingKey !== businessBindingKey(this.cwd, this.reviewSet, this.requirements)) {
+      throw new Error(m().businessReview.staleReport);
+    }
+    this.snapshot.businessReview = restoreBusinessReview(run);
+    this.snapshot.conclusion = undefined;
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+  }
+
+  invalidateBusinessReview(reason = m().businessReview.stale): void {
+    const run = this.businessReview;
+    if (!run || run.status === 'stale' && run.errors.includes(reason)) return;
+    run.status = 'stale'; run.confirmed = false;
+    if (!run.errors.includes(reason)) run.errors.push(reason);
+    if (this.snapshot) this.snapshot.conclusion = undefined;
+    this.persistScope();
+  }
+
+  hasBusinessDependency(file: string): boolean {
+    const dependencies = this.businessReview?.dependencies;
+    return !!dependencies && (Object.hasOwn(dependencies, `head:${file}`) || Object.hasOwn(dependencies, `base:${file}`));
+  }
+
+  confirmBusinessReview(): void {
+    if (!this.businessReviewCurrent || !this.businessReview || this.businessReview.status === 'running') throw new Error(m().businessReview.staleReport);
+    this.businessReview.confirmed = true;
+    this.persistScope();
+  }
+
+  recordBusinessNote(id: string, reason: string): void {
+    const run = this.businessReview;
+    if (!this.businessReviewCurrent || !run || run.status === 'running' || !run.findings.some((item) => item.id === id) || !reason.trim()) throw new Error(m().businessReview.staleReport);
+    run.dispositions[id] = { kind: 'commented', reason, at: Date.now() };
+    run.confirmed = false;
+    if (this.snapshot) this.snapshot.conclusion = undefined;
+    this.persistScope();
   }
 
   async setRequirements(draft: RequirementsDraft): Promise<void> {
@@ -216,6 +286,7 @@ export class ReviewSession {
       || previous.technicalOnly !== next.technicalOnly;
     this.snapshot.requirements = next;
     if (changed) {
+      this.invalidateBusinessReview();
       this.snapshot.globalDone = false;
       this.snapshot.conclusion = undefined;
     }
@@ -223,11 +294,27 @@ export class ReviewSession {
     this._onDidChange.fire({});
   }
 
-  /** M2 establishes evidence; only the later requirement-aware analyzer may approve its satisfaction. */
+  /** Approval requires a complete, current workflow; feedback may expose partial results. */
   canSubmitConclusion(verdict: 'approve' | 'request-changes' | 'comment'): boolean {
+    const run = this.businessReview;
+    if (run) {
+      if (!this.businessReviewCurrent || run.status === 'running' || run.status === 'stale') return false;
+      if (verdict !== 'approve') return !!run.findings.length || !!run.requirements.length || run.unitSummaries.length > 0;
+      return !businessBlockers(run).length && this.businessCoverageMatchesScope();
+    }
     if (!this.technicalGatePassed()) return false;
     if (verdict !== 'approve') return true;
     return this.requirements?.technicalOnly === true || !this.requirements?.materials.some((source) => source.selected);
+  }
+
+  private businessCoverageMatchesScope(): boolean {
+    if (!this.businessReview || !this.reviewSet) return false;
+    return this.reviewSet.files.filter((file) => !file.context).every((file) => {
+      const head = file.status === 'deleted' || this.businessReview?.coverage.some((item) => item.path === file.path && item.side === 'head' && coverageComplete(item));
+      const base = !this.reviewSet?.comparison && file.status !== 'deleted' || file.status === 'added'
+        || this.businessReview?.coverage.some((item) => item.path === (file.previousPath ?? file.path) && item.side === 'base' && coverageComplete(item));
+      return head && base;
+    });
   }
 
   /**
@@ -513,6 +600,7 @@ export class ReviewSession {
     if (!s) {
       return;
     }
+    this.invalidateBusinessReview();
     // Finding ids are positional (`f0`, `f1`, …) and therefore NOT stable across
     // re-analysis. Re-keying dispositions by id would resurrect already-handled
     // findings as fresh, unconfirmed ones. Instead, carry each prior disposition
@@ -557,6 +645,7 @@ export class ReviewSession {
     if (!this.snapshot || !this.reviewSet || !this.reviewFilesByPath.has(rootPath)) {
       return { addedFiles: [], updatedFiles: [], removedFiles: [] };
     }
+    this.invalidateBusinessReview();
     const resultPaths = Object.keys(findingsByFile);
     const added = this.addContextReviewFiles(
       resultPaths.filter((filePath) => !this.reviewFilesByPath.has(filePath)),
@@ -664,6 +753,7 @@ export class ReviewSession {
     if (!this.snapshot) {
       return { changed: false, affectedFiles: [], removedFiles: [] };
     }
+    if (this.hasReviewFile(path) || this.hasBusinessDependency(path)) this.invalidateBusinessReview();
     const roots = new Set<string>([path]);
     for (const [root, dependencies] of Object.entries(
       this.snapshot.analysisDependencies ?? {},
@@ -947,6 +1037,7 @@ export class ReviewSession {
   /** Stores the cross-file global report (reviewer must still confirm it). */
   setGlobalReport(report: GlobalReport): void {
     if (this.snapshot) {
+      this.invalidateBusinessReview();
       const previousReport = this.snapshot.globalReport;
       const previousDispositions = this.snapshot.globalFixDispositions ?? {};
       const nextDispositions: Record<string, FindingDisposition> = {};
@@ -1142,7 +1233,7 @@ export class ReviewSession {
   /** Records the reviewer's final verdict so it survives reloads. */
   setConclusion(conclusion: ReviewConclusion): void {
     if (this.snapshot) {
-      this.snapshot.conclusion = conclusion;
+      this.snapshot.conclusion = { ...conclusion, businessRunId: conclusion.businessRunId ?? this.businessReview?.id };
       this.persistScope();
     }
   }
@@ -1153,13 +1244,17 @@ export class ReviewSession {
       ? active : snapshot;
     const posted = new Set(submittedIds);
     target.pendingComments = (target.pendingComments ?? []).filter((comment) => !posted.has(comment.id));
-    target.conclusion = conclusion;
+    (target.postedConclusions ??= []).push(conclusion);
+    if (conclusion.businessRunId === target.businessReview?.id
+      && target.businessReview?.status !== 'stale' && target.businessReview?.status !== 'running') target.conclusion = conclusion;
     await this.persistScopeMeta(target);
     if (this.snapshot === target) this._onDidChange.fire({});
   }
 
   get conclusion(): ReviewConclusion | undefined {
-    return this.snapshot?.conclusion;
+    const conclusion = this.snapshot?.conclusion;
+    return conclusion?.businessRunId === this.businessReview?.id
+      && this.businessReview?.status !== 'stale' && this.businessReview?.status !== 'running' ? conclusion : undefined;
   }
 
   /** Draft PR review comments awaiting submission (pending-review model). */

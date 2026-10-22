@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 interface Disposable {
   dispose(): void;
@@ -191,11 +192,12 @@ export function resetVscodeMock(): void {
   vscodeMockState.clipboardReadError = undefined;
   vscodeMockState.contextKeys.clear();
   vscodeMockState.warnings = [];
+  workspace.textDocuments.length = 0;
   registeredCommands.clear();
 }
 
 export const workspace = {
-  textDocuments: [],
+  textDocuments: new Array<{ uri: Uri; isDirty: boolean; getText(): string }>(),
   getConfiguration: () => ({
     get: <T>(section: string, defaultValue: T): T =>
       (section === 'language' ? vscodeMockState.language : defaultValue) as T,
@@ -302,21 +304,31 @@ export class EventEmitter<T> {
 }
 
 export class Uri {
-  static file(fsPath: string): { fsPath: string; scheme: string } {
-    return { fsPath, scheme: 'file' };
+  readonly scheme = 'file';
+  constructor(readonly fsPath: string) {}
+
+  toString(): string {
+    return pathToFileURL(this.fsPath).href;
   }
 
-  static joinPath(base: { fsPath: string }, ...parts: string[]): { fsPath: string; scheme: string } {
+  static file(fsPath: string): Uri {
+    return new Uri(fsPath);
+  }
+
+  static joinPath(base: { fsPath: string }, ...parts: string[]): Uri {
     return Uri.file(path.join(base.fsPath, ...parts));
   }
 }
 
 export class CancellationTokenSource {
-  readonly token = { isCancellationRequested: false };
+  private readonly cancellation = new EventEmitter<void>();
+  readonly token = { isCancellationRequested: false, onCancellationRequested: this.cancellation.event };
 
   cancel(): void {
+    if (this.token.isCancellationRequested) return;
     this.token.isCancellationRequested = true;
+    this.cancellation.fire();
   }
 
-  dispose(): void {}
+  dispose(): void { this.cancellation.dispose(); }
 }

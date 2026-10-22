@@ -46,6 +46,36 @@ describe('WorkbenchPanel incremental patching', () => {
     });
     expect(vscodeMockState.panel?.webview.html).toContain('id="requirementPreparation"');
   });
+
+  it('patches business-run controls and actual blockers without substituting the old scroll/global gate', async () => {
+    vi.useFakeTimers();
+    const state = workbenchState();
+    const start = vi.fn();
+    const cancel = vi.fn();
+    const show = vi.fn();
+    const noop = () => {};
+    const actions: WorkbenchActions = {
+      open: noop, openFocus: noop, focusDoc: noop, disposeFinding: noop, locate: noop,
+      globalAnalysis: noop, cancelGlobalAnalysis: noop, showGlobal: noop,
+      businessReview: start, cancelBusinessReview: cancel, showBusinessReview: show,
+      exportReport: noop, submit: noop, pickModel: noop, pickLanguage: noop, pickBranch: noop,
+      pickProject: noop, pickScope: noop, pickScopeKind: noop, pickProjectCwd: noop, pickLanguageId: noop,
+      openDynMenu: noop, applyDynMenu: noop,
+    };
+    WorkbenchPanel.show(() => state, actions);
+    state.businessReview = { running: true, hasReport: true, progress: 'Independent global discovery', blockers: ['Critical provider semantics unknown'] };
+    WorkbenchPanel.refreshIfOpen();
+    await vi.advanceTimersByTimeAsync(80);
+    const webview = vscodeMockState.panel!.webview;
+    expect(webview.messages.at(-1)).toMatchObject({ type: 'patch', businessReview: state.businessReview });
+    webview.receiveMessage({ type: 'businessReview' });
+    webview.receiveMessage({ type: 'cancelBusinessReview' });
+    webview.receiveMessage({ type: 'showBusinessReview' });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(webview.html).toContain('id="businessProgress"');
+  });
 });
 
 function workbenchState(): WorkbenchState {

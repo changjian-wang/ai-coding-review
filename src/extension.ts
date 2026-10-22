@@ -26,6 +26,8 @@ import {
   setTokenUsageSink,
   verifyRootedRepositoryFindings,
   analyzeRequirementUnderstanding,
+  analyzeBusinessReviewPhase,
+  businessReviewInputFits,
   type GlobalContextFile,
 } from './ai/analyzer';
 import {
@@ -44,6 +46,10 @@ import {
 import { FileSystemScope, PrByNumberScope, BranchSnapshotScope, assertPrSnapshotCurrent } from './scope/scopes';
 import { currentBranch, listBranches, readFileAtRef, repositoryRoot } from './scope/gitClient';
 import { CommitSource } from './review/commitSource';
+import { businessBaseline, businessBindingKey, businessBlockers, businessHash, businessKnownCritical, coverageComplete, type BusinessCitation } from './review/businessReview';
+import { runBusinessReview, type BusinessLegacyCandidate } from './review/businessReviewEngine';
+import { BusinessReviewSource } from './review/businessReviewSource';
+import { BusinessReviewPanel, businessConclusionSummary, businessReportMarkdown } from './ui/businessReviewPanel';
 import { realpath } from 'node:fs/promises';
 import type { ScopePreparationOptions } from './scope/scopePreparationPanel';
 import { repositoryStorageId } from './review/repositoryIdentity';
@@ -60,7 +66,7 @@ import {
   registerIgnoreReasonPasteCommand,
   showIgnoreReasonInput,
 } from './ui/ignoreReasonInput';
-import { m, onLanguageChange, resolveLanguage, type Language } from './i18n';
+import { fmt, m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 import { buildFullFileDiff } from './review/fullFileDiff';
 import {
   collectRelatedRepositoryContext,
@@ -131,6 +137,15 @@ const inFlightAnalysisDependencies = new Map<string, Set<string>>();
 let globalAnalysisInFlight = false;
 /** Cancellation source for the in-flight global analysis, if any. */
 let globalAnalysisCts: vscode.CancellationTokenSource | undefined;
+interface BusinessReviewContext {
+  cts: vscode.CancellationTokenSource;
+  set: ReviewSet;
+  snapshot: NonNullable<ReviewSession['snapshot']>;
+  bindingKey: string;
+  runId?: string;
+  stale: boolean;
+}
+let businessContext: BusinessReviewContext | undefined;
 /** In-flight whole-document (bilingual) translation, so it can be de-duped per
  *  file and cancelled when the reviewer switches to another file. */
 let activeDocTranslation: { path: string; cts: vscode.CancellationTokenSource } | undefined;
@@ -170,6 +185,10 @@ function ensureReviewPath(relPath: string, action: string): boolean {
 }
 
 function closeScopeBoundPanels(): void {
+  const business = businessContext;
+  businessContext = undefined;
+  business?.cts.cancel();
+  business?.cts.dispose();
   openFileGeneration += 1;
   for (const timer of manualReloadTimers.values()) {
     clearTimeout(timer);
@@ -193,6 +212,7 @@ function closeScopeBoundPanels(): void {
   fixProposalOpenGeneration += 1;
   FixProposalPanel.closeIfOpen();
   GlobalReportPanel.closeIfOpen();
+  BusinessReviewPanel.closeIfOpen();
 }
 
 function reflectReviewInvalidation(
@@ -200,6 +220,7 @@ function reflectReviewInvalidation(
   sourcePath: string,
   closeFixPanel: boolean,
 ): void {
+  if (businessContext) { businessContext.stale = true; businessContext.cts.cancel(); }
   if (!invalidation.changed) {
     return;
   }
@@ -224,6 +245,11 @@ function reflectReviewInvalidation(
 }
 
 function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void {
+  if (event.contentChanges.length && event.document.uri.scheme === 'file' && session.requirements?.materials
+    .some((source) => source.selected && source.kind === 'file' && vscode.Uri.file(source.location).toString() === event.document.uri.toString())) {
+    if (businessContext) { businessContext.stale = true; businessContext.cts.cancel(); }
+    session.invalidateBusinessReview(m().requirements.materialChanged);
+  }
   if (
     session.reviewSet?.source
     ||
@@ -241,6 +267,8 @@ function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void
     || (
       !session.hasReviewFile(rel)
       && !session.hasAnalysisDependency(rel)
+      && !session.hasBusinessDependency(rel)
+      && !businessContext
       && !inFlightDependency
     )
   ) {
@@ -250,6 +278,7 @@ function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void
     cts.cancel();
   }
   globalAnalysisCts?.cancel();
+  if (businessContext) { businessContext.stale = true; businessContext.cts.cancel(); }
   const invalidation = session.invalidateAfterFileChange(rel);
   reflectReviewInvalidation(invalidation, rel, true);
   if (!session.hasReviewFile(rel)) {
@@ -781,6 +810,7 @@ function refreshUiForLanguageSwitch(): void {
     void refreshDocPanel(currentPath);
   }
   FixProposalPanel.refreshIfOpen();
+  BusinessReviewPanel.refreshIfOpen(session.businessReview);
   if (session.globalReport) {
     showGlobalReport();
   } else {
@@ -858,6 +888,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codereview.openFile', openFileInPanel),
     vscode.commands.registerCommand('codereview.analyzeFile', analyzeCurrentFile),
     vscode.commands.registerCommand('codereview.globalAnalysis', runGlobalAnalysis),
+    vscode.commands.registerCommand('codereview.businessReview', startBusinessReview),
+    vscode.commands.registerCommand('codereview.showBusinessReview', showBusinessReview),
+    vscode.commands.registerCommand('codereview.cancelBusinessReview', cancelBusinessReview),
     vscode.commands.registerCommand('codereview.showGlobalReport', showGlobalReport),
     vscode.commands.registerCommand('codereview.submitConclusion', submitConclusion),
     vscode.commands.registerCommand('codereview.viewPendingComments', viewPendingComments),
@@ -871,7 +904,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Keep the workbench webview in sync with session progress.
   context.subscriptions.push(
-    session.onDidChange((change) => WorkbenchPanel.refreshIfOpen(change.filePath)),
+    session.onDidChange((change) => {
+      const context = businessContext;
+      if (context && context.runId === session.businessReview?.id && session.businessReview?.status === 'stale') {
+        context.stale = true;
+        context.cts.cancel();
+      }
+      WorkbenchPanel.refreshIfOpen(change.filePath);
+      BusinessReviewPanel.refreshIfOpen(session.businessReview);
+    }),
   );
 
   // Re-render UI the instant the user flips `codereview.language`, so the status
@@ -1070,6 +1111,7 @@ async function openInNewWindow(
     persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
     loading.progress.report(m().workbench.loadingOpening, 'open');
     WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
+    if (picked.requirements) void startBusinessReview();
   } catch (error) {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
@@ -1132,6 +1174,7 @@ async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<voi
   commitSource = undefined;
   await refreshBranchLabel();
   closeScopeBoundPanels();
+  if (session.businessReview && session.businessReview.status !== 'stale') await verifyBusinessInputsCurrent();
   workbenchSelected = undefined;
   docRenderCache.clear();
   docDiffCache.clear();
@@ -1188,6 +1231,7 @@ async function startReview(kind?: string): Promise<void> {
       void vscode.commands.executeCommand('setContext', 'codereview.active', true);
       await openWorkbench();
     });
+    if (picked.requirements) void startBusinessReview();
   } catch (error) {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
@@ -1207,6 +1251,200 @@ function requirementPreparationOptions(): ScopePreparationOptions {
       return analyzeRequirementUnderstanding(model, draft, scope, token, usage);
     },
   };
+}
+
+async function startBusinessReview(): Promise<void> {
+  const set = session.reviewSet;
+  const snapshot = session.snapshot;
+  const cwd = session.getCwd();
+  if (!set || !snapshot || !cwd) { transientWarning(m().review.notStartedWarn); return; }
+  if (businessContext || analyzingPaths.size || globalAnalysisInFlight) {
+    transientWarning(m().businessReview.running);
+    return;
+  }
+  let context: BusinessReviewContext | undefined;
+  try {
+    const draft = session.requirements ? structuredClone(session.requirements) : undefined;
+    const baseline = businessBaseline(cwd, set, draft);
+    const source = new BusinessReviewSource(cwd, set);
+    const cts = new vscode.CancellationTokenSource();
+    const captured: BusinessReviewContext = { cts, set, snapshot, bindingKey: baseline.bindingKey, stale: false };
+    context = captured;
+    businessContext = captured;
+    const sameScope = () => businessContext === captured && session.reviewSet === set && session.snapshot === snapshot;
+    const sameInputs = () => sameScope() && businessBindingKey(cwd, set, session.requirements) === baseline.bindingKey;
+    WorkbenchPanel.refreshIfOpen();
+    try { await source.assertCurrent(draft); }
+    catch (error) {
+      if (sameInputs()) {
+        captured.stale = true;
+        session.invalidateBusinessReview(`${m().businessReview.verifyCurrent} ${String(error)}`);
+        await session.persist();
+      }
+      throw error;
+    }
+    const model = await models.resolve();
+    if (!sameInputs() || cts.token.isCancellationRequested) return;
+    if (!model) throw new AnalysisError(m().requirements.noModel);
+    const previous = session.businessReview ? structuredClone(session.businessReview) : undefined;
+    const legacy: BusinessLegacyCandidate[] = [
+      ...(previous?.findings ?? []).filter((finding) => finding.status !== 'dismissed').map((finding) => {
+        const ref = finding.evidence.find((ref) => ref.kind === 'code' && ref.side === 'head');
+        return {
+          id: finding.id, path: ref?.path ?? set.files.find((file) => file.status !== 'deleted')?.path ?? set.files[0].path,
+          line: ref?.line ?? 1, anchor: ref?.quote, title: finding.title,
+          detail: `${finding.cause}\n${finding.trigger}\n${finding.impact}\n${finding.counterRationale}`,
+        };
+      }),
+      ...set.files.flatMap((file) => session.findings(file.path).filter(isActionableFinding).map((finding) => ({
+        id: businessHash(JSON.stringify([file.path, finding.anchor, finding.title, finding.detail])),
+        path: file.path, line: finding.line, anchor: finding.anchor, title: finding.title, detail: finding.detail,
+      }))),
+      ...(session.globalReport?.fixSpots ?? []).map((finding) => ({
+        id: businessHash(JSON.stringify([finding.file, finding.anchor, finding.title, finding.detail])),
+        path: finding.file, line: finding.line, anchor: finding.anchor, title: finding.title, detail: finding.detail,
+      })),
+    ];
+    await runBusinessReview(set, baseline, {
+      modelId: model.id, token: cts.token, now: Date.now, cancel: () => cts.cancel(),
+      isCurrent: () => sameInputs() && !captured.stale,
+      read: source.read, readFresh: source.readFresh,
+      resolve: (request) => source.resolve(request, cts.token),
+      fits: (phase, payload) => businessReviewInputFits(model, phase, payload, cts.token),
+      request: (phase, payload) => analyzeBusinessReviewPhase(model, phase, payload, cts.token, (usage) => {
+        if (session.snapshot === snapshot) session.recordTokenUsage(usage);
+        else console.warn('[codereview] A late token estimate was not attributed to the new review scope.');
+      }),
+      update: async (run) => {
+        if (!sameInputs()) return;
+        captured.runId = run.id;
+        if (captured.stale) {
+          run.status = 'stale'; run.confirmed = false;
+          if (!run.errors.includes(m().businessReview.stale)) run.errors.push(m().businessReview.stale);
+        }
+        await session.setBusinessReview(run);
+      },
+    }, previous, businessKnownCritical(previous), legacy.filter((candidate, index, all) => all.findIndex((other) => other.id === candidate.id) === index));
+    if (!sameInputs()) return;
+    if (session.businessReview?.status !== 'stale' && session.businessReview?.status !== 'cancelled') {
+      try { await source.assertCurrent(draft, session.businessReview); }
+      catch (error) {
+        session.invalidateBusinessReview(`${m().businessReview.verifyCurrent} ${String(error)}`);
+        await session.persist();
+      }
+    }
+    if (sameScope() && session.businessReview) {
+      WorkbenchPanel.flashNotice(`${m().businessReview[session.businessReview.status]} · ${m().businessReview.show}`,
+        session.businessReview.status === 'completed' ? undefined : 'warn');
+    }
+  } catch (error) {
+    if (!context || businessContext === context) {
+      void vscode.window.showErrorMessage(m().review.error(String(error)));
+    } else console.warn('[codereview] A late business-review error was ignored after switching scope.', error);
+  } finally {
+    if (context && businessContext === context) {
+      businessContext = undefined;
+      context.cts.dispose();
+      WorkbenchPanel.refreshIfOpen();
+      BusinessReviewPanel.refreshIfOpen(session.businessReview);
+    }
+  }
+}
+
+function cancelBusinessReview(): void {
+  const context = businessContext;
+  if (!context) return;
+  businessContext = undefined;
+  context.cts.cancel();
+  context.cts.dispose();
+  const run = session.businessReview;
+  if (run?.status === 'running' && session.businessReviewCurrent && session.snapshot === context.snapshot) {
+    const cancelled = structuredClone(run);
+    cancelled.status = context.stale ? 'stale' : 'cancelled'; cancelled.confirmed = false; cancelled.finishedAt = Date.now();
+    cancelled.errors.push(context.stale ? m().businessReview.stale : m().businessReview.cancelled);
+    void session.setBusinessReview(cancelled).catch((error) => reportError(error));
+  }
+  WorkbenchPanel.refreshIfOpen();
+  WorkbenchPanel.flashNotice(m().businessReview.cancelled, 'warn');
+}
+
+async function verifyBusinessInputsCurrent(): Promise<boolean> {
+  if (businessContext) { transientWarning(m().businessReview.running); return false; }
+  const run = session.businessReview;
+  if (!run) return true;
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
+  if (!set || !cwd || !session.businessReviewCurrent) {
+    transientWarning(m().businessReview.staleReport);
+    return false;
+  }
+  try {
+    await new BusinessReviewSource(cwd, set).assertCurrent(session.requirements, run);
+    return !businessContext && session.reviewSet === set && session.businessReview === run && session.businessReviewCurrent;
+  } catch (error) {
+    if (session.reviewSet === set && session.businessReview === run) {
+      session.invalidateBusinessReview(`${m().businessReview.verifyCurrent} ${String(error)}`);
+      await session.persist();
+      void vscode.window.showWarningMessage(`${m().businessReview.verifyCurrent} ${String(error)}`);
+    } else console.warn('[codereview] A freshness result for an older business review was ignored.', error);
+    return false;
+  }
+}
+
+function showBusinessReview(): void {
+  const run = session.businessReview;
+  if (!run) { transientWarning(m().businessReview.noResult); return; }
+  BusinessReviewPanel.show(run, {
+    recheck: () => void startBusinessReview(),
+    cancel: cancelBusinessReview,
+    prepare: () => void startReview(),
+    confirm: () => void (async () => {
+      const id = session.businessReview?.id;
+      if (!id || !await verifyBusinessInputsCurrent() || session.businessReview?.id !== id) return;
+      session.confirmBusinessReview();
+    })().catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
+    note: (id) => void (async () => {
+      const runId = session.businessReview?.id;
+      if (!runId) throw new Error(m().businessReview.staleReport);
+      const reason = await vscode.window.showInputBox({
+        title: m().businessReview.comment, prompt: m().businessReview.notePrompt, ignoreFocusOut: true,
+        validateInput: (value) => value.trim() ? undefined : m().businessReview.notePrompt,
+      });
+      if (!reason) return;
+      if (session.businessReview?.id !== runId || !await verifyBusinessInputsCurrent() || session.businessReview?.id !== runId) return;
+      session.recordBusinessNote(id, reason);
+    })().catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
+    source: (ref) => void showBusinessSource(ref).catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
+  });
+}
+
+async function showBusinessSource(ref: BusinessCitation): Promise<void> {
+  const runId = session.businessReview?.id;
+  let text: string | undefined;
+  let error: unknown;
+  try {
+    if (ref.kind === 'material') {
+      const source = session.requirements?.materials.find((source) => source.id === ref.sourceId);
+      text = source?.versions.find((version) => version.version === ref.version)?.text;
+    } else {
+      const set = session.reviewSet;
+      const cwd = session.getCwd();
+      if (set && cwd && ref.side !== 'material') text = await new BusinessReviewSource(cwd, set).readFresh(ref.path, ref.side);
+    }
+  } catch (failure) { error = failure; }
+  if (session.businessReview?.id !== runId) { transientWarning(m().businessReview.staleReport); return; }
+  const full = text !== undefined && businessHash(text) === ref.sourceHash;
+  if (!full) {
+    void vscode.window.showWarningMessage(`${m().businessReview.quoteOnly}${error ? ` ${String(error)}` : ''}`);
+    text = `${m().businessReview.quoteOnly}\n\n${ref.path} [${ref.side}] · ${ref.sourceHash}\n\n${ref.quote}`;
+  }
+  const document = await vscode.workspace.openTextDocument({ content: text!, language: full ? languageIdFor(ref.path) : 'plaintext' });
+  if (session.businessReview?.id !== runId) { transientWarning(m().businessReview.staleReport); return; }
+  const start = full ? Math.min(ref.line - 1, document.lineCount - 1) : 0;
+  await vscode.window.showTextDocument(document, {
+    preview: false, viewColumn: DocumentPanel.viewColumn ?? vscode.ViewColumn.Active,
+    selection: new vscode.Range(start, 0, start, 0),
+  });
 }
 
 /**
@@ -1437,6 +1675,9 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     globalAnalysis: () => void runGlobalAnalysis(),
     cancelGlobalAnalysis: () => cancelGlobalAnalysis(),
     showGlobal: showGlobalReport,
+    businessReview: () => void startBusinessReview(),
+    cancelBusinessReview,
+    showBusinessReview,
     exportReport: () => void exportReviewReport(),
     submit: () => void submitConclusion(),
     pickModel: () => void selectModel(),
@@ -1658,9 +1899,19 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
     selected: workbenchSelected,
     findings: selectedFindings,
     coverage: session.totalCoverage(),
-    gatePassed: session.gatePassed(),
-    feedbackAllowed: session.canSubmitConclusion('comment'),
+    gatePassed: !businessContext && session.gatePassed(),
+    feedbackAllowed: !businessContext && session.canSubmitConclusion('comment'),
     requirementStatus: session.requirementStatus,
+    businessReview: session.businessReview || businessContext ? {
+      running: !!businessContext,
+      hasReport: !!session.businessReview,
+      progress: businessContext && session.businessReview?.status !== 'running' ? m().businessReview.read : session.businessReview
+        ? `${m().businessReview[session.businessReview.status]} · ${fmt(m().businessReview.progress,
+          m().businessReview[session.businessReview.phase], session.businessReview.coverage.filter(coverageComplete).length,
+          session.businessReview.coverage.length, session.businessReview.calls)}`
+        : m().businessReview.read,
+      blockers: businessContext ? [m().businessReview.incomplete] : session.businessReview ? businessBlockers(session.businessReview) : [m().businessReview.incomplete],
+    } : undefined,
     globalDone: session.globalConfirmed,
     hasGlobalReport: !!session.globalReport,
     modelLabel: models.label,
@@ -2597,6 +2848,7 @@ async function analyzeCurrentFile(): Promise<void> {
 
 /** Analyzes a specific review file by its relative path. */
 async function analyzeByPath(rel: string): Promise<void> {
+  if (businessContext) { transientWarning(m().businessReview.running); return; }
   if (!ensureReviewPath(rel, m().actions.analyze)) {
     return;
   }
@@ -3166,6 +3418,7 @@ function recordLocalCommentNote(
 }
 
 async function runGlobalAnalysis(): Promise<void> {
+  if (businessContext) { transientWarning(m().businessReview.running); return; }
   const reviewSet = session.reviewSet;
   if (!reviewSet) {
     WorkbenchPanel.setGlobalProgress(false);
@@ -3707,6 +3960,8 @@ async function exportReviewReport(): Promise<void> {
     transientWarning(m().report.noReview);
     return;
   }
+  const snapshot = session.snapshot;
+  const business = session.businessReview ? structuredClone(session.businessReview) : undefined;
   const cov = session.totalCoverage();
   const data: ReportData = {
     repo: reviewSet.repositoryIdentity ?? session.getRepoLabel(),
@@ -3730,7 +3985,12 @@ async function exportReviewReport(): Promise<void> {
     requirements: session.requirements,
   };
   const localized = await localizeReportData(data, resolveLanguage());
-  const markdown = buildReviewReportMarkdown(localized, m().report);
+  if (session.snapshot !== snapshot || session.requirements !== data.requirements || session.businessReview?.id !== business?.id
+    || session.businessReview?.status === 'stale' && business?.status !== 'stale') {
+    transientWarning(m().businessReview.staleReport);
+    return;
+  }
+  const markdown = `${buildReviewReportMarkdown(localized, m().report)}${business ? `\n\n---\n\n${businessReportMarkdown(business)}` : ''}`;
   const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: markdown });
   await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
   transientInfo(m().report.exported);
@@ -3928,7 +4188,8 @@ async function submitConclusion(): Promise<void> {
     transientWarning(m().review.notStartedWarn);
     return;
   }
-  if (!session.technicalGatePassed()) {
+  if (!await verifyBusinessInputsCurrent()) return;
+  if (!session.canSubmitConclusion('comment') && !session.canSubmitConclusion('request-changes')) {
     const c = session.totalCoverage();
     const reasons: string[] = [];
     if (c.filesReady < c.filesTotal) {
@@ -3937,12 +4198,15 @@ async function submitConclusion(): Promise<void> {
     if (!session.globalConfirmed) {
       reasons.push(m().conclusion.gateGlobalUnconfirmed);
     }
-    void vscode.window.showWarningMessage(m().conclusion.gateFailed(reasons.join(m().common.listSep)));
+    void vscode.window.showWarningMessage(m().conclusion.gateFailed((session.businessReview ? businessBlockers(session.businessReview) : reasons).join(m().common.listSep)));
     return;
   }
 
   const reviewedSet = session.reviewSet;
   const reviewedSnapshot = session.snapshot;
+  const reviewedBusinessId = session.businessReview?.id;
+  const sameConclusionContext = () => session.reviewSet === reviewedSet && session.snapshot === reviewedSnapshot
+    && session.businessReview?.id === reviewedBusinessId;
   if (!reviewedSnapshot) {
     void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
     return;
@@ -3958,7 +4222,7 @@ async function submitConclusion(): Promise<void> {
   if (!choice) {
     return;
   }
-  if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(choice.value === 'changes' ? 'request-changes' : choice.value)) {
+  if (!sameConclusionContext() || !session.canSubmitConclusion(choice.value === 'changes' ? 'request-changes' : choice.value)) {
     void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
     return;
   }
@@ -3977,7 +4241,7 @@ async function submitConclusion(): Promise<void> {
     if (confirm !== m().conclusion.submitToGitHub) {
       return;
     }
-    if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(conclusionVerdict)) {
+    if (!sameConclusionContext() || !session.canSubmitConclusion(conclusionVerdict)) {
       void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
       return;
     }
@@ -3986,16 +4250,22 @@ async function submitConclusion(): Promise<void> {
       return;
     }
     const c = session.totalCoverage();
-    const body = `${m().conclusion.prBody(c.filesReady, c.filesTotal)}\n\n${session.requirementStatus}`;
+    const body = session.businessReview
+      ? businessConclusionSummary(session.businessReview)
+      : `${m().conclusion.prBody(c.filesReady, c.filesTotal)}\n\n${session.requirementStatus}`;
     const pending = [...session.pendingComments];
     try {
       if (reviewedSet.source) {
         const match = /^([^/]+)\/(.+)$/.exec(reviewedSet.repositoryIdentity ?? '');
         if (!match) throw new Error(m().scope.prSnapshotChanged);
         const target = { host: match[1], nameWithOwner: match[2] };
-        const current = await getPrByNumber(cwd, prNumber, target);
-        if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(conclusionVerdict)) throw new Error(m().scope.prSnapshotChanged);
-        assertPrSnapshotCurrent(reviewedSet, current);
+        if (reviewedBusinessId) {
+          if (!await verifyBusinessInputsCurrent()) return;
+        } else {
+          const current = await getPrByNumber(cwd, prNumber, target);
+          assertPrSnapshotCurrent(reviewedSet, current);
+        }
+        if (!sameConclusionContext() || !session.canSubmitConclusion(conclusionVerdict)) throw new Error(m().scope.prSnapshotChanged);
         await submitPrReviewWithComments(
           cwd, prNumber, reviewedSet.headSha, conclusionVerdict, body,
           pending.map((pc) => ({ path: pc.path, startLine: pc.startLine, endLine: pc.endLine, body: pc.body })), target,
@@ -4018,20 +4288,24 @@ async function submitConclusion(): Promise<void> {
         await submitPrReview(cwd, prNumber, conclusionVerdict, body);
       }
       await session.recordPostedConclusion(reviewedSnapshot, {
+        businessRunId: reviewedBusinessId,
         verdict: conclusionVerdict,
         label: cleanLabel,
         target: 'pr',
         prNumber,
         submittedAt: Date.now(),
       }, pending.map((comment) => comment.id));
-      transientInfo(m().conclusion.postedToPr(prNumber, cleanLabel));
+      if (sameConclusionContext() && session.businessReview?.status !== 'stale') transientInfo(m().conclusion.postedToPr(prNumber, cleanLabel));
+      else transientWarning(`${m().conclusion.postedToPr(prNumber, cleanLabel)} · ${m().businessReview.postedOlder}`);
     } catch (err) {
       reportError(err);
     }
     return;
   }
 
+  if (!await verifyBusinessInputsCurrent() || !sameConclusionContext()) return;
   session.setConclusion({
+    businessRunId: reviewedBusinessId,
     verdict: conclusionVerdict,
     label: cleanLabel,
     target: 'local',

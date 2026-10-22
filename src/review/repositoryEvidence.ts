@@ -56,7 +56,7 @@ export interface RepositoryEvidenceServices {
 export interface RepositoryEvidenceRequest {
   cwd: string;
   sourcePath: string;
-  sourceDocument: vscode.TextDocument;
+  sourceDocument: Pick<vscode.TextDocument, 'uri' | 'getText' | 'lineCount' | 'lineAt' | 'positionAt'>;
   candidates: FileFindingCandidate[];
   /** Review-set files are searched before the wider repository fallback. */
   preferredPaths?: readonly string[];
@@ -112,6 +112,10 @@ const defaultServices: RepositoryEvidenceServices = {
     vscode.Uri.joinPath(vscode.Uri.file(cwd), ...relativePath.split('/')),
   now: () => Date.now(),
 };
+
+export function createRepositoryEvidenceServices(): RepositoryEvidenceServices {
+  return { ...defaultServices };
+}
 
 function simpleSymbol(symbol: string): string {
   const parts = symbol.trim().replace(/\(\s*\)$/, '').split(/[.:#/\\]/);
@@ -228,7 +232,7 @@ function rankPaths(
 }
 
 function queryPosition(
-  document: vscode.TextDocument,
+  document: Pick<vscode.TextDocument, 'getText' | 'lineCount' | 'lineAt' | 'positionAt'>,
   candidate: FileFindingCandidate,
   query: EvidenceQuery,
 ): vscode.Position | undefined {

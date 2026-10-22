@@ -3,6 +3,7 @@ import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
 import type { ReviewComparison, ReviewSource } from '../scope/types';
 import { restoreRequirementsDraft, type RequirementsDraft, type RequirementPreparationRecord } from './requirements';
 import { m } from '../i18n';
+import type { BusinessReviewRun } from './businessReview';
 
 /** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
 export interface Annotation {
@@ -50,6 +51,7 @@ export interface FindingDisposition {
 
 /** The reviewer's final verdict for a review, persisted once submitted. */
 export interface ReviewConclusion {
+  businessRunId?: string;
   /** Machine-readable verdict. */
   verdict: 'approve' | 'request-changes' | 'comment';
   /** Human-readable label shown in the UI. */
@@ -89,6 +91,7 @@ export interface ReviewSnapshot {
   source?: ReviewSource;
   comparison?: ReviewComparison;
   requirements?: RequirementsDraft;
+  businessReview?: BusinessReviewRun;
   repo: string;
   /** Stable id of the review scope (selected files / PR / branch / working tree). */
   scopeId: string;
@@ -111,6 +114,7 @@ export interface ReviewSnapshot {
   globalFixDispositions?: Record<string, FindingDisposition>;
   /** The reviewer's final verdict, once submitted. */
   conclusion?: ReviewConclusion;
+  postedConclusions?: ReviewConclusion[];
   /** Draft PR review comments awaiting submission (pending-review model). */
   pendingComments?: PendingComment[];
   /** Estimated LLM token usage accumulated over this review (approximate). */

@@ -34,7 +34,7 @@ English | [简体中文](README.zh-CN.md)
 - Immutable snapshots do not apply or revert fixes against a different working tree. Explicitly select a local-file review to edit; verified delivery to the PR head is a later implementation stage.
 - Persistence uses canonical repository-path identities, with commit/base/scope isolation for snapshots. Same-name folders do not share reviews. Ambiguous legacy folder-name history remains available as a separate archive, without automatically reusing approvals or patches.
 
-Development status: the scope foundation and M2 requirement preparation in the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md) are connected, not the entire vNext. Requirement-aware business-chain orchestration, the final three-stage workspace, and Reviewer Reply/Resolve remain later milestones. Snapshot evidence uses bounded text searches rather than language services for another working-tree version; context-limited analyses are not counted as fully ready.
+Development status: the scope foundation, M2 preparation and the M3 requirement-aware review slice in the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md) are connected, not the entire vNext. The final three-stage workspace, Reviewer Reply/Resolve and real-model semantic evaluation remain outstanding. Snapshot evidence uses bounded searches, never another branch's language services.
 
 ### Requirement preparation (M2)
 
@@ -46,7 +46,19 @@ Development status: the scope foundation and M2 requirement preparation in the [
 - Model errors, cancellation and unavailable models preserve material without auto-confirmation or reverse-engineering requirements from code. Explicit technical-only continuation does not erase known code issues and still requires the technical review gate.
 - Each material is limited to 512,000 bytes, with at most 12 materials. Model input is also checked against 120,000 characters and the selected model's token limit; oversized content is rejected rather than silently truncated.
 
-**Current boundary: confirming understanding is not a requirement-satisfaction review.** Until M3 is connected, the workbench, source view, global report, posted review and export retain “requirement consistency not assessed.” The older technical analyzer cannot approve unassessed requirements unless a technical-only scope was explicitly selected; bounded technical feedback still follows the existing gate.
+**Confirmation establishes intent and scope, not correctness or satisfaction.** It now starts M3 automatically. Until the current business review produces valid conclusions, requirement consistency remains unassessed; the older file/global analyzer cannot substitute for this workflow.
+
+### Requirement-aware business review (M3 development slice)
+
+- One confirmation or the workbench's business-review button runs planning, complete source segments, independent global discovery, requested contract/counterevidence, candidate verification and per-requirement/premise assessment. Opening or scrolling every file is not a prerequisite.
+- Source intervals, old/new sides, hashes and exact quotations are tracked. Added files have no invented old side; deletion and rename baselines retain their original paths. Missing facts remain unknown; upstream safeguards can overturn local suspicions, and invalid requirement premises are classified separately from implementation defects.
+- Known critical questions survive retries, technical-only mode and changed requirement identities. Notes, model agreement, confirmation or re-uploading the same normative text do not clear them. Only independently supported current facts can close them.
+- Cancellation, failures, input changes and limits retain incomplete results. Exact-input completed calls can be reused; restored running work is interrupted, not silently completed. Current branch/PR endpoints, code and local requirement files are checked before using a conclusion.
+- Approval requires complete source coverage and global analysis, no workflow limits/errors, no confirmed defects or decisive unresolved premises, and explicit report acknowledgement. Noncritical unknowns do not automatically prevent approval, but must not be described as satisfied. Partial findings may still support bounded comments or requested changes.
+- The report supports source-snapshot reading and local Markdown export. Existing PR submission publishes only bounded coverage/status metadata and explicitly drafted review comments; private requirement originals, material paths and full source quotations are not automatically copied into its summary. Late receipts cannot approve a newer business run.
+- Engine limits: 80 formal files, 24 units, 16,000-character segments, 100,000-character measured model inputs, 24 evidence requests/related files, 80 candidates, 128 model calls and a 180-second engine budget. The model's token capacity also applies. Startup/submission freshness checks are separate I/O. Limits are visible, not proof of a complete repository review.
+
+This is source/contract reasoning, not executed tests or production calls. Controlled model fixtures validate orchestration and gates, **not real Copilot accuracy**; the independent semantic evaluation remains part of M0/M7.
 
 ### Review workbench
 
