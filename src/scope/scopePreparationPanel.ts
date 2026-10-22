@@ -43,6 +43,9 @@ export interface ScopePreparationOptions {
   modelLabel?(): string;
   pickModel?(): Promise<void>;
   onRendered?(report: { materials: number; items: number; unsafeNodes: number; ready: boolean; error?: string }): void;
+  onDraftChange?(cwd: string, scope: ReviewSet, draft: RequirementsDraft): Promise<void>;
+  onReturn?(stage: 'review' | 'conclusion'): void;
+  fileScope?: { cwd: string; set: ReviewSet };
 }
 
 export function validatePreparedScope(data: RepositoryData | undefined, input: Record<string, unknown>): PreparedScopeChoice {
@@ -135,9 +138,13 @@ export function createScopePreparation(
       })), html: understandingHtml(draft),
     } });
   };
+  const notifyDraft = async () => {
+    if (data && pinned) await options.onDraftChange?.(data.cwd, pinned, structuredClone(draft));
+  };
   const save = async () => {
     if (!data || storageBlocked) throw new Error(m().requirements.loadFailed);
     await options.save?.(data.cwd, data.repositoryIdentity, { draft: structuredClone(draft), selection: selection ? { ...selection } : undefined });
+    await notifyDraft();
   };
   const choose = (input: Record<string, unknown>) => {
     const next = validatePreparedScope(data, input);
@@ -174,9 +181,11 @@ export function createScopePreparation(
     errorMessage = '';
     publish();
     try {
-      const set = await (options.loadScope ?? loadPreparedScope)(selected);
+      const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
+        ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
       if (disposed || run !== generation || version !== requestVersion) return;
       pinned = set;
+      await notifyDraft();
       await refreshFiles(() => !disposed && run === generation && version === requestVersion);
       if (disposed || run !== generation || version !== requestVersion) return;
       const scopeKey = requirementScopeKey(selected.cwd, set);
@@ -285,6 +294,10 @@ export function createScopePreparation(
       }
       if (input.type === 'cancelAnalysis') { cancel(); errorMessage = m().requirements.canceled; publish(); return; }
       if (input.type === 'cancel') { panel.dispose(); return; }
+      if (input.type === 'return' && (input.stage === 'review' || input.stage === 'conclusion')) {
+        if (!options.onReturn) throw new Error(m().scope.staleSelection);
+        cancel(); settled = true; options.onReturn(input.stage); finish(undefined); panel.dispose(); return;
+      }
       if (input.type === 'model') { cancel(); await options.pickModel?.(); if (run === generation) publish(); return; }
       if (input.type === 'editRequirement' && typeof input.id === 'string') {
         const item = draft.understanding?.requirements.find((entry) => entry.id === input.id);
@@ -296,14 +309,15 @@ export function createScopePreparation(
         const selected = input.kind === 'files' && typeof input.cwd === 'string' && (input.cwd === selectedRoot || input.cwd === data?.cwd)
           ? { cwd: await realpath(selectedRoot), kind: 'files' as const }
           : choose(input);
-        if (selected.kind === 'files') { settled = true; finish(selected); panel.dispose(); return; }
+        if (selected.kind === 'files' && input.confirmed !== true && input.technicalOnly !== true) { settled = true; finish(selected); panel.dispose(); return; }
         cancel();
         const previousKey = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
         const version = requestVersion;
         inputVersion = version;
         reading = true; publish();
         try {
-          const set = await (options.loadScope ?? loadPreparedScope)(selected);
+          const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
+            ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
           if (run !== generation || version !== requestVersion || disposed) return;
           const key = requirementScopeKey(selected.cwd, set);
           pinned = set;
@@ -393,6 +407,6 @@ export function createScopePreparation(
       }
     }
   });
-  panel.webview.html = scopePreparationView(defaultCwd, initialKind);
+  panel.webview.html = scopePreparationView(defaultCwd, initialKind, !!options.onReturn, options.fileScope?.cwd);
   return { result, ready, dispose: () => panel.dispose() };
 }

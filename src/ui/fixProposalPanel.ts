@@ -58,6 +58,8 @@ export interface FixProposalRequest {
   onUndone?: () => void;
   /** Revalidates that the finding is still actionable immediately before writing. */
   canApply?: () => boolean;
+  beforeApply?: () => Promise<void>;
+  canUndo?: () => boolean;
 }
 
 interface ProposalView {
@@ -199,8 +201,11 @@ export class FixProposalPanel {
     if (!inst || inst.request.cacheKey === cacheKey) {
       return false;
     }
-    const cached = FixProposalPanel.cache.get(cacheKey);
-    return Boolean(cached?.proposals.length);
+    return FixProposalPanel.hasCached(cacheKey);
+  }
+
+  static hasCached(cacheKey: string): boolean {
+    return Boolean(FixProposalPanel.cache.get(cacheKey)?.proposals.length);
   }
 
   /** Re-renders the open panel in the current language (after a language switch). */
@@ -521,6 +526,16 @@ export class FixProposalPanel {
       this.panel.dispose();
       return;
     }
+    const beforeApply = this.request.beforeApply;
+    if (beforeApply) {
+      const request = this.request;
+      try { await beforeApply(); }
+      catch (error) { this.markProposalError(idx, String(error)); return; }
+      if (this.request !== request || this.request.canApply && !this.request.canApply()) {
+        void vscode.window.showWarningMessage(m().fixPanel.findingNoLongerActionable);
+        return;
+      }
+    }
     // These proposals are mutually-exclusive alternatives: at most one may be
     // applied at a time. If another is already applied, refuse and tell the user
     // to undo it first (rather than silently stacking two alternatives).
@@ -607,6 +622,11 @@ export class FixProposalPanel {
     if (this.state.kind !== 'ready') {
       return;
     }
+    const request = this.request;
+    if (request.canUndo && !request.canUndo()) {
+      void vscode.window.showWarningMessage(m().fixPanel.findingNoLongerActionable);
+      return;
+    }
     const content = await this.currentFileText();
     for (const e of proposal.edits) {
       const matches = looseMatches(content, e.newText).length;
@@ -628,6 +648,10 @@ export class FixProposalPanel {
       ...(e.startLine ? { startLine: e.startLine } : {}),
       ...(e.endLine ? { endLine: e.endLine } : {}),
     }));
+    if (this.request !== request || request.canUndo && !request.canUndo()) {
+      void vscode.window.showWarningMessage(m().fixPanel.findingNoLongerActionable);
+      return;
+    }
     const ok = await this.applyEdits(reversed);
     if (!ok) {
       void vscode.window.showWarningMessage(m().fixPanel.undoRace);
@@ -1051,6 +1075,7 @@ function normaliseCached(
  * Falls back to Beside when the document view's column is unknown.
  */
 function fixProposalColumn(): vscode.ViewColumn {
+  if (DocumentPanel.isEmbedded) return DocumentPanel.viewColumn ?? vscode.ViewColumn.Active;
   const docCol = DocumentPanel.viewColumn;
   if (typeof docCol === 'number') {
     return (docCol + 1) as vscode.ViewColumn;

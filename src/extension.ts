@@ -43,18 +43,26 @@ import {
   tryLoadPreferredScope,
   type PreferredScopeKind,
 } from './scope/scopePicker';
-import { FileSystemScope, PrByNumberScope, BranchSnapshotScope, assertPrSnapshotCurrent } from './scope/scopes';
+import { FileSystemScope, PrByNumberScope, BranchSnapshotScope } from './scope/scopes';
 import { currentBranch, listBranches, readFileAtRef, repositoryRoot } from './scope/gitClient';
 import { CommitSource } from './review/commitSource';
 import { businessBaseline, businessBindingKey, businessBlockers, businessHash, businessKnownCritical, coverageComplete, type BusinessCitation } from './review/businessReview';
 import { runBusinessReview, type BusinessLegacyCandidate } from './review/businessReviewEngine';
 import { BusinessReviewSource } from './review/businessReviewSource';
 import { BusinessReviewPanel, businessConclusionSummary, businessReportMarkdown } from './ui/businessReviewPanel';
+import { buildReviewCenterState, centerReferenceId, centerReferences, reviewCenterContextKey, type CenterAction, type CenterReference } from './ui/reviewCenterState';
+import { ReviewCenterController, type CenterFileTarget } from './review/reviewCenterController';
+import { captureReviewFileAction } from './review/reviewWorkspace';
+import { businessReviewPrompt } from './ai/businessReviewPrompts';
+import { publishConclusionDraft } from './review/conclusionPublisher';
+import { ConclusionDraftDataError } from './review/conclusionDraft';
+import { createRequirementsDraft, requirementScopeKey } from './review/requirements';
+import { renderRequirementMarkdown } from './ui/requirementMarkdown';
 import { realpath } from 'node:fs/promises';
-import type { ScopePreparationOptions } from './scope/scopePreparationPanel';
+import type { PreparedScopeChoice, ScopePreparationOptions } from './scope/scopePreparationPanel';
 import { repositoryStorageId } from './review/repositoryIdentity';
 import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
-import { getPrByNumber, submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
+import { submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchProgressReporter, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
@@ -146,6 +154,21 @@ interface BusinessReviewContext {
   stale: boolean;
 }
 let businessContext: BusinessReviewContext | undefined;
+let centerController: ReviewCenterController | undefined;
+let restoringCenterSource: string | undefined;
+let lastBusinessSourceSignature: string | undefined;
+
+export interface ReviewExtensionApi {
+  test?: {
+    session: ReviewSession;
+    workspaceState: vscode.Memento;
+    loadBranch(cwd: string, head: string, base?: string): Promise<ReviewSet>;
+    open(): Promise<void>;
+    action(message: Omit<CenterAction, 'type' | 'contextKey'>): Promise<void>;
+    recordLocal(): Promise<void>;
+    document(): { path?: string; revision?: string; contextKey?: string; readOnly: boolean; embedded: boolean; loaded: boolean };
+  };
+}
 /** In-flight whole-document (bilingual) translation, so it can be de-duped per
  *  file and cancelled when the reviewer switches to another file. */
 let activeDocTranslation: { path: string; cts: vscode.CancellationTokenSource } | undefined;
@@ -839,7 +862,7 @@ function rehydrateAppliedFixes(): void {
   }
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): ReviewExtensionApi | undefined {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
   reviewStore = store;
@@ -910,6 +933,18 @@ export function activate(context: vscode.ExtensionContext): void {
         context.stale = true;
         context.cts.cancel();
       }
+      const selection = session.workspaceView.selection;
+      const selectedId = selection.kind === 'finding' ? selection.id : undefined;
+      const selected = selectedId ? session.businessReview?.findings.find((finding) => finding.id === selectedId) : undefined;
+      const signature = businessHash(JSON.stringify([session.businessReview?.id, session.businessReview?.status, selected]));
+      if (signature !== lastBusinessSourceSignature) {
+        lastBusinessSourceSignature = signature;
+        const path = DocumentPanel.currentPath;
+        const generation = openFileGeneration;
+        if (path && !DocumentPanel.isReadOnly) queueMicrotask(() => {
+          if (generation === openFileGeneration && DocumentPanel.currentPath === path && session.workspaceView.stage === 'review') void refreshDocPanel(path);
+        });
+      }
       WorkbenchPanel.refreshIfOpen(change.filePath);
       BusinessReviewPanel.refreshIfOpen(session.businessReview);
     }),
@@ -959,6 +994,36 @@ export function activate(context: vscode.ExtensionContext): void {
   // Activation setup is done; swap the status bar spinner for the real icon so
   // users only click once it can actually open the workbench.
   markStatusBarReady();
+  if (context.extensionMode === vscode.ExtensionMode.Test
+    || context.extensionMode === vscode.ExtensionMode.Development && process.env.CODEREVIEW_HOST_TEST_ROOT && process.env.CODEREVIEW_HOST_TEST_RESULT) {
+    return { test: {
+      session, workspaceState: context.workspaceState,
+      loadBranch: async (cwd, head, base) => {
+        const scope = new BranchSnapshotScope(head, base);
+        const set = await scope.load(cwd);
+        await activateReviewSet(set, cwd);
+        persistScope(scope, set, session.getCwd() ?? cwd);
+        return session.reviewSet!;
+      },
+      open: openWorkbench,
+      action: (message) => handleCenterAction({ ...message, type: 'center', contextKey: reviewCenterContextKey(session) }),
+      recordLocal: async () => {
+        if (!session.reviewSet || /^pr-/.test(session.reviewSet.scopeId)) throw new Error('Host fixture permits local conclusions only.');
+        const draft = session.conclusionDraft;
+        if (!draft?.previewKey) throw new ConclusionDraftDataError();
+        await publishConclusionDraft(session, { id: draft.id, revision: draft.revision, previewKey: draft.previewKey }, {
+          busy: () => !!businessContext || analyzingPaths.size > 0 || globalAnalysisInFlight,
+          fresh: verifyBusinessInputsCurrent, confirm: async () => true,
+          post: async () => { throw new Error('Host fixture must not publish to GitHub.'); },
+        });
+      },
+      document: () => ({
+        path: DocumentPanel.currentPath, revision: DocumentPanel.revision, contextKey: DocumentPanel.contextKey,
+        readOnly: DocumentPanel.isReadOnly, embedded: DocumentPanel.isEmbedded, loaded: DocumentPanel.isLoaded,
+      }),
+    } };
+  }
+  return undefined;
 }
 
 /**
@@ -1218,6 +1283,8 @@ async function startReview(kind?: string): Promise<void> {
     return;
   }
   scopePickInFlight = true;
+  const previousStage = session.workspaceView.stage;
+  if (session.snapshot) session.setWorkspaceView({ stage: 'prepare' });
   try {
     const picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind, requirementPreparationOptions());
     if (!picked) return;
@@ -1227,6 +1294,7 @@ async function startReview(kind?: string): Promise<void> {
       if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
       await activateReviewSet(reviewSet, cwd);
       if (picked.requirements) await session.setRequirements(picked.requirements);
+      session.setWorkspaceView({ stage: 'review' });
       persistScope(source, reviewSet, session.getCwd() ?? cwd);
       void vscode.commands.executeCommand('setContext', 'codereview.active', true);
       await openWorkbench();
@@ -1236,15 +1304,40 @@ async function startReview(kind?: string): Promise<void> {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
     scopePickInFlight = false;
+    if (session.snapshot && session.workspaceView.stage === 'prepare') session.setWorkspaceView({ stage: previousStage === 'prepare' ? 'review' : previousStage });
   }
 }
 
 function requirementPreparationOptions(): ScopePreparationOptions {
+  const current = session.reviewSet;
+  const currentCwd = session.getCwd();
   return {
-    load: (cwd, identity) => reviewStore.loadRequirementPreparation(repositoryStorageId(cwd, identity)),
+    load: (cwd, identity) => {
+      if (current && currentCwd === cwd && (!current.source || current.repositoryIdentity === identity)) {
+        const pr = current.scopeId.match(/^pr-(\d+)$/);
+        const selection: PreparedScopeChoice = pr ? { cwd, kind: 'pr', prNumber: Number(pr[1]) }
+          : current.source ? { cwd, kind: current.source.baseRef ? 'branchChanges' : 'branchFull', headRef: current.source.headRef, baseRef: current.source.baseRef }
+            : { cwd, kind: 'files' };
+        return Promise.resolve({ draft: session.requirements ? structuredClone(session.requirements) : createRequirementsDraft(), selection });
+      }
+      return reviewStore.loadRequirementPreparation(repositoryStorageId(cwd, identity));
+    },
+    fileScope: current && !current.source && current.scopeId.startsWith('files-') && currentCwd ? { cwd: currentCwd, set: current } : undefined,
     save: (cwd, identity, record) => reviewStore.saveRequirementPreparation(repositoryStorageId(cwd, identity), record),
     modelLabel: () => models.label,
     pickModel: selectModel,
+    onDraftChange: async (cwd, set, draft) => {
+      if (session.reviewSet && session.getCwd() === cwd && requirementScopeKey(cwd, set) === requirementScopeKey(cwd, session.reviewSet)) {
+        await session.setRequirements(draft);
+      }
+    },
+    onReturn: session.reviewSet ? (stage) => {
+      session.setWorkspaceView({ stage });
+      if (stage === 'conclusion' && session.snapshot?.conclusionDraft === undefined) {
+        void session.generateConclusionDraft(defaultCenterBody()).catch(reportError);
+      }
+      setTimeout(() => void openWorkbench(), 0);
+    } : undefined,
     analyze: async (draft, scope, token, usage) => {
       const model = await models.resolve();
       if (!model) throw new AnalysisError(m().requirements.noModel);
@@ -1286,6 +1379,11 @@ async function startBusinessReview(): Promise<void> {
     const model = await models.resolve();
     if (!sameInputs() || cts.token.isCancellationRequested) return;
     if (!model) throw new AnalysisError(m().requirements.noModel);
+    const outputLanguage = resolveLanguage();
+    const inputVersion = businessHash(JSON.stringify([
+      outputLanguage, model.version, model.vendor, model.family,
+      (['plan', 'discover', 'global', 'verify', 'assess'] as const).map(businessReviewPrompt),
+    ]));
     const previous = session.businessReview ? structuredClone(session.businessReview) : undefined;
     const legacy: BusinessLegacyCandidate[] = [
       ...(previous?.findings ?? []).filter((finding) => finding.status !== 'dismissed').map((finding) => {
@@ -1306,15 +1404,15 @@ async function startBusinessReview(): Promise<void> {
       })),
     ];
     await runBusinessReview(set, baseline, {
-      modelId: model.id, token: cts.token, now: Date.now, cancel: () => cts.cancel(),
+      modelId: model.id, inputVersion, token: cts.token, now: Date.now, cancel: () => cts.cancel(),
       isCurrent: () => sameInputs() && !captured.stale,
       read: source.read, readFresh: source.readFresh,
       resolve: (request) => source.resolve(request, cts.token),
-      fits: (phase, payload) => businessReviewInputFits(model, phase, payload, cts.token),
+      fits: (phase, payload) => businessReviewInputFits(model, phase, payload, cts.token, outputLanguage),
       request: (phase, payload) => analyzeBusinessReviewPhase(model, phase, payload, cts.token, (usage) => {
         if (session.snapshot === snapshot) session.recordTokenUsage(usage);
         else console.warn('[codereview] A late token estimate was not attributed to the new review scope.');
-      }),
+      }, outputLanguage),
       update: async (run) => {
         if (!sameInputs()) return;
         captured.runId = run.id;
@@ -1690,7 +1788,294 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     pickLanguageId: (id) => void applyLanguage(id),
     openDynMenu: (kind) => void openDynMenu(kind),
     applyDynMenu: (kind, id) => void applyDynMenu(kind, id),
+    document: docActions(),
+    center: (message) => void handleCenterAction(message),
   };
+}
+
+function reviewCenterController(): ReviewCenterController {
+  if (centerController) return centerController;
+  centerController = new ReviewCenterController(session, {
+    preparing: () => scopePickInFlight || workbenchOpenInFlight,
+    restoreSource: restoreCenterSource,
+    openFile: async (target: CenterFileTarget) => {
+      fixProposalOpenGeneration++;
+      FixProposalPanel.closeIfOpen();
+      if (target.legacyId) await locateInFile(target.path, target.line ?? 1, target.endLine, target.legacyId);
+      else {
+        await openFileInPanel(target.path, target.reference);
+        if (target.line && DocumentPanel.currentPath === target.path && (!target.reference || !DocumentPanel.isReadOnly)) DocumentPanel.scrollTo(target.line, target.endLine);
+      }
+    },
+    openReference: openCenterReference,
+    prepare: async () => { await startReview(); if (session.snapshot && session.workspaceView.stage === 'prepare') session.setWorkspaceView({ stage: 'review' }); },
+    run: startBusinessReview,
+    cancel: cancelBusinessReview,
+    model: selectModel,
+    language: selectLanguage,
+    export: exportReviewReport,
+    confirmReport: async (confirmed) => {
+      if (confirmed && !await verifyBusinessInputsCurrent()) throw new ConclusionDraftDataError(m().businessReview.verifyCurrent);
+      session.confirmBusinessReview(confirmed);
+    },
+    note: recordCenterNote,
+    fix: async (target) => {
+      if (target.business) await openBusinessFix(target.id);
+      else if (target.path) {
+        const finding = session.findings(target.path).find((finding) => finding.id === target.id);
+        if (!finding) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+        await openFixProposal(target.path, finding);
+      }
+      else throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+    },
+    defaultBody: defaultCenterBody,
+    findingBody: (id) => {
+      const finding = session.businessReview?.findings.find((finding) => finding.id === id);
+      if (!finding) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+      const t = m().businessReview;
+      return [
+        `### ${t[finding.kind]} · ${finding.title}`, `${t[finding.status]} · ${t[finding.severity]} · ${t[finding.attribution]}`,
+        '', finding.cause, '', finding.trigger, '', finding.impact, '', `${t.counterRationale}: ${finding.counterRationale}`,
+        ...finding.evidence.filter((ref) => ref.kind === 'code').map((ref) => `- \`${ref.path}\` [${ref.side}] L${ref.line}–${ref.endLine}`),
+      ].join('\n');
+    },
+    confirmReplace: async () => await vscode.window.showWarningMessage(m().reviewCenter.confirmReplaceDraft, { modal: true }, m().reviewCenter.replaceDraft) === m().reviewCenter.replaceDraft,
+    confirmRemoteCheck: async () => await vscode.window.showWarningMessage(m().reviewCenter.confirmRemoteCheck, { modal: true }, m().reviewCenter.remoteChecked) === m().reviewCenter.remoteChecked,
+    publish: publishCenterConclusion,
+    legacyAnalyze: async () => {
+      const path = session.workspaceView.source;
+      if (path?.kind !== 'file' || DocumentPanel.isReadOnly) throw new ConclusionDraftDataError(m().reviewCenter.readOnlyEvidence);
+      await analyzeByPath(path.path);
+    },
+    legacyGlobal: async () => { if (globalAnalysisInFlight) cancelGlobalAnalysis(); else await runGlobalAnalysis(); },
+  });
+  return centerController;
+}
+
+function defaultCenterBody(): string {
+  if (session.businessReview) return businessConclusionSummary(session.businessReview);
+  const coverage = session.totalCoverage();
+  return `${m().conclusion.prBody(coverage.filesReady, coverage.filesTotal)}\n\n${session.requirementStatus}\n\n${m().businessReview.boundary}`;
+}
+
+async function handleCenterAction(message: CenterAction): Promise<void> {
+  try {
+    const result = await reviewCenterController().handle(message);
+    WorkbenchPanel.postCenterResult(message, undefined, result.preview);
+  } catch (error) {
+    WorkbenchPanel.postCenterResult(message, String(error));
+    reportError(error);
+  }
+}
+
+async function restoreCenterSource(): Promise<void> {
+  const view = session.workspaceView;
+  const source = view.source;
+  const key = `${view.scopeKey}:${JSON.stringify(source)}`;
+  if (restoringCenterSource === key) return;
+  if (DocumentPanel.currentPath && (source?.kind === 'file' && DocumentPanel.currentPath === source.path && !DocumentPanel.isReadOnly
+    || source?.kind === 'reference' && DocumentPanel.contextKey === `${view.scopeKey}:reference:${source.id}`)) return;
+  restoringCenterSource = key;
+  try {
+    if (source?.kind === 'reference') {
+      const reference = centerReferences(session).get(source.id);
+      if (!reference) throw new ConclusionDraftDataError(m().businessReview.invalidCitation);
+      await openCenterReference(source.id, reference);
+    } else {
+      const path = source?.kind === 'file' ? source.path : session.reviewSet?.files.find((file) => !file.context)?.path;
+      if (path) await openFileInPanel(path);
+    }
+  } finally {
+    if (restoringCenterSource === key) restoringCenterSource = undefined;
+  }
+}
+
+async function recordCenterNote(id: string): Promise<void> {
+  const runId = session.businessReview?.id;
+  const snapshot = session.snapshot;
+  if (!runId) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  const reason = await vscode.window.showInputBox({
+    title: m().businessReview.comment, prompt: m().businessReview.notePrompt, ignoreFocusOut: true,
+    validateInput: (value) => value.trim() ? undefined : m().businessReview.notePrompt,
+  });
+  if (!reason) return;
+  if (session.snapshot !== snapshot || session.businessReview?.id !== runId || !await verifyBusinessInputsCurrent()) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  session.recordBusinessNote(id, reason);
+}
+
+async function openBusinessFix(id: string): Promise<void> {
+  if (!ensureWorkingTreeReview()) return;
+  const run = session.businessReview;
+  const snapshot = session.snapshot;
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
+  const finding = run?.findings.find((finding) => finding.id === id);
+  if (!run || !snapshot || !set || !cwd || !finding || finding.kind !== 'implementation' || finding.status !== 'confirmed'
+    || businessContext) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  const cacheKey = (path: string) => `business-fix:${run.bindingKey}:${run.id}:${id}:${path}:${run.dependencies[`head:${path}`]}`;
+  const targets = set.files.filter((file) => !file.context && file.status !== 'deleted' && run.dependencies[`head:${file.path}`]
+    && (session.businessReviewCurrent || FixProposalPanel.hasCached(cacheKey(file.path))));
+  if (!targets.length) throw new ConclusionDraftDataError(m().reviewCenter.staleFix);
+  const generation = ++fixProposalOpenGeneration;
+  FixProposalPanel.closeIfOpen();
+  const same = () => session.snapshot === snapshot && session.reviewSet === set && session.businessReview?.id === run.id && generation === fixProposalOpenGeneration;
+  const target = targets.length === 1 ? targets[0].path : (await vscode.window.showQuickPick(targets.map((file) => ({
+    label: file.path,
+    description: finding.evidence.filter((ref) => ref.kind === 'code' && ref.side === 'head' && ref.path === file.path)
+      .map((ref) => `L${ref.line}–${ref.endLine}`).join(', ') || m().reviewCenter.formalFiles,
+    path: file.path,
+  })), { title: m().reviewCenter.fixTarget, placeHolder: m().reviewCenter.fixTargetHint, ignoreFocusOut: true, matchOnDescription: true }))?.path;
+  if (!target) return;
+  if (!same()) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  const sourceHash = run.dependencies[`head:${target}`];
+  const ref = finding.evidence.find((ref) => ref.kind === 'code' && ref.side === 'head' && ref.path === target);
+  const source = new BusinessReviewSource(cwd, set);
+  const draft = session.requirements ? structuredClone(session.requirements) : undefined;
+  const current = () => same() && session.businessReviewCurrent && session.businessReview?.findings.some((item) => item.id === id && item.status === 'confirmed') === true;
+  const validate = async () => {
+    if (!current()) throw new Error(m().businessReview.staleReport);
+    await source.assertCurrent(draft, run);
+    if (!current()) throw new Error(m().businessReview.staleReport);
+  };
+  const cacheOnly = !current();
+  if (cacheOnly) {
+    if (!FixProposalPanel.hasCached(cacheKey(target))) throw new ConclusionDraftDataError(m().reviewCenter.staleFix);
+    transientWarning(m().reviewCenter.staleFix);
+  } else await validate();
+  if (!same()) return;
+  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), target);
+  FixProposalPanel.show({
+    rel: target, localizationScope: { kind: 'file', rel: target },
+    cacheKey: cacheKey(target), fileUri,
+    finding: {
+      id, line: ref?.line ?? 1, title: finding.title,
+      detail: `${finding.cause}\n${finding.trigger}\n${finding.impact}\n${finding.counterRationale}`,
+    },
+    getDisplayFinding: () => ({ title: finding.title, detail: `${finding.cause}\n${finding.trigger}\n${finding.impact}\n${finding.counterRationale}` }),
+    canApply: current, canUndo: same, beforeApply: validate,
+    generate: async (token, userContext) => {
+      await validate();
+      const model = await models.resolve();
+      if (!model) throw new Error(m().model.noModel);
+      const content = await source.readFresh(target, 'head');
+      if (!current() || token.isCancellationRequested || businessHash(content) !== sourceHash) throw new Error(m().businessReview.staleReport);
+      const rules = run.baseline.requirements.filter((rule) => finding.requirementIds.includes(rule.id)).map((rule) => `${rule.id}: ${rule.text}`).join('\n');
+      const evidence = [...finding.evidence, ...finding.counterEvidence].filter((citation) => citation.kind === 'code')
+        .map((citation) => `${citation.path} [${citation.side}] L${citation.line}–${citation.endLine}\n${citation.quote}`).join('\n\n');
+      return generateFixProposals(model, target, content, {
+        title: finding.title, detail: `${finding.cause}\n${finding.trigger}\n${finding.impact}\n${finding.counterRationale}\n${rules}\n\n${evidence}`,
+      }, token, userContext);
+    },
+    onApplied: () => {
+      if (same()) session.recordBusinessNote(id, `${m().fix.applied} · ${m().businessReview.notTested}`, run.id);
+      else transientWarning(m().businessReview.staleReport);
+    },
+    onUndone: () => {
+      if (same()) session.recordBusinessNote(id, `${m().reviewCenter.undoRecorded} · ${m().businessReview.notTested}`, run.id);
+    },
+    onSplices: (splices) => { if (session.snapshot === snapshot) session.remapSeenAfterSplices(target, splices); },
+    onWillChangeFile: () => beginInternalReviewEdit(fileUri),
+    onFileChangeFinished: () => endInternalReviewEdit(fileUri),
+    onFileChanged: () => {
+      if (session.snapshot !== snapshot) return;
+      reflectReviewInvalidation(session.invalidateAfterFileChange(target), target, false);
+      void reloadDocPanel(target);
+    },
+  }, { cacheOnly });
+}
+
+async function openCenterReference(id: string, reference: CenterReference, quoteOnly = false): Promise<void> {
+  const set = session.reviewSet;
+  const snapshot = session.snapshot;
+  const cwd = session.getCwd();
+  if (!set || !snapshot || !cwd || !centerReferences(session).has(id)) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  const generation = ++openFileGeneration;
+  fixProposalOpenGeneration++;
+  FixProposalPanel.closeIfOpen();
+  activeDocTranslation?.cts.cancel();
+  session.setWorkspaceView({ stage: 'review', source: { kind: 'reference', id } });
+  const path = reference.kind === 'business' ? reference.citation.path : reference.path;
+  DocumentPanel.beginLoading(path);
+  let text: string | undefined;
+  let line = reference.kind === 'business' ? reference.citation.line : reference.line;
+  let description = m().reviewCenter.sourceCurrentRelated;
+  try {
+    if (reference.kind === 'business') {
+      const ref = reference.citation;
+      if (!quoteOnly) {
+        if (ref.kind === 'material') {
+          text = session.requirements?.materials.find((material) => material.id === ref.sourceId)?.versions.find((version) => version.version === ref.version)?.text;
+        } else if (ref.side !== 'material') {
+          text = await new BusinessReviewSource(cwd, set).readFresh(ref.path, ref.side);
+        }
+      }
+      if (generation !== openFileGeneration || session.snapshot !== snapshot) return;
+      const full = text !== undefined && businessHash(text) === ref.sourceHash;
+      description = `${m().reviewCenter.sourceFrozen}\n${path} [${ref.side}] L${ref.line}–${ref.endLine} · sha256 ${ref.sourceHash}`;
+      if (!full) {
+        description = `${m().reviewCenter.sourceHistorical}\n${description}`;
+        text = ref.quote;
+        line = 1;
+        WorkbenchPanel.flashNotice(m().reviewCenter.sourceHistorical, 'warn');
+      }
+    } else {
+      const old = set.files.some((file) => file.status === 'deleted' && file.path === path || file.previousPath === path);
+      text = await new BusinessReviewSource(cwd, set).readFresh(path, old && set.comparison ? 'base' : 'head');
+      description += `\n${path} · ${old && set.comparison ? set.comparison.baseSha : set.headSha}`;
+    }
+  } catch (error) {
+    if (generation !== openFileGeneration || session.snapshot !== snapshot) return;
+    if (reference.kind !== 'business') { DocumentPanel.restoreTitle(); throw error; }
+    text = reference.citation.quote; line = 1;
+    description = `${m().reviewCenter.sourceHistorical}\n${path} · ${String(error)}`;
+    WorkbenchPanel.flashNotice(description, 'warn');
+  }
+  if (text === undefined || generation !== openFileGeneration || session.snapshot !== snapshot) return;
+  const material = reference.kind === 'business' && reference.citation.kind === 'material'
+    ? session.requirements?.materials.find((material) => material.id === reference.citation.sourceId) : undefined;
+  const render = renderDocument(text, material ? 'markdown' : languageIdFor(path), path);
+  DocumentPanel.show({
+    path, name: material?.name ?? path.split(/[\\/]/).pop() ?? path, revision: render.revision,
+    contextKey: `${session.workspaceView.scopeKey}:reference:${id}`, readOnly: true, sourceDescription: description,
+    isMarkdown: render.isMarkdown, readingHtml: render.isMarkdown ? renderRequirementMarkdown(text) : undefined,
+    sourceLines: render.sourceLines, raw: text.split(/\r?\n/), defaultToDiff: false, seen: [], findings: [], annotations: [], analyzing: false,
+  }, docActions());
+  DocumentPanel.scrollTo(line);
+}
+
+async function publishCenterConclusion(input: { id: string; revision: number; previewKey: string }): Promise<void> {
+  const set = session.reviewSet;
+  const businessId = session.businessReview?.id;
+  const result = await publishConclusionDraft(session, input, {
+    busy: () => !!businessContext || analyzingPaths.size > 0 || globalAnalysisInFlight || scopePickInFlight,
+    fresh: async () => {
+      if (!await verifyBusinessInputsCurrent()) return false;
+      if (!session.businessReview && session.reviewSet && session.getCwd()) {
+        await new BusinessReviewSource(session.getCwd()!, session.reviewSet).assertCurrent(session.requirements);
+      }
+      return true;
+    },
+    confirm: async (request) => {
+      const pr = request.set.scopeId.match(/^pr-(\d+)$/);
+      const text = pr ? fmt(m().reviewCenter.confirmPublish, request.comments.length,
+        `${request.set.repositoryIdentity ?? session.getRepoLabel()} · PR #${pr[1]}`, request.set.headSha.slice(0, 12))
+        : fmt(m().reviewCenter.confirmLocal, request.set.headSha.slice(0, 12));
+      return await vscode.window.showWarningMessage(text, { modal: true }, pr ? m().reviewCenter.publish : m().reviewCenter.saveLocal)
+        === (pr ? m().reviewCenter.publish : m().reviewCenter.saveLocal);
+    },
+    post: async (request) => {
+      const match = /^([^/]+)\/(.+)$/.exec(request.set.repositoryIdentity ?? '');
+      const pr = request.set.scopeId.match(/^pr-(\d+)$/);
+      if (!match || !pr || !/^[a-f0-9]{40,64}$/i.test(request.set.headSha)) throw new ConclusionDraftDataError(m().scope.prSnapshotChanged);
+      await submitPrReviewWithComments(request.cwd, Number(pr[1]), request.set.headSha, request.verdict, request.body,
+        request.comments.map((comment) => ({ path: comment.path, startLine: comment.startLine, endLine: comment.endLine, body: comment.body })),
+        { host: match[1], nameWithOwner: match[2] });
+    },
+  });
+  if (result !== 'cancelled') {
+    if (session.reviewSet !== set || session.businessReview?.id !== businessId) transientWarning(m().businessReview.postedOlder);
+    else transientInfo(result === 'posted' ? m().conclusion.postedToPr(Number(set?.scopeId.slice(3)), session.conclusion?.label ?? '') : m().conclusion.recordedLocal(session.conclusion?.label ?? ''));
+  }
 }
 
 /**
@@ -1777,6 +2162,7 @@ async function restoreLastScope(
  * ratio the user dragged to.
  */
 async function applyWorkbenchLayout(): Promise<void> {
+  if (DocumentPanel.isEmbedded) return;
   try {
     await vscode.commands.executeCommand('vscode.setEditorLayout', {
       orientation: 0,
@@ -1855,6 +2241,7 @@ function buildWorkbenchFile(file: ReviewFile): WorkbenchFile {
 
 function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState {
   const reviewSet = session.reviewSet;
+  const analysisBusy = analyzingPaths.size > 0 || globalAnalysisInFlight;
   const structureVersion = session.reviewStructureVersion;
   if (workbenchFilesVersion !== structureVersion) {
     workbenchFilesCache = (reviewSet?.files ?? []).map(buildWorkbenchFile);
@@ -1899,8 +2286,8 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
     selected: workbenchSelected,
     findings: selectedFindings,
     coverage: session.totalCoverage(),
-    gatePassed: !businessContext && session.gatePassed(),
-    feedbackAllowed: !businessContext && session.canSubmitConclusion('comment'),
+    gatePassed: !businessContext && !analysisBusy && session.gatePassed(),
+    feedbackAllowed: !businessContext && !analysisBusy && session.canSubmitConclusion('comment'),
     requirementStatus: session.requirementStatus,
     businessReview: session.businessReview || businessContext ? {
       running: !!businessContext,
@@ -1912,6 +2299,10 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
         : m().businessReview.read,
       blockers: businessContext ? [m().businessReview.incomplete] : session.businessReview ? businessBlockers(session.businessReview) : [m().businessReview.incomplete],
     } : undefined,
+    center: reviewSet ? buildReviewCenterState(session, {
+      running: !!businessContext, analysisBusy, globalRunning: globalAnalysisInFlight, publishBusy: session.publicationInFlight,
+      model: models.label, language: resolveLanguage(),
+    }) : undefined,
     globalDone: session.globalConfirmed,
     hasGlobalReport: !!session.globalReport,
     modelLabel: models.label,
@@ -1947,10 +2338,11 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
 }
 
 /** Opens a review file in the document webview beside the workbench. */
-async function openFileInPanel(relPath: string): Promise<void> {
+async function openFileInPanel(relPath: string, expected?: BusinessCitation): Promise<void> {
   if (!ensureReviewPath(relPath, m().actions.open)) {
     return;
   }
+  if (session.snapshot) session.setWorkspaceView({ stage: 'review', source: { kind: 'file', path: relPath } });
   // Switching to a different file invalidates any open fix-proposal panel
   // (it's scoped to one finding in the file we're leaving).
   const previousSelected = workbenchSelected;
@@ -1984,6 +2376,11 @@ async function openFileInPanel(relPath: string): Promise<void> {
   const text = await readReviewFileText(relPath, true);
   if (myGeneration !== openFileGeneration) {
     return; // a newer click superseded us — skip the expensive render + show.
+  }
+  if (expected && businessHash(text) !== expected.sourceHash) {
+    session.invalidateBusinessReview();
+    await openCenterReference(centerReferenceId({ kind: 'business', citation: expected }), { kind: 'business', citation: expected }, true);
+    return;
   }
   const render = renderFor(relPath, text);
   if (myGeneration !== openFileGeneration) {
@@ -2062,7 +2459,7 @@ async function buildAndAttachDocDiff(
 /** Renders (and caches) the highlighted/markdown content for a file. */
 function renderFor(relPath: string, text: string): DocumentRender {
   const cached = docRenderCache.get(relPath);
-  if (cached) {
+  if (cached?.revision === businessHash(text)) {
     return cached;
   }
   const languageId = languageIdFor(relPath);
@@ -2150,17 +2547,20 @@ function buildDocModel(
   const state = session.fileState(relPath);
   const rawLines = render.isMarkdown ? deHighlight(render.sourceLines) : [];
   const lang = resolveLanguage();
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
+  if (!set || !cwd) throw new Error(m().review.notStartedWarn);
   const findings = localizeFindingsNow(relPath, session.findings(relPath), lang);
   const annotations = localizeAnnotationsNow(relPath, session.annotations(relPath), lang);
-  return {
+  const model: DocModel = {
     path: relPath,
     revision: render.revision,
     name: relPath.split('/').pop() ?? relPath,
     sourceDescription: session.reviewSet?.source
       ? isDeletedReviewFile(relPath) && session.reviewSet.comparison
-        ? `${m().scope.deletedSnapshotNotice(session.reviewSet.comparison.baseSha.slice(0, 8))}\n${session.requirementStatus}`
-        : `${m().scope.snapshotNotice(session.reviewSet.source.headRef, session.reviewSet.headSha.slice(0, 8))}\n${session.requirementStatus}`
-      : session.requirementStatus,
+        ? m().scope.deletedSnapshotNotice(session.reviewSet.comparison.baseSha.slice(0, 8))
+        : m().scope.snapshotNotice(session.reviewSet.source.headRef, session.reviewSet.headSha.slice(0, 8))
+      : DocumentPanel.isEmbedded ? `${m().reviewCenter.formalFiles} · sha256 ${render.revision}` : session.requirementStatus,
     isMarkdown: render.isMarkdown,
     readingHtml: render.readingHtml,
     sourceLines: render.sourceLines,
@@ -2207,7 +2607,24 @@ function buildDocModel(
     })),
     analyzing: analyzingPaths.has(relPath),
     translationHtml: workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY)?.[relPath],
+    readOnly: isDeletedReviewFile(relPath),
   };
+  if (!DocumentPanel.isEmbedded && set.source) model.sourceDescription += `\n${session.requirementStatus}`;
+  const selected = session.workspaceView.selection;
+  const selectedId = selected.kind === 'finding' ? selected.id : undefined;
+  const run = session.businessReview;
+  const finding = selectedId ? run?.findings.find((finding) => finding.id === selectedId) : undefined;
+  const ref = finding?.evidence.find((ref) => ref.kind === 'code' && ref.side === 'head' && ref.path === relPath && ref.sourceHash === render.revision);
+  if (finding && ref) model.findings.push({
+    id: finding.id, line: ref.line, endLine: ref.endLine, title: finding.title,
+    detail: `${finding.cause}\n${finding.trigger}\n${finding.impact}`,
+    severity: finding.status === 'dismissed' ? 'suggestion' : finding.severity === 'high' ? 'bug' : 'conditional',
+    business: { kind: finding.kind, status: finding.status, stale: run?.status === 'stale' },
+  });
+  model.contextKey = businessHash(JSON.stringify([
+    requirementScopeKey(cwd, set), render.revision, model.readOnly, model.findings, model.annotations,
+  ]));
+  return model;
 }
 
 /**
@@ -2333,10 +2750,13 @@ function deHighlight(lines: string[]): string[] {
 
 /** Pushes an updated model into the document panel if it shows this file. */
 async function refreshDocPanel(relPath: string): Promise<void> {
+  const snapshot = session.snapshot;
+  const generation = openFileGeneration;
+  if (DocumentPanel.isReadOnly) return;
   const render = docRenderCache.get(relPath);
   if (render && DocumentPanel.currentPath === relPath) {
     const anchors = await computeFindingAnchors(relPath);
-    if (DocumentPanel.currentPath !== relPath) {
+    if (DocumentPanel.currentPath !== relPath || DocumentPanel.isReadOnly || snapshot !== session.snapshot || generation !== openFileGeneration) {
       return;
     }
     DocumentPanel.update(buildDocModel(relPath, render, anchors, docDiffCache.get(relPath)));
@@ -2350,12 +2770,14 @@ async function refreshDocPanel(relPath: string): Promise<void> {
  * (e.g. a Copilot fix was applied).
  */
 async function reloadDocPanel(relPath: string): Promise<void> {
+  const snapshot = session.snapshot;
+  const generation = openFileGeneration;
   if (!isReviewPath(relPath)) {
     docRenderCache.delete(relPath);
     docDiffCache.delete(relPath);
     return;
   }
-  if (DocumentPanel.currentPath !== relPath) {
+  if (DocumentPanel.currentPath !== relPath || DocumentPanel.isReadOnly) {
     docRenderCache.delete(relPath);
     docDiffCache.delete(relPath);
     return;
@@ -2363,14 +2785,16 @@ async function reloadDocPanel(relPath: string): Promise<void> {
   docRenderCache.delete(relPath);
   docDiffCache.delete(relPath);
   const text = await readReviewFileText(relPath);
+  if (snapshot !== session.snapshot || generation !== openFileGeneration) return;
   const render = renderFor(relPath, text);
   const diffLines = await buildDocDiff(relPath, text);
+  if (snapshot !== session.snapshot || generation !== openFileGeneration) return;
   if (diffLines) {
     docDiffCache.set(relPath, diffLines);
   }
   session.setTotalLines(relPath, render.totalLines);
   const anchors = await computeFindingAnchors(relPath);
-  if (DocumentPanel.currentPath !== relPath) {
+  if (DocumentPanel.currentPath !== relPath || DocumentPanel.isReadOnly || snapshot !== session.snapshot || generation !== openFileGeneration) {
     return;
   }
   DocumentPanel.update(buildDocModel(relPath, render, anchors, diffLines));
@@ -2462,11 +2886,35 @@ function docActions() {
     analyze: (path: string) => void analyzeByPath(path),
     jumpNext: (path: string) => jumpToNextUnseen(path),
     focusTree: () => WorkbenchPanel.focusTree(),
+    businessFinding: (id: string) => void handleCenterAction({
+      type: 'center', action: 'select', kind: 'finding', id, contextKey: reviewCenterContextKey(session),
+    }),
   };
 }
 
 function newAnnotationId(): string {
   return `anno-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function captureDocumentAction(path: string) {
+  const snapshot = session.snapshot;
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
+  const revision = DocumentPanel.revision;
+  const contextKey = DocumentPanel.contextKey;
+  if (!snapshot || !set || !cwd || !revision || !session.hasReviewFile(path)
+    || DocumentPanel.currentPath !== path || DocumentPanel.isReadOnly || !DocumentPanel.isLoaded) {
+    transientWarning(m().reviewCenter.staleDocument);
+    return;
+  }
+  const source = new BusinessReviewSource(cwd, set);
+  const visible = () => session.snapshot === snapshot && DocumentPanel.currentPath === path
+    && DocumentPanel.revision === revision && DocumentPanel.contextKey === contextKey && !DocumentPanel.isReadOnly;
+  return {
+    commit: captureReviewFileAction(session, path, revision, () => source.readFresh(path, set.comparison && isDeletedReviewFile(path) ? 'base' : 'head')),
+    visible,
+    finish: () => { if (visible()) DocumentPanel.setAiBusy(path, false); },
+  };
 }
 
 /**
@@ -2488,6 +2936,8 @@ async function addPrComment(
     transientWarning(m().documentPanel.commentNotPr);
     return;
   }
+  const target = captureDocumentAction(relPath);
+  if (!target) return;
   const loc = endLine > startLine ? `${relPath}:${startLine}-${endLine}` : `${relPath}:${startLine}`;
   const input = vscode.window.createInputBox();
   input.title = loc;
@@ -2547,16 +2997,18 @@ async function addPrComment(
   if (!body) {
     return;
   }
-  session.addPendingComment({
-    id: `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    path: relPath,
-    startLine,
-    endLine,
-    body,
-    source: 'manual',
-    createdAt: Date.now(),
-  });
-  transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
+  try {
+    await target.commit(() => session.addPendingComment({
+      id: `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      path: relPath,
+      startLine,
+      endLine,
+      body,
+      source: 'manual',
+      createdAt: Date.now(),
+    }));
+    transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
+  } catch (error) { reportError(error); }
 }
 
 /** Persisted cache of whole-document translations for the side-by-side view (path → translated reading HTML). */
@@ -2635,12 +3087,14 @@ async function annotateWithTranslation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const target = captureDocumentAction(path);
+  if (!target) return;
   // Reuse an existing translation for the same selection (see explanation note).
   const existing = findAnnotation(path, 'translate', text, startLine);
   if (existing) {
-    DocumentPanel.setAiBusy(path, false);
+    target.finish();
     await refreshDocPanel(path);
-    if (existing.endLine > 0) {
+    if (target.visible() && existing.endLine > 0) {
       DocumentPanel.scrollTo(existing.startLine, existing.endLine);
     }
     transientInfo(m().analysis.reuseTranslation);
@@ -2648,7 +3102,7 @@ async function annotateWithTranslation(
   }
   const model = await models.resolve();
   if (!model) {
-    DocumentPanel.setAiBusy(path, false);
+    target.finish();
     void vscode.window.showErrorMessage(m().model.noModel);
     return;
   }
@@ -2666,12 +3120,12 @@ async function annotateWithTranslation(
           content,
           createdAt: Date.now(),
         };
-        session.addAnnotation(path, annotation);
-        refreshDocPanel(path);
+        await target.commit(() => session.addAnnotation(path, annotation));
+        void refreshDocPanel(path);
       } catch (err) {
         reportError(err);
       } finally {
-        DocumentPanel.setAiBusy(path, false);
+        target.finish();
       }
     },
   );
@@ -2733,14 +3187,16 @@ async function annotateWithExplanation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const target = captureDocumentAction(path);
+  if (!target) return;
   // Reuse an existing explanation for the same selection instead of calling the
   // model again (which would append a second, differently-worded card). The
   // result is persisted, so the saved one is what the user asked to "explain".
   const existing = findAnnotation(path, 'explain', text, startLine);
   if (existing) {
-    DocumentPanel.setAiBusy(path, false);
+    target.finish();
     await refreshDocPanel(path);
-    if (existing.endLine > 0) {
+    if (target.visible() && existing.endLine > 0) {
       DocumentPanel.scrollTo(existing.startLine, existing.endLine);
     }
     transientInfo(m().analysis.reuseExplanation);
@@ -2748,7 +3204,7 @@ async function annotateWithExplanation(
   }
   const model = await models.resolve();
   if (!model) {
-    DocumentPanel.setAiBusy(path, false);
+    target.finish();
     void vscode.window.showErrorMessage(m().model.noModel);
     return;
   }
@@ -2766,12 +3222,12 @@ async function annotateWithExplanation(
           content,
           createdAt: Date.now(),
         };
-        session.addAnnotation(path, annotation);
-        refreshDocPanel(path);
+        await target.commit(() => session.addAnnotation(path, annotation));
+        void refreshDocPanel(path);
       } catch (err) {
         reportError(err);
       } finally {
-        DocumentPanel.setAiBusy(path, false);
+        target.finish();
       }
     },
   );
@@ -2784,6 +3240,8 @@ async function annotateWithNote(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const target = captureDocumentAction(path);
+  if (!target) return;
   const note = await vscode.window.showInputBox({
     title: m().annotation.addTitle,
     prompt: startLine > 0 ? m().annotation.linePrompt(startLine, endLine) : m().annotation.selectionPrompt,
@@ -2801,8 +3259,10 @@ async function annotateWithNote(
     content: note,
     createdAt: Date.now(),
   };
-  session.addAnnotation(path, annotation);
-  refreshDocPanel(path);
+  try {
+    await target.commit(() => session.addAnnotation(path, annotation));
+    void refreshDocPanel(path);
+  } catch (error) { reportError(error); }
 }
 
 /**
@@ -3458,6 +3918,7 @@ async function runGlobalAnalysis(): Promise<void> {
   // instead of a parent-window notification, which is easy to miss when the
   // workbench is in its own auxiliary window.
   globalAnalysisInFlight = true;
+  WorkbenchPanel.refreshIfOpen();
   const cts = new vscode.CancellationTokenSource();
   globalAnalysisCts = cts;
   const token = cts.token;
@@ -3510,6 +3971,7 @@ async function runGlobalAnalysis(): Promise<void> {
       globalAnalysisInFlight = false;
       globalAnalysisCts = undefined;
       WorkbenchPanel.setGlobalProgress(false);
+      WorkbenchPanel.refreshIfOpen();
     }
   }
 }
@@ -4188,130 +4650,11 @@ async function submitConclusion(): Promise<void> {
     transientWarning(m().review.notStartedWarn);
     return;
   }
-  if (!await verifyBusinessInputsCurrent()) return;
-  if (!session.canSubmitConclusion('comment') && !session.canSubmitConclusion('request-changes')) {
-    const c = session.totalCoverage();
-    const reasons: string[] = [];
-    if (c.filesReady < c.filesTotal) {
-      reasons.push(m().conclusion.gateFilesUnready(c.filesTotal - c.filesReady));
-    }
-    if (!session.globalConfirmed) {
-      reasons.push(m().conclusion.gateGlobalUnconfirmed);
-    }
-    void vscode.window.showWarningMessage(m().conclusion.gateFailed((session.businessReview ? businessBlockers(session.businessReview) : reasons).join(m().common.listSep)));
-    return;
-  }
-
-  const reviewedSet = session.reviewSet;
-  const reviewedSnapshot = session.snapshot;
-  const reviewedBusinessId = session.businessReview?.id;
-  const sameConclusionContext = () => session.reviewSet === reviewedSet && session.snapshot === reviewedSnapshot
-    && session.businessReview?.id === reviewedBusinessId;
-  if (!reviewedSnapshot) {
-    void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
-    return;
-  }
-  const choice = await vscode.window.showQuickPick(
-    [
-      ...(session.canSubmitConclusion('approve') ? [{ label: `$(check) ${m().conclusion.approve}`, value: 'approve' as const }] : []),
-      { label: `$(request-changes) ${m().conclusion.requestChanges}`, value: 'changes' as const },
-      { label: `$(comment) ${m().conclusion.comment}`, value: 'comment' as const },
-    ],
-    { title: m().conclusion.submitTitle, placeHolder: m().conclusion.submitPlaceholder },
-  );
-  if (!choice) {
-    return;
-  }
-  if (!sameConclusionContext() || !session.canSubmitConclusion(choice.value === 'changes' ? 'request-changes' : choice.value)) {
-    void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
-    return;
-  }
-
-  const cleanLabel = choice.label.replace(/\$\([^)]+\)\s*/, '');
-  const conclusionVerdict =
-    choice.value === 'approve' ? 'approve' : choice.value === 'changes' ? 'request-changes' : 'comment';
-  const prMatch = reviewedSet.scopeId.match(/^pr-(\d+)$/);
-  if (prMatch) {
-    const prNumber = Number(prMatch[1]);
-    const confirm = await vscode.window.showWarningMessage(
-      m().conclusion.confirmPr(prNumber, cleanLabel),
-      { modal: true },
-      m().conclusion.submitToGitHub,
-    );
-    if (confirm !== m().conclusion.submitToGitHub) {
-      return;
-    }
-    if (!sameConclusionContext() || !session.canSubmitConclusion(conclusionVerdict)) {
-      void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
-      return;
-    }
-    const cwd = activeCwd();
-    if (!cwd) {
-      return;
-    }
-    const c = session.totalCoverage();
-    const body = session.businessReview
-      ? businessConclusionSummary(session.businessReview)
-      : `${m().conclusion.prBody(c.filesReady, c.filesTotal)}\n\n${session.requirementStatus}`;
-    const pending = [...session.pendingComments];
-    try {
-      if (reviewedSet.source) {
-        const match = /^([^/]+)\/(.+)$/.exec(reviewedSet.repositoryIdentity ?? '');
-        if (!match) throw new Error(m().scope.prSnapshotChanged);
-        const target = { host: match[1], nameWithOwner: match[2] };
-        if (reviewedBusinessId) {
-          if (!await verifyBusinessInputsCurrent()) return;
-        } else {
-          const current = await getPrByNumber(cwd, prNumber, target);
-          assertPrSnapshotCurrent(reviewedSet, current);
-        }
-        if (!sameConclusionContext() || !session.canSubmitConclusion(conclusionVerdict)) throw new Error(m().scope.prSnapshotChanged);
-        await submitPrReviewWithComments(
-          cwd, prNumber, reviewedSet.headSha, conclusionVerdict, body,
-          pending.map((pc) => ({ path: pc.path, startLine: pc.startLine, endLine: pc.endLine, body: pc.body })), target,
-        );
-      } else if (pending.length > 0) {
-        await submitPrReviewWithComments(
-          cwd,
-          prNumber,
-          reviewedSet.headSha,
-          conclusionVerdict,
-          body,
-          pending.map((pc) => ({
-            path: pc.path,
-            startLine: pc.startLine,
-            endLine: pc.endLine,
-            body: pc.body,
-          })),
-        );
-      } else {
-        await submitPrReview(cwd, prNumber, conclusionVerdict, body);
-      }
-      await session.recordPostedConclusion(reviewedSnapshot, {
-        businessRunId: reviewedBusinessId,
-        verdict: conclusionVerdict,
-        label: cleanLabel,
-        target: 'pr',
-        prNumber,
-        submittedAt: Date.now(),
-      }, pending.map((comment) => comment.id));
-      if (sameConclusionContext() && session.businessReview?.status !== 'stale') transientInfo(m().conclusion.postedToPr(prNumber, cleanLabel));
-      else transientWarning(`${m().conclusion.postedToPr(prNumber, cleanLabel)} · ${m().businessReview.postedOlder}`);
-    } catch (err) {
-      reportError(err);
-    }
-    return;
-  }
-
-  if (!await verifyBusinessInputsCurrent() || !sameConclusionContext()) return;
-  session.setConclusion({
-    businessRunId: reviewedBusinessId,
-    verdict: conclusionVerdict,
-    label: cleanLabel,
-    target: 'local',
-    submittedAt: Date.now(),
-  });
-  transientInfo(m().conclusion.recordedLocal(cleanLabel));
+  try {
+    await openWorkbench();
+    await reviewCenterController().handle({ type: 'center', action: 'stage', value: 'conclusion', contextKey: reviewCenterContextKey(session) });
+    WorkbenchPanel.reveal();
+  } catch (error) { reportError(error); }
 }
 
 /**
@@ -4421,6 +4764,6 @@ async function restoreGloballyHiddenActivityBar(context: vscode.ExtensionContext
   }
 }
 
-export function deactivate(): void {
-  // nothing to clean up beyond context.subscriptions
+export async function deactivate(): Promise<void> {
+  if (session) await session.persist();
 }

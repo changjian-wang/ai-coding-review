@@ -18,7 +18,7 @@ function within<T>(work: Promise<T>, label: string): Promise<T> {
   });
 }
 
-export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet): Promise<string[]> {
+export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet) {
   const entries = new Map<string, unknown>();
   const memento: vscode.Memento = {
     keys: () => [...entries.keys()],
@@ -141,10 +141,13 @@ export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet): 
     workbench = vscode.window.createWebviewPanel('codereview.workbench', 'Business host fixture', vscode.ViewColumn.One, { enableScripts: true });
     WorkbenchPanel.adopt(workbench, () => state, actions);
     await within(workbenchReady, 'native M3 workbench controls and non-approval feedback state');
-    return [
-      'native M3 exact-source five-phase workflow, independent global finding and persistence (controlled model response, not semantic quality evaluation)',
-      'native M3 report/source rendering and workbench feedback/approval controls',
-    ];
+    return {
+      checks: [
+        'native M3 exact-source five-phase workflow, independent global finding and persistence (controlled model response, not semantic quality evaluation)',
+        'native M3 report/source rendering and workbench feedback/approval controls',
+      ],
+      run, draft,
+    };
   } finally {
     workbench?.dispose();
     BusinessReviewPanel.closeIfOpen();

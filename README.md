@@ -34,7 +34,7 @@ English | [简体中文](README.zh-CN.md)
 - Immutable snapshots do not apply or revert fixes against a different working tree. Explicitly select a local-file review to edit; verified delivery to the PR head is a later implementation stage.
 - Persistence uses canonical repository-path identities, with commit/base/scope isolation for snapshots. Same-name folders do not share reviews. Ambiguous legacy folder-name history remains available as a separate archive, without automatically reusing approvals or patches.
 
-Development status: the scope foundation, M2 preparation and the M3 requirement-aware review slice in the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md) are connected, not the entire vNext. The final three-stage workspace, Reviewer Reply/Resolve and real-model semantic evaluation remain outstanding. Snapshot evidence uses bounded searches, never another branch's language services.
+Development status: the scope foundation, M2 preparation, M3 requirement-aware review and M4 review center in the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md) are connected, not the entire vNext. Reviewer feedback synchronization, Reply/Resolve and real-model semantic evaluation remain outstanding. Snapshot evidence uses bounded searches, never another branch's language services.
 
 ### Requirement preparation (M2)
 
@@ -53,21 +53,26 @@ Development status: the scope foundation, M2 preparation and the M3 requirement-
 - One confirmation or the workbench's business-review button runs planning, complete source segments, independent global discovery, requested contract/counterevidence, candidate verification and per-requirement/premise assessment. Opening or scrolling every file is not a prerequisite.
 - Source intervals, old/new sides, hashes and exact quotations are tracked. Added files have no invented old side; deletion and rename baselines retain their original paths. Missing facts remain unknown; upstream safeguards can overturn local suspicions, and invalid requirement premises are classified separately from implementation defects.
 - Known critical questions survive retries, technical-only mode and changed requirement identities. Notes, model agreement, confirmation or re-uploading the same normative text do not clear them. Only independently supported current facts can close them.
-- Cancellation, failures, input changes and limits retain incomplete results. Exact-input completed calls can be reused; restored running work is interrupted, not silently completed. Current branch/PR endpoints, code and local requirement files are checked before using a conclusion.
+- Cancellation, failures, input changes and limits retain incomplete results. Completed calls can be reused only for the same exact input, captured output language, model version and prompt version; restored running work is interrupted, not silently completed. Current branch/PR endpoints, code and local requirement files are checked before using a conclusion.
 - Approval requires complete source coverage and global analysis, no workflow limits/errors, no confirmed defects or decisive unresolved premises, and explicit report acknowledgement. Noncritical unknowns do not automatically prevent approval, but must not be described as satisfied. Partial findings may still support bounded comments or requested changes.
-- The report supports source-snapshot reading and local Markdown export. Existing PR submission publishes only bounded coverage/status metadata and explicitly drafted review comments; private requirement originals, material paths and full source quotations are not automatically copied into its summary. Late receipts cannot approve a newer business run.
+- The report supports source-snapshot reading and local Markdown export. Conclusion drafts start with bounded coverage/status metadata; findings are appended only on explicit action. Private originals and full source quotations are not attached automatically. Publication uses the exact saved and visibly previewed body and inline comments, not a regenerated summary. Late receipts cannot approve a newer draft or business run.
 - Engine limits: 80 formal files, 24 units, 16,000-character segments, 100,000-character measured model inputs, 24 evidence requests/related files, 80 candidates, 128 model calls and a 180-second engine budget. The model's token capacity also applies. Startup/submission freshness checks are separate I/O. Limits are visible, not proof of a complete repository review.
 
 This is source/contract reasoning, not executed tests or production calls. Controlled model fixtures validate orchestration and gates, **not real Copilot accuracy**; the independent semantic evaluation remains part of M0/M7.
 
-### Review workbench
+### Review center (M4 development slice)
 
-- File tree + per-file / overall coverage progress + findings summary + action buttons, all in one webview
+- Prepare → Review → Conclusion. The review stage uses one webview with business/findings/PR-feedback/file navigation, the shared source/Diff/Markdown reader, and a judgment/evidence/handling inspector.
+- Reading associated files or original evidence preserves the selected finding. The overview remains directly accessible; read-only quotations do not add formal review coverage. Narrow windows use navigation/inspector drawers; focus mode and F8 finding navigation are available.
+- Edit Markdown and the verdict, then save and preview the exact body and frozen inline comments before publishing a GitHub Review or recording a local conclusion. Saving alone is not preview acknowledgement. The application limit is 60,000 body characters; oversize input stays editable rather than being truncated.
+- Drafts and receipts bind to scope, requirements, analysis and draft revision. Busy/stale inputs, concurrent or repeated publication and unknown write outcomes are guarded on the host. An uncertain write requires explicit remote checking; that acknowledgement does not claim the remote state was automatically reconciled.
+- A local working-tree business fix explicitly selects a single repair file when several reviewed files are available; the first evidence citation is not treated as the required repair location. Applying a patch invalidates the report, not the defect. Cached proposals can still be inspected/undone, but generating or applying another fix requires a current review.
+- Workspace navigation, source and saved drafts survive a real window restart. A hidden saved preview does not inherit publication acknowledgement. Async annotations/comments stay bound to their original snapshot and source hash.
+- PR feedback explicitly states that existing Reviewer discussions have not been read yet; synchronization and Reply/Resolve belong to M5/M6, not an empty “zero comments” result.
 - Can be popped out into a separate window (like "Open in Agents Window")
-- Auto-restores the review and workbench after a window reload — no need to re-pick the scope
 - **Token accounting (estimated)**: a HUD row shows estimated LLM tokens (↑input ↓output) with a per-operation breakdown on hover, accumulated over the review and persisted; estimated locally via `countTokens`, not the provider's billed counts
 
-### Per-file review
+### Per-file review (legacy technical tools)
 
 - PR and other diff-backed scopes open in an uncollapsed, full-file inline Diff by default, with
   old/new line numbers and added/deleted rows; switch to the clean head file at any time
@@ -80,25 +85,28 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 - **Reviewer context before a fix**: when the model's read of a finding is off, add a supplementary note in the fix panel; it overrides the finding when generating proposals and is persisted per finding
 - Selection translation / code explanation annotations
 
-### Global analysis
+### Global analysis (legacy technical tools)
 
 - Cross-file logic analysis, optionally scoped to selected directories
 - A dedicated global-report webview
 
 ### Gate and conclusion
 
-- Gate: **every file is analyzed and all findings are disposed** + **the global conclusion is confirmed**
+- Business-review approval requires complete/current source coverage and global workflow, no confirmed defects or decisive unknowns, and explicit report acknowledgement. Valid partial findings may support bounded comments or requested changes, not complete approval.
 - Conclusion: Approve / Request Changes / Comment
-- When the scope is a PR, one click writes the conclusion back to the GitHub PR (`gh`); otherwise it is recorded locally
+- Every submission entry opens the conclusion editor and exact preview. A PR uses the GitHub CLI after confirmation and freshness checks; other scopes record the conclusion locally.
 
 ## Gate model
 
 ```text
-gatePassed = all files ready && global analysis confirmed
-file ready  = file-level analysis done && every actionable finding in the file disposed
+business approval = complete current coverage/workflow
+                    && no confirmed defect / decisive unknown
+                    && report acknowledged
+legacy technical gate = all files ready && global analysis confirmed
+legacy file ready = analysis done && every actionable finding disposed
 ```
 
-Per-line coverage is shown as a live progress signal (per-file / overall `seen/total`) to push "actually read it", displayed alongside the gate verdict.
+The legacy gate applies only when no business-review result is being used; it cannot verify requirement satisfaction. Per-line reading progress is an auxiliary signal, not proof of business correctness. Notes, comments or an applied but unverified patch do not clear a business-review defect.
 
 ## Language (bilingual)
 
@@ -124,7 +132,7 @@ AI Coding Review is fully bilingual (English / 简体中文), **English by defau
 | `codereview.analyzeFile` | Analyze repository behavior rooted at the current file |
 | `codereview.globalAnalysis` | Run global analysis |
 | `codereview.showGlobalReport` | Show the global report |
-| `codereview.submitConclusion` | Submit the review conclusion |
+| `codereview.submitConclusion` | Open the conclusion editor and exact publication preview |
 | `codereview.jumpToNextUnseen` | Jump to the next unseen line |
 | `codereview.pickModel` | Select the analysis model |
 | `codereview.pickLanguage` | Switch the experience language (UI + LLM output) |

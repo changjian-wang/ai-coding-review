@@ -51,6 +51,7 @@ describe('DocumentPanel diff updates', () => {
       type: 'loaded',
       requestId: load.requestId,
       path: model.path,
+      revision: model.revision,
     });
     expect(vscodeMockState.panel?.title).toBe(`📄 ${model.name}`);
 
@@ -93,6 +94,8 @@ describe('DocumentPanel diff updates', () => {
       type: 'viewFix',
       id: 'f2',
       cachedOnly: true,
+      path: model.path,
+      revision: model.revision,
     });
 
     expect(viewFix).toHaveBeenCalledWith(model.path, 'f2', true);
@@ -116,9 +119,46 @@ describe('DocumentPanel diff updates', () => {
       type: 'loaded',
       requestId: retryLoad.requestId,
       path: model.path,
+      revision: model.revision,
     });
     expect(vscodeMockState.panel?.title).toBe(`📄 ${model.name}`);
   });
+
+  it('does not apply an old source action to a new file or revision', () => {
+      const model = documentModel();
+      const note = vi.fn();
+      DocumentPanel.show(model, { ...actions(), note });
+      DocumentPanel.update({ ...model, revision: '2:changed' });
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'note', path: model.path, revision: model.revision, startLine: 1, endLine: 1, text: 'old selection' });
+      expect(note).not.toHaveBeenCalled();
+      expect(vscodeMockState.warnings.at(-1)).toMatch(/context changed/);
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'note', path: model.path, revision: '2:changed', startLine: 1, endLine: 1, text: 'current selection' });
+      expect(note).toHaveBeenCalledWith(model.path, 1, 1, 'current selection');
+    });
+
+    it('keeps evidence snapshots outside review coverage and mutation actions', () => {
+      const model = { ...documentModel(), readOnly: true, contextKey: 'evidence' };
+      const seen = vi.fn();
+      const note = vi.fn();
+      DocumentPanel.show(model, { ...actions(), seen, note });
+      const context = { path: model.path, revision: model.revision, contextKey: model.contextKey };
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'seen', ...context, lines: [1] });
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'note', ...context, startLine: 1, endLine: 1, text: 'evidence' });
+      expect(seen).not.toHaveBeenCalled();
+      expect(note).not.toHaveBeenCalled();
+      expect(DocumentPanel.isReadOnly).toBe(true);
+    });
+
+    it('defers requested source location until the exact document load is acknowledged', () => {
+      const model = documentModel();
+      DocumentPanel.show(model, actions());
+      DocumentPanel.scrollTo(1);
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'ready' });
+      const load = vscodeMockState.panel?.webview.messages.at(-1) as { requestId: number };
+      expect(vscodeMockState.panel?.webview.messages.some((message) => (message as { type: string }).type === 'scrollTo')).toBe(false);
+      vscodeMockState.panel?.webview.receiveMessage({ type: 'loaded', requestId: load.requestId, path: model.path, revision: model.revision });
+      expect(vscodeMockState.panel?.webview.messages.at(-1)).toMatchObject({ type: 'scrollTo', line: 1 });
+    });
 });
 
 describe('sourceRenderPlan', () => {

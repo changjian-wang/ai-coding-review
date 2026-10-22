@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 import type { FindingEvidenceRef, FindingSeverity } from '../ai/types';
 import { esc, escAttr, nonce as makeNonce } from './html';
 import { m, fmt, resolveLanguage, type Messages } from '../i18n';
+import { DocumentPanel, type DocActions, type DocumentInbound, type EmbeddedDocumentSurface } from './documentPanel';
+import { reviewCenterView } from './reviewCenterView';
+import type { CenterAction, ReviewCenterState } from './reviewCenterState';
 
 export type FindingDispositionKind = 'fixed' | 'commented' | 'ignored';
 
@@ -51,6 +54,7 @@ export interface WorkbenchState {
   feedbackAllowed?: boolean;
   requirementStatus?: string;
   businessReview?: { running: boolean; hasReport: boolean; progress: string; blockers: string[] };
+  center?: ReviewCenterState;
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
@@ -119,6 +123,9 @@ export interface WorkbenchActions {
   /** Applies an async menu choice (model / branch). */
   applyDynMenu(kind: string, id: string): void;
   onRendered?(report: { businessControls: number; running: boolean; showEnabled: boolean; feedbackEnabled: boolean }): void;
+  document?: DocActions;
+  center?(message: CenterAction): void;
+  onCenterRendered?(report: { columns: number; stage: string; sourceShadow: boolean }): void;
 }
 
 interface FilePatch {
@@ -171,6 +178,9 @@ type WorkbenchStateProvider = (
 ) => WorkbenchState;
 
 type InboundMessage =
+  | CenterAction
+  | { type: 'document'; clientId: string; message: DocumentInbound }
+  | { type: 'centerRendered'; clientId: string; columns: number; stage: string; sourceShadow: boolean }
   | { type: 'select'; path: string }
   | { type: 'openFocus'; path: string }
   | { type: 'focusDoc' }
@@ -227,6 +237,9 @@ export class WorkbenchPanel {
   private readonly fileIndexByPath = new Map<string, number>();
   private readonly folderAncestorsByFile = new Map<string, string[]>();
   private readonly folderMetrics = new Map<string, FolderMetric>();
+  private centerInstanceId?: string;
+  private embeddedRegistration?: vscode.Disposable;
+  private readonly documentMessages = new vscode.EventEmitter<DocumentInbound>();
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -240,6 +253,7 @@ export class WorkbenchPanel {
       null,
       this.disposables,
     );
+    this.disposables.push(this.documentMessages);
   }
 
   static init(extensionUri: vscode.Uri): void {
@@ -361,6 +375,15 @@ export class WorkbenchPanel {
     void inst.panel.webview.postMessage({ type: 'focusTree' });
   }
 
+  static postCenterResult(message: CenterAction, error?: string, preview = false): void {
+    const current = WorkbenchPanel.current;
+    current?.refresh();
+    void current?.panel.webview.postMessage({
+      type: 'centerResult', contextKey: message.contextKey, clientId: message.clientId ?? current?.centerInstanceId,
+      requestId: message.requestId, error, preview,
+    });
+  }
+
   /** Pushes async dropdown items (model / branch) to the inline menu. */
   static postDynMenu(
     kind: string,
@@ -452,6 +475,24 @@ export class WorkbenchPanel {
     }
     const state = this.getState(changedPaths);
     const sig = String(state.structureVersion);
+    if (state.center) {
+      this.ensureEmbeddedDocument();
+      if (this.rendered && this.centerInstanceId) {
+        void this.panel.webview.postMessage({
+          type: 'centerState', center: state.center,
+          files: sig !== this.lastStructureSig ? state.files : undefined,
+          fileChanges: sig === this.lastStructureSig ? state.files.filter((file) => changedPaths?.has(file.path)) : undefined,
+        });
+        this.lastStructureSig = sig;
+      } else this.renderCenter(state);
+      return;
+    }
+    if (this.centerInstanceId) {
+      this.embeddedRegistration?.dispose();
+      this.embeddedRegistration = undefined;
+      this.centerInstanceId = undefined;
+      this.rendered = false;
+    }
     // Hot path: while the file set is unchanged (the common case during a
     // review — only progress / findings / selection change), patch the live
     // DOM in place via postMessage instead of reassigning `webview.html`, which
@@ -482,12 +523,66 @@ export class WorkbenchPanel {
       this.refreshTimer = undefined;
     }
     const state = this.getState();
+    if (state.center) {
+      this.ensureEmbeddedDocument();
+      this.renderCenter(state);
+      return;
+    }
     const root = compactTree(buildTree(state.files));
     this.indexStructure(state, root);
     this.lastStructureSig = String(state.structureVersion);
     this.rendered = true;
     this.lastSnapshot = snapshotFor(state, root);
     this.panel.webview.html = this.render(state, root);
+  }
+
+  private ensureEmbeddedDocument(): void {
+    if (this.embeddedRegistration) return;
+    if (!this.actions.document || !this.actions.center) throw new Error(m().reviewCenter.sourceUnavailable);
+    this.embeddedRegistration = DocumentPanel.useEmbeddedSurface(() => this.createDocumentSurface());
+    this.disposables.push(this.embeddedRegistration);
+    DocumentPanel.prewarm(this.actions.document);
+  }
+
+  private renderCenter(state: WorkbenchState): void {
+    if (!state.center) return;
+    this.centerInstanceId = makeNonce();
+    this.lastStructureSig = String(state.structureVersion);
+    this.rendered = true;
+    this.panel.webview.html = reviewCenterView(state.center, state.files, this.centerInstanceId);
+  }
+
+  private createDocumentSurface(): EmbeddedDocumentSurface {
+    const owner = this;
+    const closed = new vscode.EventEmitter<void>();
+    let title = '';
+    let disposed = false;
+    return {
+      embedded: true,
+      get viewColumn() { return owner.panel.viewColumn; },
+      get title() { return title; },
+      set title(value) {
+        title = value;
+        void owner.panel.webview.postMessage({ type: 'sourceStatus', title: value, loading: value.startsWith('⏳') });
+      },
+      onDidDispose: closed.event,
+      webview: {
+        onDidReceiveMessage: owner.documentMessages.event,
+        postMessage: (message) => owner.panel.webview.postMessage({ type: 'document', message }),
+      },
+      reveal: (_column, preserveFocus) => {
+        owner.panel.reveal(undefined, preserveFocus);
+        void owner.panel.webview.postMessage({ type: 'focusSource' });
+      },
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        void owner.panel.webview.postMessage({ type: 'sourceStatus', empty: true });
+        closed.fire();
+        closed.dispose();
+      },
+      rebuild: () => { void owner.panel.webview.postMessage({ type: 'document', message: { type: 'requestReady' } }); },
+    };
   }
 
   private indexStructure(state: WorkbenchState, root: TreeNode): void {
@@ -648,6 +743,16 @@ export class WorkbenchPanel {
 
   private handle(msg: InboundMessage): void {
     switch (msg.type) {
+      case 'document':
+        if (msg.clientId === this.centerInstanceId) this.documentMessages.fire(msg.message);
+        break;
+      case 'center':
+        if (msg.clientId === this.centerInstanceId) this.actions.center?.(msg);
+        else void vscode.window.showWarningMessage(m().reviewCenter.staleSelection);
+        break;
+      case 'centerRendered':
+        if (msg.clientId === this.centerInstanceId) this.actions.onCenterRendered?.(msg);
+        break;
       case 'rendered':
         this.actions.onRendered?.(msg);
         break;
@@ -1663,7 +1768,7 @@ export class WorkbenchPanel {
   }
 
   dispose(): void {
-    WorkbenchPanel.current = undefined;
+    if (WorkbenchPanel.current === this) WorkbenchPanel.current = undefined;
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
@@ -2038,7 +2143,7 @@ function formatTokenCount(n: number, units: Messages['workbench']['tokenUnits'])
 }
 
 /** One-line HUD token summary, e.g. "↑~12.4k ↓~3.1k". Empty string when no usage. */
-function tokenSummary(usage: WorkbenchState['tokenUsage'], t: Messages['workbench']): string {
+export function tokenSummary(usage: WorkbenchState['tokenUsage'], t: Messages['workbench']): string {
   if (!usage) {
     return '';
   }
@@ -2046,7 +2151,7 @@ function tokenSummary(usage: WorkbenchState['tokenUsage'], t: Messages['workbenc
 }
 
 /** Multi-line hover tooltip: total + per-operation breakdown. */
-function tokenTooltip(usage: WorkbenchState['tokenUsage'], t: Messages['workbench']): string {
+export function tokenTooltip(usage: WorkbenchState['tokenUsage'], t: Messages['workbench']): string {
   if (!usage) {
     return '';
   }

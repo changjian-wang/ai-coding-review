@@ -52,6 +52,9 @@ export interface FindingDisposition {
 /** The reviewer's final verdict for a review, persisted once submitted. */
 export interface ReviewConclusion {
   businessRunId?: string;
+  draftId?: string;
+  draftRevision?: number;
+  bodyHash?: string;
   /** Machine-readable verdict. */
   verdict: 'approve' | 'request-changes' | 'comment';
   /** Human-readable label shown in the UI. */
@@ -92,6 +95,9 @@ export interface ReviewSnapshot {
   comparison?: ReviewComparison;
   requirements?: RequirementsDraft;
   businessReview?: BusinessReviewRun;
+  workspaceView?: unknown;
+  conclusionDraft?: unknown;
+  publicationAttempts?: PublicationAttempt[];
   repo: string;
   /** Stable id of the review scope (selected files / PR / branch / working tree). */
   scopeId: string;
@@ -120,6 +126,18 @@ export interface ReviewSnapshot {
   /** Estimated LLM token usage accumulated over this review (approximate). */
   tokenUsage?: TokenAccount;
   updatedAt: number;
+}
+
+export interface PublicationAttempt {
+  id: string;
+  draftId: string;
+  draftRevision: number;
+  bodyHash: string;
+  headSha: string;
+  status: 'sending' | 'posted' | 'unknown' | 'not-submitted';
+  checked?: boolean;
+  error?: string;
+  at: number;
 }
 
 /**

@@ -105,6 +105,8 @@ describe('FixProposalPanel', () => {
       onApplied: () => undefined,
     });
 
+    expect(FixProposalPanel.hasCached('second')).toBe(true);
+    expect(FixProposalPanel.hasCached('missing')).toBe(false);
     FixProposalPanel.show(request('first', 'first', 1));
     expect(FixProposalPanel.canSwitchToCached('second')).toBe(true);
     FixProposalPanel.show(request('second', 'second', 2));

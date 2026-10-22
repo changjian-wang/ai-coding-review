@@ -1,6 +1,7 @@
 import MarkdownIt from 'markdown-it';
 import hljs from 'highlight.js/lib/common';
 import { esc as escapeHtml } from './html';
+import { businessHash } from '../review/businessReview';
 
 /** Rendered representation of a review file, ready for the document webview. */
 export interface DocumentRender {
@@ -141,17 +142,8 @@ export function renderDocument(text: string, languageId: string, fileName: strin
     readingHtml: isMarkdown ? renderMarkdownReading(text) : undefined,
     sourceLines: sourceLines.slice(0, rawLines.length),
     totalLines: rawLines.length,
-    revision: textRevision(text),
+    revision: businessHash(text),
   };
-}
-
-function textRevision(text: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `${text.length}:${(hash >>> 0).toString(36)}`;
 }
 
 /**

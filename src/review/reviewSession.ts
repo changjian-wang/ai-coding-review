@@ -13,7 +13,7 @@ import {
   type GlobalReport,
 } from '../ai/types';
 import type { TokenUsage } from '../ai/analyzer';
-import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
+import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount, PublicationAttempt } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
 import { canonicalRepositoryPath, repositoryLabel, repositoryStorageId } from './repositoryIdentity';
 import {
@@ -24,6 +24,13 @@ import {
   businessBindingKey, businessBlockers, coverageComplete, restoreBusinessReview,
   type BusinessReviewRun,
 } from './businessReview';
+import {
+  createWorkspaceView, reconcileWorkspaceView, restoreWorkspaceView, ReviewWorkspaceDataError, type ReviewWorkspaceView,
+} from './reviewWorkspace';
+import {
+  conclusionBindingKey, conclusionPreviewKey, createConclusionDraft, restoreConclusionDraft, updateConclusionDraft,
+  ConclusionDraftDataError, type ConclusionDraft, type ConclusionVerdict,
+} from './conclusionDraft';
 
 export interface ReviewSessionChange {
   filePath?: string;
@@ -54,6 +61,10 @@ export class ReviewSession {
   private deletedPaths = new Set<string>();
   private structureVersion = 0;
   private startGeneration = 0;
+  private workspaceViewState = createWorkspaceView('unstarted');
+  private workspaceViewFailure?: string;
+  private previewedConclusion?: string;
+  private publishingConclusion = false;
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
@@ -171,6 +182,15 @@ export class ReviewSession {
     if (businessReview && (!cwd || businessReview.bindingKey !== businessBindingKey(cwd, reviewSet, requirements))) {
       businessReview.status = 'stale'; businessReview.confirmed = false;
     }
+    const scopeKey = requirementScopeKey(cwd ?? this.defaultRepo, reviewSet);
+    let workspaceView = createWorkspaceView(scopeKey);
+    let viewFailure: string | undefined;
+    try { workspaceView = restoreWorkspaceView(scopeSnap?.workspaceView, scopeKey); }
+    catch (error) {
+      if (!(error instanceof ReviewWorkspaceDataError)) throw error;
+      viewFailure = error.message;
+      void vscode.window.showWarningMessage(error.message);
+    }
     if (generation !== this.startGeneration) return;
     this.cwd = cwd;
     this.repoLabel = label;
@@ -182,6 +202,9 @@ export class ReviewSession {
       effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
     );
     this.structureVersion++;
+    this.workspaceViewState = reconcileWorkspaceView(workspaceView, businessReview);
+    this.workspaceViewFailure = viewFailure;
+    this.previewedConclusion = undefined;
     this.snapshot = {
       schemaVersion: 2,
       repositoryRoot: cwd ? canonicalRepositoryPath(cwd) : undefined,
@@ -190,6 +213,10 @@ export class ReviewSession {
       comparison: reviewSet.comparison,
       requirements,
       businessReview,
+      workspaceView: viewFailure ? scopeSnap?.workspaceView : this.workspaceViewState,
+      conclusionDraft: scopeSnap?.conclusionDraft,
+      publicationAttempts: scopeSnap?.publicationAttempts?.map((attempt) => attempt.status === 'sending'
+        ? { ...attempt, status: 'unknown', error: m().reviewCenter.publicationInterrupted } : attempt),
       repo,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
@@ -213,6 +240,110 @@ export class ReviewSession {
 
   get requirements(): RequirementsDraft | undefined {
     return this.snapshot?.requirements;
+  }
+
+  get workspaceView(): ReviewWorkspaceView {
+    return structuredClone(this.workspaceViewState);
+  }
+
+  get workspaceViewError(): string | undefined {
+    return this.workspaceViewFailure;
+  }
+
+  setWorkspaceView(patch: Partial<Omit<ReviewWorkspaceView, 'version' | 'scopeKey' | 'runId'>>): void {
+    if (!this.snapshot || !this.reviewSet) throw new ReviewWorkspaceDataError();
+    const next = restoreWorkspaceView({
+      ...this.workspaceViewState, ...patch, runId: this.businessReview?.id,
+    }, this.workspaceViewState.scopeKey);
+    this.workspaceViewState = next;
+    this.workspaceViewFailure = undefined;
+    this.snapshot.workspaceView = structuredClone(next);
+    this.persistScope();
+  }
+
+  get conclusionDraft(): ConclusionDraft | undefined {
+    return restoreConclusionDraft(this.snapshot?.conclusionDraft);
+  }
+
+  get conclusionBinding(): string {
+    if (!this.cwd || !this.reviewSet || !this.snapshot) throw new ConclusionDraftDataError();
+    return conclusionBindingKey(this.cwd, this.reviewSet, this.requirements, this.snapshot);
+  }
+
+  async generateConclusionDraft(body: string): Promise<ConclusionDraft> {
+    if (!this.snapshot) throw new ConclusionDraftDataError();
+    const draft = createConclusionDraft(this.conclusionBinding, body, this.pendingComments);
+    this.snapshot.conclusionDraft = draft;
+    this.previewedConclusion = undefined;
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+    return structuredClone(draft);
+  }
+
+  async saveConclusionDraft(id: string, revision: number, body: string, verdict: ConclusionVerdict): Promise<ConclusionDraft> {
+    const current = this.conclusionDraft;
+    if (!this.snapshot || !current || current.id !== id) throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
+    const next = updateConclusionDraft(current, this.conclusionBinding, revision, body, verdict);
+    this.snapshot.conclusionDraft = next;
+    this.previewedConclusion = undefined;
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+    return structuredClone(next);
+  }
+
+  async prepareConclusionPreview(id: string, revision: number): Promise<void> {
+    const draft = this.conclusionDraft;
+    if (!this.snapshot || !draft || draft.id !== id || draft.revision !== revision || draft.bindingKey !== this.conclusionBinding) {
+      throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
+    }
+    draft.previewKey = conclusionPreviewKey(draft);
+    this.snapshot.conclusionDraft = draft;
+    this.previewedConclusion = undefined;
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+  }
+
+  acknowledgeConclusionPreview(id: string, revision: number, key: string): void {
+    const draft = this.conclusionDraft;
+    if (!draft || draft.id !== id || draft.revision !== revision || draft.bindingKey !== this.conclusionBinding
+      || draft.previewKey !== key || conclusionPreviewKey(draft) !== key) throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
+    if (this.previewedConclusion === key) return;
+    this.previewedConclusion = key;
+    this._onDidChange.fire({});
+  }
+
+  get conclusionPreviewCurrent(): boolean {
+    const draft = this.conclusionDraft;
+    return !!draft?.previewKey && draft.previewKey === this.previewedConclusion && draft.bindingKey === this.conclusionBinding
+      && draft.previewKey === conclusionPreviewKey(draft);
+  }
+
+  clearConclusionPreview(): void {
+    this.previewedConclusion = undefined;
+    this._onDidChange.fire({});
+  }
+
+  get publicationInFlight(): boolean { return this.publishingConclusion; }
+
+  beginConclusionPublication(): () => void {
+    if (this.publishingConclusion) throw new ConclusionDraftDataError(m().reviewCenter.checking);
+    this.publishingConclusion = true;
+    this._onDidChange.fire({});
+    return () => { this.publishingConclusion = false; this._onDidChange.fire({}); };
+  }
+
+  async recordPublicationAttempt(snapshot: ReviewSnapshot, attempt: PublicationAttempt): Promise<void> {
+    const active = this.snapshot;
+    const target = active && active.repo === snapshot.repo && active.scopeId === snapshot.scopeId && active.headSha === snapshot.headSha ? active : snapshot;
+    target.publicationAttempts = [...(target.publicationAttempts ?? []).filter((item) => item.id !== attempt.id), structuredClone(attempt)];
+    await this.persistScopeMeta(target);
+    if (this.snapshot === target) this._onDidChange.fire({});
+  }
+
+  async acknowledgePublicationUncertainty(id: string): Promise<void> {
+    const attempt = this.snapshot?.publicationAttempts?.find((attempt) => attempt.id === id && attempt.status === 'unknown');
+    if (!attempt || !this.snapshot) throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
+    await this.recordPublicationAttempt(this.snapshot, { ...attempt, checked: true });
   }
 
   get requirementStatus(): string {
@@ -241,6 +372,8 @@ export class ReviewSession {
       throw new Error(m().businessReview.staleReport);
     }
     this.snapshot.businessReview = restoreBusinessReview(run);
+    this.workspaceViewState = reconcileWorkspaceView(this.workspaceViewState, run);
+    if (!this.workspaceViewFailure) this.snapshot.workspaceView = structuredClone(this.workspaceViewState);
     this.snapshot.conclusion = undefined;
     await this.persistScopeMeta();
     this._onDidChange.fire({});
@@ -260,15 +393,16 @@ export class ReviewSession {
     return !!dependencies && (Object.hasOwn(dependencies, `head:${file}`) || Object.hasOwn(dependencies, `base:${file}`));
   }
 
-  confirmBusinessReview(): void {
+  confirmBusinessReview(confirmed = true): void {
     if (!this.businessReviewCurrent || !this.businessReview || this.businessReview.status === 'running') throw new Error(m().businessReview.staleReport);
-    this.businessReview.confirmed = true;
+    this.businessReview.confirmed = confirmed;
     this.persistScope();
   }
 
-  recordBusinessNote(id: string, reason: string): void {
+  recordBusinessNote(id: string, reason: string, expectedRunId?: string): void {
     const run = this.businessReview;
-    if (!this.businessReviewCurrent || !run || run.status === 'running' || !run.findings.some((item) => item.id === id) || !reason.trim()) throw new Error(m().businessReview.staleReport);
+    if (!run || (expectedRunId ? run.id !== expectedRunId : !this.businessReviewCurrent)
+      || run.status === 'running' || !run.findings.some((item) => item.id === id) || !reason.trim()) throw new Error(m().businessReview.staleReport);
     run.dispositions[id] = { kind: 'commented', reason, at: Date.now() };
     run.confirmed = false;
     if (this.snapshot) this.snapshot.conclusion = undefined;
@@ -1245,8 +1379,12 @@ export class ReviewSession {
     const posted = new Set(submittedIds);
     target.pendingComments = (target.pendingComments ?? []).filter((comment) => !posted.has(comment.id));
     (target.postedConclusions ??= []).push(conclusion);
+    const storedDraft = target.conclusionDraft;
+    const sameDraft = !conclusion.draftId || !!storedDraft && typeof storedDraft === 'object'
+      && 'id' in storedDraft && storedDraft.id === conclusion.draftId
+      && 'revision' in storedDraft && storedDraft.revision === conclusion.draftRevision;
     if (conclusion.businessRunId === target.businessReview?.id
-      && target.businessReview?.status !== 'stale' && target.businessReview?.status !== 'running') target.conclusion = conclusion;
+      && sameDraft && target.businessReview?.status !== 'stale' && target.businessReview?.status !== 'running') target.conclusion = conclusion;
     await this.persistScopeMeta(target);
     if (this.snapshot === target) this._onDidChange.fire({});
   }

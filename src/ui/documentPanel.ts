@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { nonce as makeNonce } from './html';
 import { m, resolveLanguage } from '../i18n';
 import type { FindingEvidenceRef } from '../ai/types';
+import type { BusinessFinding } from '../review/businessReview';
 
 export type DocFindingDisposition = 'fixed' | 'commented' | 'ignored';
 
@@ -26,6 +27,7 @@ export interface DocFinding {
    * (the hard-to-reproduce case) is at least identifiable.
    */
   estimatedLine?: boolean;
+  business?: Pick<BusinessFinding, 'kind' | 'status'> & { stale?: boolean };
 }
 
 /** A persisted annotation (translation, explanation, or note) anchored to a file. */
@@ -71,6 +73,22 @@ export interface DocModel {
   analyzing: boolean;
   /** Persisted whole-document translation (rendered reading HTML) for the side-by-side view. */
   translationHtml?: string;
+  contextKey?: string;
+  readOnly?: boolean;
+}
+
+export interface EmbeddedDocumentSurface {
+  readonly embedded: true;
+  readonly viewColumn: vscode.ViewColumn | undefined;
+  title: string;
+  onDidDispose: vscode.Event<void>;
+  webview: {
+    onDidReceiveMessage: vscode.Event<DocumentInbound>;
+    postMessage(message: object): Thenable<boolean>;
+  };
+  reveal(column?: vscode.ViewColumn, preserveFocus?: boolean): void;
+  dispose(): void;
+  rebuild(): void;
 }
 
 export interface SourceRenderPlan {
@@ -151,13 +169,11 @@ export interface DocActions {
   jumpNext(path: string): void;
   /** Hands keyboard focus back to the workbench file tree. */
   focusTree(): void;
+  businessFinding?(id: string): void;
 }
 
-type Inbound =
-  | { type: 'ready' }
-  | { type: 'loaded'; requestId: number; path: string }
-  | { type: 'loadError'; requestId: number; path: string; message?: string }
-  | { type: 'seen'; path: string; lines: number[] }
+type DocumentAction =
+  | { type: 'seen'; lines: number[] }
   | { type: 'translate'; startLine: number; endLine: number; text: string }
   | { type: 'translateWhole' }
   | { type: 'explain'; startLine: number; endLine: number; text: string }
@@ -172,7 +188,14 @@ type Inbound =
   | { type: 'locate'; line: number; endLine?: number; id?: string }
   | { type: 'analyze' }
   | { type: 'jumpNext' }
-  | { type: 'focusTree' };
+  | { type: 'focusTree' }
+  | { type: 'businessFinding'; id: string };
+
+export type DocumentInbound =
+  | { type: 'ready' }
+  | { type: 'loaded'; requestId: number; path: string; revision: string; contextKey?: string }
+  | { type: 'loadError'; requestId: number; path: string; message?: string }
+  | (DocumentAction & { path: string; revision: string; contextKey?: string });
 
 /**
  * The Document Viewer: a webview that renders a review file in either a
@@ -182,7 +205,8 @@ type Inbound =
  */
 export class DocumentPanel {
   private static current?: DocumentPanel;
-  private readonly panel: vscode.WebviewPanel;
+  private static embeddedFactory?: () => EmbeddedDocumentSurface;
+  private readonly panel: vscode.WebviewPanel | EmbeddedDocumentSurface;
   private readonly disposables: vscode.Disposable[] = [];
   private model?: DocModel;
   private ready = false;
@@ -190,12 +214,26 @@ export class DocumentPanel {
   private pendingLoadId = 0;
   private loadRetryCount = 0;
   private loadAckTimer?: ReturnType<typeof setTimeout>;
+  private pendingScroll?: { line: number; endLine?: number };
+  private awaitingModel = false;
 
-  private constructor(panel: vscode.WebviewPanel, private actions: DocActions) {
+  private constructor(panel: vscode.WebviewPanel | EmbeddedDocumentSurface, private actions: DocActions) {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.webview.onDidReceiveMessage((m: Inbound) => this.handle(m), null, this.disposables);
-    this.panel.webview.html = this.shell();
+    this.panel.webview.onDidReceiveMessage((m: DocumentInbound) => this.handle(m), null, this.disposables);
+    if (!('embedded' in panel)) panel.webview.html = this.shell();
+  }
+
+  static useEmbeddedSurface(factory: () => EmbeddedDocumentSurface): vscode.Disposable {
+    DocumentPanel.closeIfOpen();
+    DocumentPanel.embeddedFactory = factory;
+    return {
+      dispose: () => {
+        if (DocumentPanel.embeddedFactory !== factory) return;
+        DocumentPanel.closeIfOpen();
+        DocumentPanel.embeddedFactory = undefined;
+      },
+    };
   }
 
   static show(model: DocModel, actions: DocActions): void {
@@ -204,8 +242,10 @@ export class DocumentPanel {
     inst.actions = actions;
     if (inst.model?.path !== model.path || inst.model?.revision !== model.revision) {
       inst.loadRetryCount = 0;
+      inst.pendingScroll = undefined;
     }
     inst.model = model;
+    inst.awaitingModel = false;
     inst.panel.title = `⏳ ${model.name}`;
     inst.panel.reveal(undefined, true);
     if (inst.ready) {
@@ -220,6 +260,12 @@ export class DocumentPanel {
    */
   static prewarm(actions: DocActions): void {
     if (DocumentPanel.current) {
+      return;
+    }
+    if (DocumentPanel.embeddedFactory) {
+      const surface = DocumentPanel.embeddedFactory();
+      DocumentPanel.current = new DocumentPanel(surface, actions);
+      surface.rebuild();
       return;
     }
     const panel = vscode.window.createWebviewPanel(
@@ -263,13 +309,30 @@ export class DocumentPanel {
     return DocumentPanel.current?.model?.path;
   }
 
+  static get contextKey(): string | undefined { return DocumentPanel.current?.model?.contextKey; }
+  static get revision(): string | undefined { return DocumentPanel.current?.model?.revision; }
+  static get isLoaded(): boolean { return !!DocumentPanel.current?.model && DocumentPanel.current.ready && !DocumentPanel.current.pendingLoadId && !DocumentPanel.current.awaitingModel; }
+
   static get isOpen(): boolean {
     return !!DocumentPanel.current;
+  }
+
+  static get isEmbedded(): boolean {
+    return !!DocumentPanel.current && 'embedded' in DocumentPanel.current.panel;
+  }
+
+  static get isReadOnly(): boolean {
+    return DocumentPanel.current?.model?.readOnly === true;
   }
 
   static beginLoading(path: string): void {
     const inst = DocumentPanel.current;
     if (inst) {
+      inst.awaitingModel = true;
+      inst.pendingScroll = undefined;
+      inst.pendingLoadId = 0;
+      if (inst.loadAckTimer) clearTimeout(inst.loadAckTimer);
+      inst.loadAckTimer = undefined;
       inst.panel.title = `⏳ ${path.split('/').pop() ?? path}`;
     }
   }
@@ -277,7 +340,9 @@ export class DocumentPanel {
   static restoreTitle(): void {
     const inst = DocumentPanel.current;
     if (inst?.model) {
+      inst.awaitingModel = false;
       inst.panel.title = `📄 ${inst.model.name}`;
+      if (inst.ready) inst.post();
     }
   }
 
@@ -294,7 +359,9 @@ export class DocumentPanel {
    * in the window where the panel was first created.
    */
   static closeIfOpen(): void {
-    DocumentPanel.current?.panel.dispose();
+    const current = DocumentPanel.current;
+    DocumentPanel.current = undefined;
+    current?.panel.dispose();
   }
 
   /** Re-renders the open document panel in the current language (after a language switch). */
@@ -302,15 +369,18 @@ export class DocumentPanel {
     const inst = DocumentPanel.current;
     if (inst) {
       inst.ready = false;
-      inst.panel.webview.html = inst.shell();
+      inst.rebuild();
     }
   }
 
   /** Switches to source view and scrolls a line (or line range) into view. */
   static scrollTo(line: number, endLine?: number): void {
     const inst = DocumentPanel.current;
-    if (inst?.ready) {
+    if (!inst) return;
+    inst.pendingScroll = { line, endLine };
+    if (inst.ready && !inst.pendingLoadId) {
       void inst.panel.webview.postMessage({ type: 'scrollTo', line, endLine });
+      inst.pendingScroll = undefined;
     }
   }
 
@@ -382,7 +452,7 @@ export class DocumentPanel {
   }
 
   private post(): void {
-    if (this.model) {
+    if (this.model && !this.awaitingModel) {
       const requestId = ++this.loadSequence;
       this.pendingLoadId = requestId;
       if (this.loadAckTimer) {
@@ -412,7 +482,7 @@ export class DocumentPanel {
     if (this.loadRetryCount < 1) {
       this.loadRetryCount++;
       this.ready = false;
-      this.panel.webview.html = this.shell();
+      this.rebuild();
       return;
     }
     this.pendingLoadId = 0;
@@ -422,20 +492,28 @@ export class DocumentPanel {
     );
   }
 
-  private handle(m: Inbound): void {
+  private rebuild(): void {
+    this.ready = false;
+    if ('embedded' in this.panel) this.panel.rebuild();
+    else this.panel.webview.html = this.shell();
+  }
+
+  private handle(message: DocumentInbound): void {
+    if (DocumentPanel.current !== this) return;
     // `ready` means the webview script has loaded and can receive postMessage.
     // It MUST be handled before the `!path` guard below: if the webview loads
     // fast enough that `ready` arrives before `show()` has assigned `this.model`,
     // the guard would drop it, `this.ready` would never flip true, and the panel
     // (a reused singleton) would stay blank forever — for this file and every
     // file opened afterwards.
-    if (m.type === 'ready') {
+    if (message.type === 'ready') {
       this.ready = true;
       this.post();
       return;
     }
-    if (m.type === 'loaded') {
-      if (m.requestId === this.pendingLoadId && this.model?.path === m.path) {
+    if (message.type === 'loaded') {
+      if (!this.awaitingModel && message.requestId === this.pendingLoadId && this.model?.path === message.path
+        && this.model.revision === message.revision && this.model.contextKey === message.contextKey) {
         if (this.loadAckTimer) {
           clearTimeout(this.loadAckTimer);
           this.loadAckTimer = undefined;
@@ -443,61 +521,74 @@ export class DocumentPanel {
         this.pendingLoadId = 0;
         this.loadRetryCount = 0;
         this.panel.title = `📄 ${this.model.name}`;
+        if (this.pendingScroll) {
+          void this.panel.webview.postMessage({ type: 'scrollTo', ...this.pendingScroll });
+          this.pendingScroll = undefined;
+        }
       }
       return;
     }
-    if (m.type === 'loadError') {
-      if (m.requestId === this.pendingLoadId) {
-        console.warn('[codereview] document load failed:', m.path, m.message ?? 'unknown error');
-        this.recoverLoad(m.requestId);
+    if (message.type === 'loadError') {
+      if (message.requestId === this.pendingLoadId) {
+        console.warn('[codereview] document load failed:', message.path, message.message ?? 'unknown error');
+        this.recoverLoad(message.requestId);
       }
       return;
     }
+    if (message.type === 'focusTree') { this.actions.focusTree(); return; }
     const path = this.model?.path;
     if (!path) {
       return;
     }
-    switch (m.type) {
+    if (this.awaitingModel || this.pendingLoadId || message.path !== path || message.revision !== this.model?.revision || message.contextKey !== this.model.contextKey) {
+      void vscode.window.showWarningMessage(m().reviewCenter.staleDocument);
+      return;
+    }
+    if (this.model.readOnly && message.type !== 'businessFinding' && message.type !== 'locate') {
+      void vscode.window.showWarningMessage(m().reviewCenter.readOnlyEvidence);
+      return;
+    }
+    switch (message.type) {
       case 'seen':
-        if (m.path === path) {
-          this.actions.seen(path, m.lines);
+        if (message.path === path) {
+          this.actions.seen(path, message.lines);
         }
         break;
       case 'translate':
-        this.actions.translate(path, m.startLine, m.endLine, m.text);
+        this.actions.translate(path, message.startLine, message.endLine, message.text);
         break;
       case 'translateWhole':
         this.actions.translateWhole(path);
         break;
       case 'explain':
-        this.actions.explain(path, m.startLine, m.endLine, m.text);
+        this.actions.explain(path, message.startLine, message.endLine, message.text);
         break;
       case 'note':
-        this.actions.note(path, m.startLine, m.endLine, m.text);
+        this.actions.note(path, message.startLine, message.endLine, message.text);
         break;
       case 'comment':
-        this.actions.comment(path, m.startLine, m.endLine, m.text);
+        this.actions.comment(path, message.startLine, message.endLine, message.text);
         break;
       case 'removeAnnotation':
-        this.actions.removeAnnotation(path, m.id);
+        this.actions.removeAnnotation(path, message.id);
         break;
       case 'regenerateAnnotation':
-        this.actions.regenerateAnnotation(path, m.id);
+        this.actions.regenerateAnnotation(path, message.id);
         break;
       case 'convertToNote':
-        this.actions.convertAnnotationToNote(path, m.id);
+        this.actions.convertAnnotationToNote(path, message.id);
         break;
       case 'editAnnotation':
-        this.actions.editAnnotation(path, m.id, m.content);
+        this.actions.editAnnotation(path, message.id, message.content);
         break;
       case 'dispose':
-        this.actions.disposeFinding(path, m.id, m.kind);
+        this.actions.disposeFinding(path, message.id, message.kind);
         break;
       case 'viewFix':
-        this.actions.viewFix(path, m.id, m.cachedOnly);
+        this.actions.viewFix(path, message.id, message.cachedOnly);
         break;
       case 'locate':
-        this.actions.locate(path, m.line, m.endLine, m.id);
+        this.actions.locate(path, message.line, message.endLine, message.id);
         break;
       case 'analyze':
         this.actions.analyze(path);
@@ -505,8 +596,9 @@ export class DocumentPanel {
       case 'jumpNext':
         this.actions.jumpNext(path);
         break;
-      case 'focusTree':
-        this.actions.focusTree();
+      case 'businessFinding':
+        if (this.model.findings.some((finding) => finding.id === message.id && finding.business) && this.actions.businessFinding) this.actions.businessFinding(message.id);
+        else void vscode.window.showWarningMessage(m().reviewCenter.staleSelection);
         break;
     }
   }
@@ -516,7 +608,7 @@ export class DocumentPanel {
       clearTimeout(this.loadAckTimer);
       this.loadAckTimer = undefined;
     }
-    DocumentPanel.current = undefined;
+    if (DocumentPanel.current === this) DocumentPanel.current = undefined;
     for (const d of this.disposables) {
       d.dispose();
     }
@@ -525,15 +617,21 @@ export class DocumentPanel {
   private shell(): string {
     const nonce = makeNonce();
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
-    const t = m().documentPanel;
     const lang = resolveLanguage();
+    const parts = documentViewParts();
     return `<!DOCTYPE html>
 <html lang="${lang}">
 <head>
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
-<style>
-  :root {
+${parts.styles}</head><body>${parts.body}<script nonce="${nonce}">${parts.script}</script></body></html>`;
+  }
+}
+
+export function documentViewParts(embedded = false): { styles: string; body: string; script: string } {
+    const t = m().documentPanel;
+    const styles = `<style>
+  :root, :host {
     --purple:#c586c0; --red:#f14c4c; --green:#4ec9b0;
     --yellow:#d8c020; --blue:#569cd6;
     --line:var(--vscode-panel-border);
@@ -542,11 +640,11 @@ export class DocumentPanel {
   }
   * { box-sizing:border-box; }
   html,body { height:100%; margin:0; }
-  body {
+  body, .document-surface {
     font-family:var(--vscode-font-family);
     color:var(--vscode-foreground);
     background:var(--vscode-editor-background);
-    display:flex; flex-direction:column; height:100vh;
+    display:flex; flex-direction:column; height:100%; min-height:0;
   }
   .topbar {
     display:flex; align-items:center; gap:8px;
@@ -829,8 +927,8 @@ export class DocumentPanel {
   @keyframes popSpin { to { transform:rotate(360deg); } }
   .hint { padding:6px 12px; color:var(--dim); font-size:11px; border-bottom:1px solid var(--line); background:rgba(197,134,192,.08); }
 </style>
-</head>
-<body>
+`;
+    const body = `<div class="document-surface">
   <div class="topbar">
     <span class="fname" id="fname"></span>
     <span class="spacer"></span>
@@ -861,11 +959,20 @@ export class DocumentPanel {
     <button id="pop-comment">${t.comment}</button>
   </div>
   <div class="pop-busy" id="pop-busy"><span class="spin"></span><span id="pop-busy-label"></span></div>
-<script nonce="${nonce}">
-const vscode = acquireVsCodeApi();
+</div>`;
+    const script = `((root, api) => {
+const vscode = {
+  getState: () => api.getState(),
+  setState: value => api.setState(value),
+  postMessage: message => api.postMessage(['ready','loaded','loadError'].includes(message.type) ? message : {
+    ...message, path:model?.path, revision:model?.revision, contextKey:model?.contextKey,
+  }),
+};
 const T = ${JSON.stringify(t)};
 const SEV = ${JSON.stringify(m().severity)};
 const DISP = ${JSON.stringify(m().disposition)};
+const BUSINESS = ${JSON.stringify(m().businessReview)};
+const CENTER = ${JSON.stringify(m().reviewCenter)};
 const sourceRenderPlan = ${sourceRenderPlan.toString()};
 const shouldCacheSourceDom = ${shouldCacheSourceDom.toString()};
 const diffChangeStarts = ${diffChangeStarts.toString()};
@@ -873,6 +980,7 @@ const nextDiffChangeIndex = ${nextDiffChangeIndex.toString()};
 const fmt = (s, ...a) => String(s).replace(/\\{(\\d+)\\}/g, (_, i) => a[Number(i)] ?? '');
 let model = null;
 let loadedPath = null;
+let loadedRevision = null;
 let mode = 'source';
 let displayMode = 'file';
 const seen = new Set();
@@ -890,7 +998,7 @@ let pendingDocumentLoad = null;
 let pendingDocumentLoadRaf = 0;
 let latestDocumentLoadId = 0;
 
-const $ = (id) => document.getElementById(id);
+const $ = (id) => root.getElementById(id);
 const contentEl = $('content');
 
 let bilingual = false;
@@ -906,10 +1014,11 @@ function setBiBusy(on) {
 // Side-by-side bilingual: the whole doc is translated once and rendered into the
 // right column; the left column is the untouched original. No per-block work.
 function fillTrColumn(html) {
-  const col = document.getElementById('readingTr');
+  const col = $('readingTr');
   if (col) col.innerHTML = html || ('<div class="tr-empty">' + T.translatingDoc + '</div>');
 }
 function ensureWholeTranslation() {
+  if (model?.readOnly) return;
   if (docTrHtml) { fillTrColumn(docTrHtml); return; }
   setBiBusy(true);
   fillTrColumn('');
@@ -926,6 +1035,21 @@ const SEV_LABEL = SEV;
 const DISP_LABEL = DISP;
 
 function findingCard(f) {
+  if (f.business) {
+    const card = document.createElement('div');
+    card.className = 'finding '+f.severity;
+    card.dataset.findingId = f.id;
+    const heading = document.createElement('button');
+    heading.className = 'f-head';
+    heading.textContent = BUSINESS[f.business.kind]+' · '+(f.business.stale?BUSINESS.stale:BUSINESS[f.business.status])+' · '+f.title;
+    heading.addEventListener('click',()=>vscode.postMessage({type:'businessFinding',id:f.id}));
+    const body = document.createElement('p');
+    body.className = 'f-body';body.textContent=f.detail;
+    const action = document.createElement('button');
+    action.textContent=CENTER.inspectFinding;
+    action.addEventListener('click',()=>vscode.postMessage({type:'businessFinding',id:f.id}));
+    card.append(heading,body,action);return card;
+  }
   const div = document.createElement('div');
   const unresolved = f.verificationStatus === 'unresolved';
   const overturned = f.verificationStatus === 'overturned';
@@ -1445,6 +1569,7 @@ function renderReading() {
 }
 
 function flushSeen() {
+  if (!model || model.readOnly) return;
   const fresh = [...visible].filter((l) => !seen.has(l));
   if (!fresh.length) return;
   for (const l of fresh) {
@@ -1456,14 +1581,16 @@ function flushSeen() {
 }
 
 function render() {
+  for (const id of ['act-analyze','act-jump','m-bi']) $(id).disabled = !!model.readOnly;
   $('fname').textContent = model.name;
   $('source-description').textContent = model.sourceDescription || '';
   $('source-description').hidden = !model.sourceDescription;
   // Switching to a different file should start at the top; refreshing the same
   // file (e.g. after re-analysis) should keep the reader where they were.
   const firstFile = loadedPath === null;
-  const isNewFile = model.path !== loadedPath;
+  const isNewFile = model.path !== loadedPath || model.revision !== loadedRevision;
   loadedPath = model.path;
+  loadedRevision = model.revision;
   if (firstFile) displayMode = model.defaultToDiff ? 'diff' : 'file';
   // A located highlight belongs to the file it was set in; drop it on switch.
   if (isNewFile) locatedRange = null;
@@ -1476,7 +1603,7 @@ function render() {
   for (const l of model.seen) seen.add(l);
   renderFindbar();
   // Restore the persisted bilingual preference (Markdown only).
-  bilingual = !!model.isMarkdown && !!(vscode.getState() || {}).bilingual;
+  bilingual = !model.readOnly && !!model.isMarkdown && !!(vscode.getState() || {}).bilingual;
   const biBtn0 = $('m-bi');
   if (biBtn0) biBtn0.classList.toggle('on', bilingual);
   if (showingDiff()) { setMode('source', isNewFile); }
@@ -1589,7 +1716,8 @@ function lineOf(node) {
 }
 
 function captureSelection() {
-  const sel = window.getSelection();
+  if (!model || model.readOnly) { pop.style.display = 'none'; pendingSel = null; return; }
+  const sel = root.getSelection ? root.getSelection() : window.getSelection();
   if (!sel || sel.isCollapsed) { pop.style.display = 'none'; pendingSel = null; return; }
   const text = sel.toString();
   if (!text.trim()) { pop.style.display = 'none'; pendingSel = null; return; }
@@ -1749,7 +1877,7 @@ function flushDocumentLoad() {
     render();
     requestAnimationFrame(() => {
       if (pending.requestId === latestDocumentLoadId) {
-        vscode.postMessage({ type:'loaded', requestId:pending.requestId, path:model.path });
+        vscode.postMessage({ type:'loaded', requestId:pending.requestId, path:model.path, revision:model.revision, contextKey:model.contextKey });
       }
     });
   } catch (error) {
@@ -1763,7 +1891,12 @@ function flushDocumentLoad() {
 }
 
 window.addEventListener('message', (ev) => {
-  const msg = ev.data;
+  const msg = ${embedded} ? ev.data?.type === 'document' ? ev.data.message : undefined : ev.data;
+  if (!msg) return;
+  if (msg.type === 'requestReady') {
+    vscode.postMessage({type:'ready'});
+    return;
+  }
   if (msg.type === 'load') {
     queueDocumentLoad(msg);
   }
@@ -1784,7 +1917,7 @@ window.addEventListener('message', (ev) => {
     if (displayMode === 'diff') setMode('source', false);
   }
   else if (msg.type === 'wholeTranslation') {
-    const col = document.getElementById('readingTr');
+    const col = $('readingTr');
     if (msg.done) {
       docTrHtml = msg.content || '';
       setBiBusy(false);
@@ -1867,7 +2000,8 @@ function centerLine(line) {
  */
 function focusFindingCard(f) {
   if (mode !== 'source') setMode('source');
-  vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
+  if (f.business) vscode.postMessage({type:'businessFinding',id:f.id});
+  else vscode.postMessage({ type:'viewFix', id:f.id, cachedOnly:true });
   const start = f.line;
   const end = (f.endLine && f.endLine > start) ? f.endLine : start;
   ensureSrcRenderedThrough(end);
@@ -1921,7 +2055,7 @@ function typingInField(el) {
   const tag = el.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
 }
-window.addEventListener('keydown', (e) => {
+root.addEventListener('keydown', (e) => {
   // Never hijack keys while editing a note or in any input.
   if (typingInField(e.target)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1932,14 +2066,14 @@ window.addEventListener('keydown', (e) => {
   } else if (k === 'a' || k === 'A') {
     // The ONLY shortcut that may cost tokens — mirrors the 基于此文件分析 button.
     const btn = $('act-analyze');
-    if (btn && !btn.classList.contains('analyzing')) {
+    if (btn && !btn.disabled && !btn.classList.contains('analyzing')) {
       e.preventDefault();
       setAnalyzing(true);
       vscode.postMessage({ type:'analyze' });
     }
   } else if (k === 'ArrowLeft' || k === 'Escape') {
     // Hand focus back to the file tree. Ignore ArrowLeft mid-text-selection.
-    const sel = window.getSelection();
+    const sel = root.getSelection ? root.getSelection() : window.getSelection();
     if (k === 'ArrowLeft' && sel && !sel.isCollapsed) return;
     e.preventDefault();
     vscode.postMessage({ type:'focusTree' });
@@ -1948,8 +2082,6 @@ window.addEventListener('keydown', (e) => {
 });
 
 vscode.postMessage({ type:'ready' });
-</script>
-</body>
-</html>`;
-  }
+})(${embedded ? "document.getElementById('review-source').shadowRoot, window.__reviewDocumentApi" : 'document, acquireVsCodeApi()'});`;
+    return { styles, body, script };
 }

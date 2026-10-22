@@ -310,11 +310,12 @@ async function ask(
 
 export async function businessReviewInputFits(
   model: vscode.LanguageModelChat, phase: BusinessModelPhase, payload: unknown, token: vscode.CancellationToken,
+  language: OutputLanguage = getOutputLanguage(),
 ): Promise<boolean> {
   if (token.isCancellationRequested) return false;
   const user = JSON.stringify(payload);
   if (user.length > BUSINESS_REVIEW_LIMITS.inputCharacters) return false;
-  const count = await model.countTokens(`${languageDirective()}\n\n${businessReviewPrompt(phase)}\n\n${user}`, token);
+  const count = await model.countTokens(`${languageDirective(language)}\n\n${businessReviewPrompt(phase)}\n\n${user}`, token);
   if (!Number.isFinite(count) || count < 0 || !Number.isFinite(model.maxInputTokens) || model.maxInputTokens <= 512) throw new AnalysisError(m().businessReview.inputLimit);
   return !token.isCancellationRequested && count <= model.maxInputTokens - 512;
 }
@@ -322,13 +323,15 @@ export async function businessReviewInputFits(
 export async function analyzeBusinessReviewPhase(
   model: vscode.LanguageModelChat, phase: BusinessModelPhase, payload: unknown,
   token: vscode.CancellationToken, usage: (record: TokenUsage) => void,
+  language: OutputLanguage = getOutputLanguage(),
 ): Promise<unknown> {
   if (token.isCancellationRequested) throw new vscode.CancellationError();
-  if (!await businessReviewInputFits(model, phase, payload, token)) {
+  if (!await businessReviewInputFits(model, phase, payload, token, language)) {
     if (token.isCancellationRequested) throw new vscode.CancellationError();
     throw new AnalysisError(m().businessReview.inputLimit);
   }
-  const raw = await ask(model, businessReviewPrompt(phase), JSON.stringify(payload), token, { op: 'business', onUsage: usage });
+  const raw = await ask(model, `${languageDirective(language)}\n\n${businessReviewPrompt(phase)}`, JSON.stringify(payload), token,
+    { op: 'business', onUsage: usage, skipLanguageDirective: true });
   if (token.isCancellationRequested) throw new vscode.CancellationError();
   return parseJson<unknown>(raw);
 }
@@ -1446,14 +1449,14 @@ export async function generateFixProposals(
   model: vscode.LanguageModelChat,
   fileRelPath: string,
   fileContent: string,
-  finding: { title: string; detail: string; suggestion?: string; line: number; endLine?: number; anchor?: string },
+  finding: { title: string; detail: string; suggestion?: string; line?: number; endLine?: number; anchor?: string },
   token: vscode.CancellationToken,
   userContext?: string,
 ): Promise<FixProposal[]> {
   const numbered = numberifyLines(fileContent);
-  const range = finding.endLine && finding.endLine > finding.line
-    ? `第 ${finding.line}-${finding.endLine} 行`
-    : `第 ${finding.line} 行附近`;
+  const range = finding.line
+    ? finding.endLine && finding.endLine > finding.line ? `第 ${finding.line}-${finding.endLine} 行` : `第 ${finding.line} 行附近`
+    : m().reviewCenter.fixLocationUnspecified;
   const anchorBlock = finding.anchor
     ? `问题代码（务必只修复这段，不要改到文件里其它类似位置）：\n${finding.anchor}\n\n`
     : '';

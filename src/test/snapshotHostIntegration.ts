@@ -1,7 +1,7 @@
 import * as assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { createScopePreparation } from '../scope/scopePreparationPanel';
@@ -13,6 +13,7 @@ import { addRequirementMaterial, createRequirementsDraft, currentMaterial } from
 import { readRequirementFile } from '../review/requirementSources';
 import { analyzeRequirementUnderstanding } from '../ai/analyzer';
 import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
+import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -23,14 +24,20 @@ function within<T>(promise: Promise<T>, milliseconds: number, label: string): Pr
 
 /** Runs in a real Extension Development Host, not the Vitest vscode mock. */
 export async function run(): Promise<void> {
-  const root = process.env.CODEREVIEW_HOST_TEST_ROOT;
+  const configuredRoot = process.env.CODEREVIEW_HOST_TEST_ROOT;
   const output = process.env.CODEREVIEW_HOST_TEST_RESULT;
-  assert.ok(root && output, 'The isolated host-test runner must provide the fixture paths');
+  assert.ok(configuredRoot && output, 'The isolated host-test runner must provide the fixture paths');
+  const root = await realpath(configuredRoot);
   const exec = promisify(execFile);
   const git = async (...args: string[]) => (await exec('git', args, { cwd: root })).stdout.trim();
   const checks: string[] = [];
   let preparation: ReturnType<typeof createScopePreparation> | undefined;
   try {
+    if (process.env.CODEREVIEW_HOST_TEST_PHASE === 'restore') {
+      checks.push(...await runReviewCenterRestartChecks(root));
+      await writeFile(output, JSON.stringify({ status: 'passed', checks }, null, 2));
+      return;
+    }
     await git('init', '--initial-branch=main');
     await git('config', 'core.autocrlf', 'false');
     await mkdir(path.join(root, 'src'));
@@ -131,7 +138,9 @@ export async function run(): Promise<void> {
     }, actions);
     assert.ok((await within(seen, 30_000, 'real document rendering and visible-line acknowledgement')).includes(1));
     checks.push('real document webview load and seen acknowledgement');
-    checks.push(...await runBusinessReviewHostChecks(root, set));
+    const business = await runBusinessReviewHostChecks(root, set);
+    checks.push(...business.checks);
+    checks.push(...await runReviewCenterHostChecks(root, business));
     assert.equal(await git('branch', '--show-current'), 'main');
     assert.equal(await git('stash', 'list'), '');
     assert.equal(await readFile(path.join(root, 'src', 'value.ts'), 'utf8'), 'local unsaved work\n');

@@ -108,7 +108,7 @@ export function businessConclusionSummary(run: BusinessReviewRun): string {
     `${t.findings}: ${(['confirmed', 'unresolved', 'dismissed'] as const).map((status) => `${t[status]} ${run.findings.filter((item) => item.status === status).length}`).join(' / ')}`,
     `${t.priorCritical}: ${run.priorCriticalVerdicts.filter((item) => item.status === 'cleared').length}/${run.priorCritical.length}`,
     fmt(t.errorCount, run.limitations.length, run.errors.length),
-    '', ...businessBlockers(run).map((reason) => `- ${reason}`),
+    '', ...businessBlockers(run).filter((reason) => reason !== t.humanConfirm).map((reason) => `- ${reason}`),
     '', t.boundary, t.materialSnapshotBoundary, t.summaryLocal,
   ].join('\n');
 }

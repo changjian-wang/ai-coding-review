@@ -12,6 +12,7 @@ import {
 
 export interface BusinessReviewServices {
   modelId: string;
+  inputVersion?: string;
   token: vscode.CancellationToken;
   now(): number;
   cancel(): void;
@@ -98,7 +99,7 @@ export async function runBusinessReview(
   const query = async <T>(phase: BusinessModelPhase, payload: unknown, parse: (value: unknown) => T): Promise<T> => {
     current();
     run.phase = phase;
-    const key = businessHash(JSON.stringify([run.version, run.modelId, phase, payload]));
+    const key = businessHash(JSON.stringify([run.version, run.modelId, services.inputVersion ?? '', phase, payload]));
     const cached = run.cache.find((entry) => entry.key === key && entry.phase === phase);
     if (cached) return parse(cached.value);
     if (!await fits(phase, payload)) throw new ReviewStop('budget', t.inputLimit);

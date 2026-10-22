@@ -326,6 +326,25 @@ describe('requirement-aware business review execution', () => {
     expect(changed.dependencies).not.toEqual(run.dependencies);
   });
 
+  it.each(['zh-CN:model-v1:prompt-v1', 'en:model-v2:prompt-v1', 'en:model-v1:prompt-v2'])(
+    'does not reuse another output-language, model-version or prompt-version namespace (%s)',
+    async (inputVersion) => {
+      const { set, baseline } = fixture();
+      const first = harness();
+      first.services.inputVersion = 'en:model-v1:prompt-v1';
+      const previous = await runBusinessReview(set, baseline, first.services);
+      const same = harness();
+      same.services.inputVersion = first.services.inputVersion;
+      await runBusinessReview(set, baseline, same.services, previous);
+      expect(same.request).not.toHaveBeenCalled();
+      const changed = harness();
+      changed.services.inputVersion = inputVersion;
+      await runBusinessReview(set, baseline, changed.services, previous);
+      expect(changed.request).toHaveBeenCalledWith('plan', expect.anything());
+      expect(changed.request).toHaveBeenCalledWith('global', expect.anything());
+    },
+  );
+
   it('does not forget a previously known critical issue when switching to technical mode', async () => {
     const { set, baseline } = fixture();
     const { services } = harness();

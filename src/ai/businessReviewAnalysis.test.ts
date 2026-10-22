@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
 import { analyzeBusinessReviewPhase, businessReviewInputFits, setTokenUsageSink } from './analyzer';
 import { BUSINESS_REVIEW_LIMITS } from '../review/businessReview';
+import { languageDirective } from './lang';
+import { vscodeMockState } from '../test/vscodeMock';
 
-afterEach(() => setTokenUsageSink(undefined));
+afterEach(() => { setTokenUsageSink(undefined); vscodeMockState.language = 'en'; });
 
 function fixture() {
-  const countTokens = vi.fn(async () => 25);
+  const countTokens = vi.fn<vscode.LanguageModelChat['countTokens']>(async () => 25);
   const sendRequest = vi.fn<vscode.LanguageModelChat['sendRequest']>(async () => ({
     text: (async function* () { yield '{"summary":"Actual whole-scope analysis","candidates":[],"requests":[]}'; })(),
     stream: (async function* () {})(),
@@ -69,5 +71,16 @@ describe('business-review model adapter', () => {
       text: (async function* () { yield '{not-json'; })(), stream: (async function* () {})(),
     }));
     await expect(analyzeBusinessReviewPhase(model, 'global', {}, cts.token, () => {})).rejects.toThrow();
+  });
+
+  it('uses one captured language for measured input and the actual request despite a UI language switch', async () => {
+    const { model, countTokens, sendRequest, cts } = fixture();
+    expect(await businessReviewInputFits(model, 'global', {}, cts.token, 'en')).toBe(true);
+    vscodeMockState.language = 'zh-CN';
+    await analyzeBusinessReviewPhase(model, 'global', {}, cts.token, () => {}, 'en');
+    expect(countTokens.mock.calls[0][0]).toBe(countTokens.mock.calls[1][0]);
+    const request = JSON.stringify(sendRequest.mock.calls[0][0]);
+    expect(request).toContain(languageDirective('en'));
+    expect(request).not.toContain(languageDirective('zh-CN'));
   });
 });
