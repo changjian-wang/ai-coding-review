@@ -202,6 +202,7 @@
     "package": "npm run check-types && node esbuild.js --production",
     "check-types": "tsc --noEmit",
     "test": "vitest run",
+    "test:host": "npm run compile && node scripts/run-host-tests.cjs",
     "test:watch": "vitest"
   },
   "devDependencies": {

@@ -38,13 +38,14 @@ import {
 import {
   pickScope,
   tryLoadPreferredScope,
-  type PickedScope,
   type PreferredScopeKind,
 } from './scope/scopePicker';
-import { FileSystemScope, PrByNumberScope } from './scope/scopes';
-import { currentBranch, headSha, listBranches, readFileAtRef, switchBranchTo } from './scope/gitClient';
+import { FileSystemScope, PrByNumberScope, BranchSnapshotScope, assertPrSnapshotCurrent } from './scope/scopes';
+import { currentBranch, listBranches, readFileAtRef, repositoryRoot } from './scope/gitClient';
+import { CommitSource } from './review/commitSource';
+import { realpath } from 'node:fs/promises';
 import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
-import { submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
+import { getPrByNumber, submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
 import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchProgressReporter, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
@@ -68,6 +69,24 @@ const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
 let currentBranchLabel: string | undefined;
+let commitSource: CommitSource | undefined;
+const legacyHistoryNotices = new Set<string>();
+
+function currentCommitSource(): CommitSource | undefined {
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
+  if (!set?.source || !cwd) return undefined;
+  if (commitSource?.reviewSet !== set || commitSource.cwd !== cwd) {
+    commitSource = new CommitSource(cwd, set);
+  }
+  return commitSource;
+}
+
+function ensureWorkingTreeReview(): boolean {
+  if (!session.reviewSet?.source) return true;
+  void vscode.window.showWarningMessage(m().scope.snapshotNoEdit);
+  return false;
+}
 let workbenchFilesVersion = -1;
 let workbenchFilesCache: WorkbenchFile[] = [];
 const workbenchFileIndex = new Map<string, number>();
@@ -147,6 +166,7 @@ function ensureReviewPath(relPath: string, action: string): boolean {
 }
 
 function closeScopeBoundPanels(): void {
+  openFileGeneration += 1;
   for (const timer of manualReloadTimers.values()) {
     clearTimeout(timer);
   }
@@ -201,6 +221,8 @@ function reflectReviewInvalidation(
 
 function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void {
   if (
+    session.reviewSet?.source
+    ||
     event.contentChanges.length === 0
     || event.document.uri.scheme !== 'file'
     || internalReviewEdits.has(reviewEditKey(event.document.uri))
@@ -255,44 +277,23 @@ function fixKey(rel: string, findingId: string): string {
   const findingRef = index >= 0
     ? findingContentSignatures(findings)[index]
     : findingId;
-  const repository = hashString(
-    (session.getCwd() ?? session.getRepoName()).replaceAll('\\', '/').toLowerCase(),
-  );
+  const repository = hashString(session.getRepoName());
   return `${repository}::${rel}::${findingRef}`;
-}
-
-function legacyFixKey(rel: string, findingId: string): string {
-  return `${rel}::${findingId}`;
 }
 
 function getAppliedFix(
   rel: string,
   findingId: string,
 ): { oldText: string; newText: string } | undefined {
-  const key = fixKey(rel, findingId);
-  const current = appliedFixes.get(key);
-  if (current) {
-    return current;
-  }
-  const legacyKey = legacyFixKey(rel, findingId);
-  const legacy = appliedFixes.get(legacyKey);
-  if (legacy) {
-    appliedFixes.set(key, legacy);
-    appliedFixes.delete(legacyKey);
-    flushAppliedFixes();
-  }
-  return legacy;
+  return appliedFixes.get(fixKey(rel, findingId));
 }
 
 function deleteAppliedFixFor(rel: string, findingId: string): void {
-  deleteAppliedFixKeys(fixKey(rel, findingId), legacyFixKey(rel, findingId));
+  deleteAppliedFixKeys(fixKey(rel, findingId));
 }
 
-function deleteAppliedFixKeys(key: string, legacyKey?: string): void {
+function deleteAppliedFixKeys(key: string): void {
   appliedFixes.delete(key);
-  if (legacyKey) {
-    appliedFixes.delete(legacyKey);
-  }
   flushAppliedFixes();
 }
 
@@ -316,6 +317,7 @@ type PersistedScope =
   | { kind: 'folder'; cwd: string }
   | { kind: 'preferred'; cwd: string }
   | { kind: 'files'; cwd: string; relPaths: string[] }
+  | { kind: 'branch'; cwd: string; headRef: string; baseRef?: string }
   | { kind: 'pr'; cwd: string; number: number; reviewSet?: ReviewSet };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
@@ -753,7 +755,6 @@ function migrateAppliedGlobalFixes(
     if (edit && oldKey !== newKey) {
       appliedFixes.set(newKey, edit);
       appliedFixes.delete(oldKey);
-      appliedFixes.delete(legacyFixKey(oldSpot.file, oldSpot.id));
       changed = true;
     }
   }
@@ -1052,14 +1053,19 @@ async function openInNewWindow(
     openingWorkbenchPanel = loading.panel;
     await moveActiveEditorToNewWindow();
 
-    const loaded = await loadPreferredReviewWithProgress(chosenCwd, loading.progress);
-    if (!loaded) {
+    const picked = await pickScope(chosenCwd, loading.panel.viewColumn);
+    if (!picked) {
       loading.panel.dispose();
-      transientWarning(m().review.noReviewableFiles);
       return;
     }
+    const reviewSet = await picked.scope.load(picked.cwd);
+    if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
+    await activateReviewSet(reviewSet, picked.cwd);
+    persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
     loading.progress.report(m().workbench.loadingOpening, 'open');
     WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
+  } catch (error) {
+    void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
     if (loadingPanel && !WorkbenchPanel.isOpen) {
       loadingPanel.dispose();
@@ -1115,7 +1121,9 @@ async function loadPreferredReviewWithProgress(
 }
 
 async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<void> {
-  await session.start(reviewSet, cwd);
+  const resolvedCwd = await realpath(reviewSet.source ? await repositoryRoot(cwd) : cwd);
+  await session.start(reviewSet, resolvedCwd);
+  commitSource = undefined;
   await refreshBranchLabel();
   closeScopeBoundPanels();
   workbenchSelected = undefined;
@@ -1128,6 +1136,18 @@ async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<voi
   layoutAppliedForCurrentReview = false;
   void vscode.commands.executeCommand('setContext', 'codereview.active', true);
   transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
+  const archive = session.legacyArchive;
+  if (archive && (archive.snapshots.length || Object.keys(archive.files).length) && !legacyHistoryNotices.has(resolvedCwd)) {
+    legacyHistoryNotices.add(resolvedCwd);
+    void vscode.window.showInformationMessage(m().scope.legacyHistory, m().scope.viewLegacyHistory).then(async (choice) => {
+      if (choice !== m().scope.viewLegacyHistory) return;
+      const document = await vscode.workspace.openTextDocument({
+        language: 'json',
+        content: JSON.stringify({ notice: m().scope.legacyArchiveTitle, ...archive }, null, 2),
+      });
+      await vscode.window.showTextDocument(document);
+    });
+  }
 }
 
 function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): string | undefined {
@@ -1145,56 +1165,34 @@ async function startReview(kind?: string): Promise<void> {
     return;
   }
 
-  if (scopePickInFlight) {
+  if (scopePickInFlight || workbenchOpenInFlight) {
     return;
   }
   scopePickInFlight = true;
-  let picked: PickedScope | undefined;
   try {
-    picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind);
+    const picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind);
+    if (!picked) return;
+    const { scope: source, cwd } = picked;
+    await withWorkbenchProgress(m().review.loadingSource, async () => {
+      const reviewSet = await source.load(cwd);
+      if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
+      await activateReviewSet(reviewSet, cwd);
+      persistScope(source, reviewSet, session.getCwd() ?? cwd);
+      void vscode.commands.executeCommand('setContext', 'codereview.active', true);
+      await openWorkbench();
+    });
+  } catch (error) {
+    void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
     scopePickInFlight = false;
   }
-  if (!picked) {
-    return;
-  }
-  const { scope: source, cwd } = picked;
-  await withWorkbenchProgress(
-    m().review.loadingSource,
-    async () => {
-      try {
-        const reviewSet = await source.load(cwd);
-        await session.start(reviewSet, cwd);
-        await refreshBranchLabel();
-        closeScopeBoundPanels();
-        workbenchSelected = undefined;
-        docRenderCache.clear();
-        docDiffCache.clear();
-        baseTextCache.clear();
-        baseRenderCache.clear();
-        rehydrateAppliedFixes();
-        WorkbenchPanel.resetFolders();
-        layoutAppliedForCurrentReview = false;
-        // Persist the exact scope so an extension/host restart can rebuild this
-        // same selection (and hit its saved snapshot), not just the whole folder.
-        persistScope(source, reviewSet, cwd);
-        void vscode.commands.executeCommand('setContext', 'codereview.active', true);
-        await openWorkbench();
-        transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
-      } catch (err) {
-        const message = String((err as Error)?.message ?? err);
-        void vscode.window.showErrorMessage(m().review.error(message));
-      }
-    },
-  );
 }
 
 /**
  * Records the scope the user just started reviewing so a later extension/host
  * restart can rebuild the *same* selection (and therefore reuse its persisted
- * snapshot). File-system selections store their resolved relative paths; other
- * scope kinds (e.g. PR) fall back to remembering the folder, since they are
- * reconstructed dynamically and their snapshot key follows the live head.
+ * snapshot). Commit-backed scopes remember their PR or branch/base selection
+ * and reload authoritative endpoints rather than restoring a working-tree alias.
  */
 function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): void {
   void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, cwd);
@@ -1202,6 +1200,8 @@ function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): v
   const descriptor: PersistedScope =
     source instanceof FileSystemScope
       ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
+      : source instanceof BranchSnapshotScope
+        ? { kind: 'branch', cwd, headRef: source.headRef, baseRef: source.baseRef }
       : Number.isFinite(prNumber)
         ? { kind: 'pr', cwd, number: prNumber, reviewSet }
         : { kind: 'preferred', cwd };
@@ -1240,7 +1240,7 @@ async function openDynMenu(kind: string): Promise<void> {
     const branches = await listBranches(cwd).catch(() => [] as string[]);
     WorkbenchPanel.postDynMenu(
       'branch',
-      branches.map((b) => ({ id: b, label: b, current: b === currentBranchLabel })),
+      branches.map((b) => ({ id: b, label: b, current: b === (session.reviewSet?.source?.headRef ?? currentBranchLabel) })),
     );
   }
 }
@@ -1258,21 +1258,24 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
   }
   if (kind === 'branch') {
     const cwd = session.getCwd();
-    if (!cwd || id === currentBranchLabel) {
+    if (!cwd || scopePickInFlight || workbenchOpenInFlight) {
       return;
     }
-    let result: { stashed: boolean };
+    scopePickInFlight = true;
     try {
-      result = await withWorkbenchProgress(m().workbench.switchingBranch(id), () => switchBranchTo(cwd, id));
+      const source = new BranchSnapshotScope(id, session.reviewSet?.source?.baseRef);
+      const set = await withWorkbenchProgress(m().review.loadingSource, () => source.load(cwd));
+      if (!set.files.length) throw new Error(m().scope.emptySnapshot);
+      await activateReviewSet(set, cwd);
+      persistScope(source, set, session.getCwd() ?? cwd);
     } catch (err) {
       WorkbenchPanel.flashNotice(m().workbench.branchSwitchFailed(id) + ': ' + String((err as Error)?.message ?? err), 'error');
       return;
+    } finally {
+      scopePickInFlight = false;
     }
     await refreshBranchLabel();
     WorkbenchPanel.refreshIfOpen();
-    if (result.stashed) {
-      WorkbenchPanel.flashNotice(m().workbench.branchStashed, 'warn');
-    }
   }
 }
 
@@ -1350,24 +1353,10 @@ async function moveActiveEditorToNewWindow(): Promise<void> {
 }
 
 /**
- * Switches the active git branch via VS Code's native checkout picker (same UI
- * as the status-bar branch indicator), then refreshes the HUD branch label. The
- * current review session/progress is left intact — to review the new branch's
- * content, use the 'Switch scope' button.
+ * Selects a commit-backed branch review without checking out or stashing files.
  */
 async function switchBranch(): Promise<void> {
-  const cwd = session.getCwd();
-  if (!cwd) {
-    return;
-  }
-  try {
-    await vscode.commands.executeCommand('git.checkout');
-  } catch (err) {
-    console.warn('[codereview] git.checkout failed:', err);
-    return;
-  }
-  await refreshBranchLabel();
-  WorkbenchPanel.rerenderIfOpen();
+  await startReview('branchChanges');
 }
 
 /**
@@ -1383,9 +1372,7 @@ async function switchProjectTo(cwd: string): Promise<void> {
   preferredDefaultCwd = cwd;
   setStatusBarBusy(true);
   try {
-    if (await loadPreferredReview(cwd)) {
-      await openWorkbench();
-    }
+    await startReview();
   } finally {
     setStatusBarBusy(false);
   }
@@ -1412,9 +1399,7 @@ async function switchProject(): Promise<void> {
   preferredDefaultCwd = pick.cwd;
   setStatusBarBusy(true);
   try {
-    if (await loadPreferredReview(pick.cwd)) {
-      await openWorkbench();
-    }
+    await startReview();
   } finally {
     setStatusBarBusy(false);
   }
@@ -1496,17 +1481,14 @@ async function restoreLastScope(
   progress?: WorkbenchProgressReporter,
 ): Promise<void> {
   const descriptor = workspaceMemento?.get<PersistedScope>(LAST_SCOPE_KEY);
-  if (descriptor?.kind === 'pr' || (descriptor?.kind === 'files' && descriptor.relPaths.length > 0)) {
+  if (descriptor?.kind === 'pr' || descriptor?.kind === 'branch' || (descriptor?.kind === 'files' && descriptor.relPaths.length > 0)) {
     try {
       progress?.report(m().workbench.loadingSavedScope, 'restore');
       let reviewSet: ReviewSet;
       if (descriptor.kind === 'pr') {
-        const currentHead = descriptor.reviewSet
-          ? await headSha(descriptor.cwd).catch(() => undefined)
-          : undefined;
-        reviewSet = descriptor.reviewSet && currentHead === descriptor.reviewSet.headSha
-          ? descriptor.reviewSet
-          : await new PrByNumberScope(descriptor.number).load(descriptor.cwd);
+        reviewSet = await new PrByNumberScope(descriptor.number).load(descriptor.cwd);
+      } else if (descriptor.kind === 'branch') {
+        reviewSet = await new BranchSnapshotScope(descriptor.headRef, descriptor.baseRef).load(descriptor.cwd);
       } else {
         reviewSet = await new FileSystemScope(descriptor.relPaths).load(descriptor.cwd);
       }
@@ -1514,7 +1496,8 @@ async function restoreLastScope(
       await activateReviewSet(reviewSet, descriptor.cwd);
       return;
     } catch (err) {
-      console.warn(`[codereview] restoreLastScope (${descriptor.kind}) failed; using preferred scope:`, err);
+      void vscode.window.showErrorMessage(m().review.error(String(err)));
+      return;
     }
   }
   if (progress) {
@@ -1571,6 +1554,10 @@ function changeBadge(status?: string, additions?: number, deletions?: number): W
  * non-git folder or any git failure simply clears it (the HUD then shows —).
  */
 async function refreshBranchLabel(): Promise<void> {
+  if (session.reviewSet?.source) {
+    currentBranchLabel = `${session.reviewSet.source.headRef} @ ${session.reviewSet.headSha.slice(0, 8)}`;
+    return;
+  }
   const cwd = session.getCwd();
   if (!cwd) {
     currentBranchLabel = undefined;
@@ -1643,7 +1630,9 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
 
   return {
     structureVersion,
-    label: reviewSet?.label ?? m().review.notStarted,
+    label: reviewSet?.source
+      ? `${reviewSet.label} · ${m().scope.snapshotNotice(reviewSet.source.headRef, reviewSet.headSha.slice(0, 8))}`
+      : reviewSet?.label ?? m().review.notStarted,
     files: workbenchFilesCache,
     selected: workbenchSelected,
     findings: selectedFindings,
@@ -1652,7 +1641,7 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
     globalDone: session.globalConfirmed,
     hasGlobalReport: !!session.globalReport,
     modelLabel: models.label,
-    repoName: session.getRepoName(),
+    repoName: reviewSet?.repositoryIdentity ?? session.getRepoLabel(),
     branch: currentBranchLabel,
     projects: (vscode.workspace.workspaceFolders ?? []).map((f) => ({
       cwd: f.uri.fsPath,
@@ -1776,7 +1765,15 @@ async function buildAndAttachDocDiff(
 ): Promise<void> {
   // Let the lightweight file model paint before base-file I/O and diff work.
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  const diffLines = await buildDocDiff(relPath, text);
+  let diffLines: DocDiffLine[] | undefined;
+  try {
+    diffLines = await buildDocDiff(relPath, text);
+  } catch (error) {
+    if (generation === openFileGeneration) {
+      DocumentPanel.flashNotice(relPath, m().review.error(String(error)), 'error');
+    }
+    return;
+  }
   if (
     generation !== openFileGeneration
     || DocumentPanel.currentPath !== relPath
@@ -1833,7 +1830,10 @@ async function buildDocDiff(
   if (file.status !== 'added') {
     const cacheKey = `${comparison.baseSha}:${basePath}`;
     if (!baseTextCache.has(cacheKey)) {
-      const loaded = await readFileAtRef(cwd, comparison.baseSha, basePath);
+      const source = currentCommitSource();
+      const loaded = source
+        ? await source.read(basePath, comparison.baseSha)
+        : await readFileAtRef(cwd, comparison.baseSha, basePath);
       baseTextCache.set(cacheKey, loaded ?? null);
     }
     baseText = baseTextCache.get(cacheKey) ?? undefined;
@@ -1882,6 +1882,11 @@ function buildDocModel(
     path: relPath,
     revision: render.revision,
     name: relPath.split('/').pop() ?? relPath,
+    sourceDescription: session.reviewSet?.source
+      ? isDeletedReviewFile(relPath) && session.reviewSet.comparison
+        ? m().scope.deletedSnapshotNotice(session.reviewSet.comparison.baseSha.slice(0, 8))
+        : m().scope.snapshotNotice(session.reviewSet.source.headRef, session.reviewSet.headSha.slice(0, 8))
+      : undefined,
     isMarkdown: render.isMarkdown,
     readingHtml: render.readingHtml,
     sourceLines: render.sourceLines,
@@ -2104,11 +2109,11 @@ async function reloadDocPanel(relPath: string): Promise<void> {
  * (file was edited by hand after applying). Returns whether the revert happened.
  */
 async function revertAppliedFix(rel: string, findingId: string): Promise<boolean> {
+  if (!ensureWorkingTreeReview()) return false;
   if (!ensureReviewPath(rel, m().actions.revertFix)) {
     return false;
   }
   const appliedFixKey = fixKey(rel, findingId);
-  const legacyAppliedFixKey = legacyFixKey(rel, findingId);
   const edit = getAppliedFix(rel, findingId);
   if (!edit) {
     return false;
@@ -2136,7 +2141,7 @@ async function revertAppliedFix(rel: string, findingId: string): Promise<boolean
     we.replace(fileUri, new vscode.Range(start, end), edit.oldText);
     const ok = await vscode.workspace.applyEdit(we);
     if (ok) {
-      deleteAppliedFixKeys(appliedFixKey, legacyAppliedFixKey);
+      deleteAppliedFixKeys(appliedFixKey);
       await reloadDocPanel(rel);
     }
     return ok;
@@ -2534,6 +2539,8 @@ async function readReviewFileText(relPath: string, strict = false): Promise<stri
   if (!ensureReviewPath(relPath, m().actions.read)) {
     return '';
   }
+  const source = currentCommitSource();
+  if (source) return source.readReviewFile(relPath);
   if (isDeletedReviewFile(relPath)) {
     return m().document.deletedFileNote;
   }
@@ -2598,12 +2605,16 @@ async function analyzeByPath(rel: string): Promise<void> {
   }
 
   let document: vscode.TextDocument;
+  const source = currentCommitSource();
+  const evidenceServices = source?.evidenceServices();
   try {
-    const uri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
-    document = await vscode.workspace.openTextDocument(uri);
-  } catch {
-    if (!DocumentPanel.flashNotice(rel, m().analysis.cannotOpen(rel), 'error')) {
-      void vscode.window.showWarningMessage(m().analysis.cannotOpen(rel));
+    document = source
+      ? await vscode.workspace.openTextDocument({ content: await source.read(rel), language: languageIdFor(rel) })
+      : await vscode.workspace.openTextDocument(vscode.Uri.joinPath(vscode.Uri.file(cwd), rel));
+  } catch (error) {
+    const message = `${m().analysis.cannotOpen(rel)}: ${String(error)}`;
+    if (!DocumentPanel.flashNotice(rel, message, 'error')) {
+      void vscode.window.showWarningMessage(message);
     }
     return;
   }
@@ -2642,10 +2653,13 @@ async function analyzeByPath(rel: string): Promise<void> {
       let context = await collectRelatedRepositoryContext({
         cwd,
         sourcePath: rel,
-        sourceDocument: document,
+        sourceDocument: source ? {
+          uri: vscode.Uri.joinPath(vscode.Uri.file(cwd), rel),
+          getText: () => document.getText(),
+        } : document,
         preferredPaths: reviewSet?.files.map((file) => file.path),
         token: cts.token,
-      });
+      }, evidenceServices);
       if (!stillCurrent()) {
         return;
       }
@@ -2670,7 +2684,7 @@ async function analyzeByPath(rel: string): Promise<void> {
       if (!stillCurrent()) {
         return;
       }
-      if (!await validateRepositoryAnalysisContext(context, cwd, cts.token)) {
+      if (!await validateRepositoryAnalysisContext(context, cwd, cts.token, evidenceServices)) {
         throw new AnalysisError(m().analysis.relatedCodeChanged);
       }
       if (!stillCurrent()) {
@@ -2797,6 +2811,7 @@ async function openFixProposal(
   finding: Finding,
   options?: { cacheOnly?: boolean },
 ): Promise<void> {
+  if (!ensureWorkingTreeReview()) return;
   const openGeneration = ++fixProposalOpenGeneration;
   const cwd = activeCwd();
   if (!cwd) {
@@ -2805,7 +2820,6 @@ async function openFixProposal(
   const [displayFinding] = localizeFindingsNow(rel, [finding], resolveLanguage());
   const findingId = finding.id;
   const appliedFixKey = fixKey(rel, findingId);
-  const legacyAppliedFixKey = legacyFixKey(rel, findingId);
   // Opening the fix panel must NOT move the document — the reviewer is reading a
   // specific spot and only the explicit 「定位」 button should scroll. Resolve the
   // finding's CURRENT line via the shared authority (no side effects), so the
@@ -2891,7 +2905,7 @@ async function openFixProposal(
       return !!current && isActionableFinding(current);
     },
     onUndone: () => {
-      deleteAppliedFixKeys(appliedFixKey, legacyAppliedFixKey);
+      deleteAppliedFixKeys(appliedFixKey);
       session.setFindingDisposition(rel, findingId, null);
       WorkbenchPanel.refreshIfOpen();
       // Reload the reverted file, then re-center on the finding again so the
@@ -3315,6 +3329,7 @@ function globalFixAnchor(spotId: string): string | undefined {
  * findings be fixed with the same one-click flow as file-level findings.
  */
 async function openGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
+  if (!ensureWorkingTreeReview()) return;
   const openGeneration = ++fixProposalOpenGeneration;
   if (!ensureReviewPath(file, m().actions.analyze)) {
     return;
@@ -3346,7 +3361,6 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   }
   const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
   const appliedFixKey = fixKey(file, spotId);
-  const legacyAppliedFixKey = legacyFixKey(file, spotId);
   const findingLike: Finding = {
     id: spotId,
     line: spot.line,
@@ -3411,7 +3425,7 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
       );
     },
     onUndone: () => {
-      deleteAppliedFixKeys(appliedFixKey, legacyAppliedFixKey);
+      deleteAppliedFixKeys(appliedFixKey);
       session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, null);
       WorkbenchPanel.refreshIfOpen();
       GlobalReportPanel.refreshIfOpen();
@@ -3796,10 +3810,9 @@ async function locateByAnchor(
     return undefined;
   }
   try {
-    const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
-    const doc = await vscode.workspace.openTextDocument(fileUri);
+    const text = await readReviewFileText(rel, true);
     const hit = locateSnippetLines(
-      doc.getText().split(/\r?\n/),
+      text.split(/\r?\n/),
       anchor,
       preferredLine,
     );
@@ -3902,6 +3915,12 @@ async function submitConclusion(): Promise<void> {
     return;
   }
 
+  const reviewedSet = session.reviewSet;
+  const reviewedSnapshot = session.snapshot;
+  if (!reviewedSnapshot) {
+    void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
+    return;
+  }
   const choice = await vscode.window.showQuickPick(
     [
       { label: `$(check) ${m().conclusion.approve}`, value: 'approve' as const },
@@ -3913,11 +3932,15 @@ async function submitConclusion(): Promise<void> {
   if (!choice) {
     return;
   }
+  if (session.reviewSet !== reviewedSet || !session.gatePassed()) {
+    void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
+    return;
+  }
 
   const cleanLabel = choice.label.replace(/\$\([^)]+\)\s*/, '');
   const conclusionVerdict =
     choice.value === 'approve' ? 'approve' : choice.value === 'changes' ? 'request-changes' : 'comment';
-  const prMatch = session.reviewSet.scopeId.match(/^pr-(\d+)$/);
+  const prMatch = reviewedSet.scopeId.match(/^pr-(\d+)$/);
   if (prMatch) {
     const prNumber = Number(prMatch[1]);
     const confirm = await vscode.window.showWarningMessage(
@@ -3928,19 +3951,34 @@ async function submitConclusion(): Promise<void> {
     if (confirm !== m().conclusion.submitToGitHub) {
       return;
     }
+    if (session.reviewSet !== reviewedSet || !session.gatePassed()) {
+      void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
+      return;
+    }
     const cwd = activeCwd();
     if (!cwd) {
       return;
     }
     const c = session.totalCoverage();
     const body = m().conclusion.prBody(c.filesReady, c.filesTotal);
-    const pending = session.pendingComments;
+    const pending = [...session.pendingComments];
     try {
-      if (pending.length > 0) {
+      if (reviewedSet.source) {
+        const match = /^([^/]+)\/(.+)$/.exec(reviewedSet.repositoryIdentity ?? '');
+        if (!match) throw new Error(m().scope.prSnapshotChanged);
+        const target = { host: match[1], nameWithOwner: match[2] };
+        const current = await getPrByNumber(cwd, prNumber, target);
+        if (session.reviewSet !== reviewedSet || !session.gatePassed()) throw new Error(m().scope.prSnapshotChanged);
+        assertPrSnapshotCurrent(reviewedSet, current);
+        await submitPrReviewWithComments(
+          cwd, prNumber, reviewedSet.headSha, conclusionVerdict, body,
+          pending.map((pc) => ({ path: pc.path, startLine: pc.startLine, endLine: pc.endLine, body: pc.body })), target,
+        );
+      } else if (pending.length > 0) {
         await submitPrReviewWithComments(
           cwd,
           prNumber,
-          session.reviewSet.headSha,
+          reviewedSet.headSha,
           conclusionVerdict,
           body,
           pending.map((pc) => ({
@@ -3950,17 +3988,16 @@ async function submitConclusion(): Promise<void> {
             body: pc.body,
           })),
         );
-        session.clearPendingComments();
       } else {
         await submitPrReview(cwd, prNumber, conclusionVerdict, body);
       }
-      session.setConclusion({
+      await session.recordPostedConclusion(reviewedSnapshot, {
         verdict: conclusionVerdict,
         label: cleanLabel,
         target: 'pr',
         prNumber,
         submittedAt: Date.now(),
-      });
+      }, pending.map((comment) => comment.id));
       transientInfo(m().conclusion.postedToPr(prNumber, cleanLabel));
     } catch (err) {
       reportError(err);

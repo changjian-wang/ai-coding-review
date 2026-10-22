@@ -118,6 +118,8 @@ export type RepositoryContextLimitReason =
   | 'provider-calls'
   | 'scan-characters'
   | 'scan-unavailable'
+  | 'language-services-unavailable'
+  | 'read-unavailable'
   | 'timeout';
 
 /** Bounded repository graph rooted at the file whose analysis the user requested. */

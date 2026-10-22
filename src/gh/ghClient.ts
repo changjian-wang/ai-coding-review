@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { m } from '../i18n';
-import type { PullRequest, PrSummary } from './types';
+import type { PullRequest, PrSummary, GitHubRepositoryTarget } from './types';
 
 const pexec = promisify(execFile);
 
@@ -74,17 +74,10 @@ export async function ensureAuth(cwd: string): Promise<void> {
 
 /** Loads the PR associated with the current branch in `cwd`. */
 export async function getCurrentPr(cwd: string): Promise<PullRequest> {
-  let json: string;
-  try {
-    json = await runGh(
-      ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files'],
-      cwd,
-    );
-  } catch {
-    // gh exits non-zero when the current branch has no associated PR (e.g. on
-    // main). Surface a clear, actionable message instead of the raw gh stderr.
-    throw new GhError(m().gh.noCurrentPr);
-  }
+  const json = await runGh(
+    ['pr', 'view', '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files'],
+    cwd,
+  );
   let raw: {
     number: number;
     title: string;
@@ -193,9 +186,18 @@ export async function currentLogin(cwd: string): Promise<string> {
 }
 
 /** Loads a specific PR by number — may be a branch we don't have checked out. */
-export async function getPrByNumber(cwd: string, number: number): Promise<PullRequest> {
+function validateTarget(target: GitHubRepositoryTarget | undefined): void {
+  if (target && (target.host !== 'github.com' || !/^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(target.nameWithOwner)
+    || ['.', '..'].includes(target.nameWithOwner.split('/')[1]))) {
+    throw new GhError(m().git.invalidPrTarget);
+  }
+}
+
+export async function getPrByNumber(cwd: string, number: number, target?: GitHubRepositoryTarget): Promise<PullRequest> {
+  validateTarget(target);
   const json = await runGh(
-    ['pr', 'view', String(number), '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files'],
+    ['pr', 'view', String(number), '--json', 'number,title,url,headRefName,baseRefName,baseRefOid,headRefOid,files',
+      ...(target ? ['--repo', `${target.host}/${target.nameWithOwner}`] : [])],
     cwd,
   );
   let raw: {
@@ -291,15 +293,20 @@ export async function submitPrReviewWithComments(
   verdict: 'approve' | 'request-changes' | 'comment',
   body: string,
   comments: { path: string; startLine: number; endLine: number; body: string }[],
+  target?: GitHubRepositoryTarget,
 ): Promise<void> {
-  const repoJson = await runGh(['repo', 'view', '--json', 'owner,name'], cwd);
-  let repo: { owner: { login: string }; name: string };
-  try {
-    repo = JSON.parse(repoJson);
-  } catch {
-    throw new GhError(m().gh.repoViewParseFailed);
+  validateTarget(target);
+  let slug = target?.nameWithOwner;
+  if (!slug) {
+    const repoJson = await runGh(['repo', 'view', '--json', 'owner,name'], cwd);
+    let repo: { owner: { login: string }; name: string };
+    try {
+      repo = JSON.parse(repoJson);
+    } catch {
+      throw new GhError(m().gh.repoViewParseFailed);
+    }
+    slug = `${repo.owner.login}/${repo.name}`;
   }
-  const slug = `${repo.owner.login}/${repo.name}`;
   const event =
     verdict === 'approve' ? 'APPROVE' : verdict === 'request-changes' ? 'REQUEST_CHANGES' : 'COMMENT';
   const payload = {
@@ -329,7 +336,8 @@ export async function submitPrReviewWithComments(
   await fs.writeFile(tmp, JSON.stringify(payload), 'utf8');
   try {
     await runGh(
-      ['api', `repos/${slug}/pulls/${prNumber}/reviews`, '-X', 'POST', '--input', tmp],
+      ['api', `repos/${slug}/pulls/${prNumber}/reviews`, '-X', 'POST', '--input', tmp,
+        ...(target ? ['--hostname', target.host] : [])],
       cwd,
     );
   } finally {

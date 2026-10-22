@@ -27,11 +27,14 @@ English | [简体中文](README.zh-CN.md)
 
 ### Review scope (workspace-first)
 
-- The whole project folder (auto-skips `node_modules / .git / dist / out / bin / obj / .vs`)
-- A self-built webview tree picker, locked to the project root, to pick any file subset
-- The current branch's PR (via `gh`)
-- Current branch vs base branch (pure git diff)
-- Uncommitted working-tree changes (pure git)
+- The preparation page selects a local repository and a PR, a branch comparison with an explicit base, or a full branch snapshot. Choose an open repository or explicitly browse to another local repository.
+- PR and branch scopes pin actual commits. Source, Diff, and related evidence come from the selected Git objects without implicit checkout, stash, or working-tree replacement. Missing PR objects are fetched for the selected GitHub PR; failures are explicit.
+- Full snapshots list committed files, not untracked edits or another branch's working tree. Binary/non-UTF-8 content, symlinks, and submodules are explicitly rejected as regular text rather than silently treated as reviewed.
+- Local file/folder reviews remain available through the root-locked tree picker, skipping `node_modules / .git / dist / out / bin / obj / .vs`. This mode reads working-tree files and open unsaved documents.
+- Immutable snapshots do not apply or revert fixes against a different working tree. Explicitly select a local-file review to edit; verified delivery to the PR head is a later implementation stage.
+- Persistence uses canonical repository-path identities, with commit/base/scope isolation for snapshots. Same-name folders do not share reviews. Ambiguous legacy folder-name history remains available as a separate archive, without automatically reusing approvals or patches.
+
+Development status: this is the first foundation slice of the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md), not delivery of the entire vNext. Requirement intake/understanding, business-chain orchestration, the final three-stage workspace, and Reviewer Reply/Resolve remain planned. Snapshot evidence currently uses bounded text searches rather than language services for another working-tree version; context-limited analyses are not counted as fully ready.
 
 ### Review workbench
 

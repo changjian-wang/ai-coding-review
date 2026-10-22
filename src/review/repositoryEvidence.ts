@@ -44,6 +44,7 @@ interface EvidenceLocation {
 }
 
 export interface RepositoryEvidenceServices {
+  languageServicesAvailable?: boolean;
   definitions(uri: vscode.Uri, position: vscode.Position): Promise<EvidenceLocation[]>;
   references(uri: vscode.Uri, position: vscode.Position): Promise<EvidenceLocation[]>;
   readText(uri: vscode.Uri): Promise<string>;
@@ -65,7 +66,7 @@ export interface RepositoryEvidenceRequest {
 export interface RelatedRepositoryContextRequest {
   cwd: string;
   sourcePath: string;
-  sourceDocument: vscode.TextDocument;
+  sourceDocument: Pick<vscode.TextDocument, 'uri' | 'getText'>;
   preferredPaths?: readonly string[];
   token: vscode.CancellationToken;
 }
@@ -751,6 +752,9 @@ export async function collectRelatedRepositoryContext(
   services: RepositoryEvidenceServices = defaultServices,
 ): Promise<RepositoryAnalysisContext> {
   const reasons = new Set<RepositoryContextLimitReason>();
+  if (services.languageServicesAvailable === false) {
+    addLimitReason(reasons, 'language-services-unavailable');
+  }
   const budget: EvidenceBudget = {
     usedChars: 0,
     deadline: services.now() + RELATED_CONTEXT_LIMITS.timeoutMs,
@@ -843,7 +847,7 @@ export async function collectRelatedRepositoryContext(
       addLimitReason(reasons, 'timeout');
       continue;
     }
-    const symbols = extractRelationshipSymbols(
+    const symbols = services.languageServicesAvailable === false ? [] : extractRelationshipSymbols(
       node.text,
       node.depth === 0
         ? RELATED_CONTEXT_LIMITS.symbolsPerRoot
@@ -907,7 +911,7 @@ export async function collectRelatedRepositoryContext(
   const enrichment = reviewablePaths
     .filter((file) =>
       !nodes.has(file)
-      && (isTestPath(file) || isConfigurationPath(file)),
+      && (services.languageServicesAvailable === false || isTestPath(file) || isConfigurationPath(file)),
     )
     .sort((a, b) =>
       Number(preferred.has(b)) - Number(preferred.has(a))
@@ -933,9 +937,10 @@ export async function collectRelatedRepositoryContext(
     let text: string;
     try {
       text = await beforeDeadline(services.readText(uri), budget, services);
-    } catch {
-      addLimitReason(reasons, 'timeout');
-      break;
+    } catch (error) {
+      console.warn(`[codereview] Related evidence could not be read: ${file}`, error);
+      addLimitReason(reasons, services.now() >= budget.deadline ? 'timeout' : 'read-unavailable');
+      continue;
     }
     scannedChars += text.length;
     const matched = rootSymbols.find((symbol) => findSymbolOffsets(text, symbol, 1).length > 0);
@@ -948,7 +953,7 @@ export async function collectRelatedRepositoryContext(
       uri,
       text,
       depth: 1,
-      relationKind: isTestPath(file) ? 'test' : 'configuration',
+      relationKind: isTestPath(file) ? 'test' : isConfigurationPath(file) ? 'configuration' : 'search',
       relationSymbol: matched,
       lines: new Set([lineAtOffset(text, offset)]),
     });

@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+
 interface Disposable {
   dispose(): void;
 }
@@ -296,6 +298,10 @@ export class EventEmitter<T> {
 export class Uri {
   static file(fsPath: string): { fsPath: string; scheme: string } {
     return { fsPath, scheme: 'file' };
+  }
+
+  static joinPath(base: { fsPath: string }, ...parts: string[]): { fsPath: string; scheme: string } {
+    return Uri.file(path.join(base.fsPath, ...parts));
   }
 }
 

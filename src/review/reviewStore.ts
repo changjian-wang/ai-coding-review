@@ -1,5 +1,6 @@
 import type * as vscode from 'vscode';
 import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
+import type { ReviewComparison, ReviewSource } from '../scope/types';
 
 /** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
 export interface Annotation {
@@ -80,6 +81,11 @@ export interface PendingComment {
 
 /** A complete, persistable snapshot of one review. */
 export interface ReviewSnapshot {
+  schemaVersion?: 2;
+  repositoryRoot?: string;
+  repositoryIdentity?: string;
+  source?: ReviewSource;
+  comparison?: ReviewComparison;
   repo: string;
   /** Stable id of the review scope (selected files / PR / branch / working tree). */
   scopeId: string;
@@ -171,6 +177,10 @@ export function isBlankFileState(s: PerFileState | undefined): boolean {
  * user across machines.
  */
 export interface ReviewStore {
+  legacyArchive?(legacyName: string): Promise<{
+    snapshots: ReviewSnapshot[];
+    files: Record<string, PerFileState>;
+  }>;
   load(key: ReviewKey): Promise<ReviewSnapshot | undefined>;
   save(snapshot: ReviewSnapshot): Promise<void>;
   clear(key: ReviewKey): Promise<void>;
@@ -204,6 +214,23 @@ export interface ReviewStore {
 /** Local, single-machine store backed by VS Code workspaceState. */
 export class WorkspaceStateReviewStore implements ReviewStore {
   constructor(private readonly memento: vscode.Memento) {}
+
+  async legacyArchive(legacyName: string): Promise<{ snapshots: ReviewSnapshot[]; files: Record<string, PerFileState> }> {
+    const snapshots: ReviewSnapshot[] = [];
+    const files: Record<string, PerFileState> = {};
+    const scopePrefix = `codereview:review:${legacyName}#`;
+    const filePrefix = `codereview:file:${legacyName}#`;
+    for (const key of this.memento.keys()) {
+      if (key.startsWith(scopePrefix)) {
+        const snapshot = this.memento.get<ReviewSnapshot>(key);
+        if (snapshot) snapshots.push(snapshot);
+      } else if (key.startsWith(filePrefix)) {
+        const state = this.memento.get<PerFileState>(key);
+        if (state) files[key.slice(filePrefix.length)] = state;
+      }
+    }
+    return { snapshots, files };
+  }
 
   async load(key: ReviewKey): Promise<ReviewSnapshot | undefined> {
     return this.memento.get<ReviewSnapshot>(storageKey(key));

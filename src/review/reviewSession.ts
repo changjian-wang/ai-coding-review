@@ -15,6 +15,7 @@ import {
 import type { TokenUsage } from '../ai/analyzer';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
+import { canonicalRepositoryPath, repositoryLabel, repositoryStorageId } from './repositoryIdentity';
 
 export interface ReviewSessionChange {
   filePath?: string;
@@ -44,6 +45,7 @@ export class ReviewSession {
   private reviewFilesByPath = new Map<string, ReviewFile>();
   private deletedPaths = new Set<string>();
   private structureVersion = 0;
+  private startGeneration = 0;
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
@@ -51,6 +53,8 @@ export class ReviewSession {
   private cwd?: string;
   /** Repo name override for the active review (typically basename of cwd). */
   private repoName?: string;
+  private repoLabel?: string;
+  legacyArchive?: Awaited<ReturnType<NonNullable<ReviewStore['legacyArchive']>>>;
 
   constructor(
     private readonly store: ReviewStore,
@@ -70,12 +74,22 @@ export class ReviewSession {
     return this.repoName ?? this.defaultRepo;
   }
 
+  getRepoLabel(): string {
+    return this.repoLabel ?? this.defaultRepo;
+  }
+
   /** Loads or initialises review progress for the given review set. */
   async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
+    const generation = ++this.startGeneration;
     await this.flushPendingFilePersists();
-    this.cwd = cwd;
-    this.repoName = cwd ? path.basename(cwd) : this.defaultRepo;
-    const repo = this.repoName;
+    const label = cwd ? repositoryLabel(cwd) : this.defaultRepo;
+    const rootId = cwd ? repositoryStorageId(cwd, reviewSet.repositoryIdentity) : this.defaultRepo;
+    const repo = reviewSet.source
+      ? `${rootId}:commit:${reviewSet.headSha}:${reviewSet.comparison?.baseSha ?? ''}:${reviewSet.source.baseTipSha ?? ''}:${reviewSet.scopeId}`
+      : `${rootId}:working-tree`;
+    const legacyArchive = this.store.legacyArchive
+      ? await this.store.legacyArchive(label)
+      : undefined;
     const key: ReviewKey = {
       repo,
       scopeId: reviewSet.scopeId,
@@ -109,18 +123,11 @@ export class ReviewSession {
       ...reviewSet.files,
       ...contextFiles.map((filePath) => ({ path: filePath, context: true })),
     ];
-    this.reviewSet = { ...reviewSet, files: effectiveFiles };
-    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
-    this.deletedPaths = new Set(
-      effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
-    );
-    this.structureVersion++;
-
     // Keep state sparse: untouched files do not allocate promises or empty
     // PerFileState objects. Existing progress is loaded in one key scan.
     const perFile: Record<string, PerFileState> = {};
     const toMigrate: string[] = [];
-    const activePaths = new Set(this.reviewFilesByPath.keys());
+    const activePaths = new Set(effectiveFiles.map((file) => file.path));
     const stored = await this.loadStoredFileStates(repo, activePaths);
     for (const [filePath, state] of stored) {
       if (!isBlankFileState(state)) {
@@ -147,7 +154,23 @@ export class ReviewSession {
       }
     }
 
+    if (generation !== this.startGeneration) return;
+    this.cwd = cwd;
+    this.repoLabel = label;
+    this.repoName = repo;
+    this.legacyArchive = legacyArchive;
+    this.reviewSet = { ...reviewSet, files: effectiveFiles };
+    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
+    this.deletedPaths = new Set(
+      effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
+    );
+    this.structureVersion++;
     this.snapshot = {
+      schemaVersion: 2,
+      repositoryRoot: cwd ? canonicalRepositoryPath(cwd) : undefined,
+      repositoryIdentity: reviewSet.repositoryIdentity,
+      source: reviewSet.source,
+      comparison: reviewSet.comparison,
       repo,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
@@ -165,7 +188,7 @@ export class ReviewSession {
     // Surface the panel immediately; persist migrated/initial state in the
     // background so a large review set doesn't block opening.
     this._onDidChange.fire({ structureChanged: true });
-    void this.persistInBackground(repo, toMigrate);
+    void this.persistInBackground(this.snapshot, toMigrate);
   }
 
   /**
@@ -173,22 +196,19 @@ export class ReviewSession {
    * were migrated or newly created — off the startup path so a large review set
    * opens immediately.
    */
-  private async persistInBackground(repo: string, migratedPaths: string[]): Promise<void> {
-    if (!this.snapshot) {
-      return;
-    }
+  private async persistInBackground(snapshot: ReviewSnapshot, migratedPaths: string[]): Promise<void> {
     try {
       if (this.store.saveFile) {
         for (const p of migratedPaths) {
-          const s = this.snapshot.perFile[p];
+          const s = snapshot.perFile[p];
           if (s) {
-            await this.store.saveFile(repo, p, s);
+            await this.store.saveFile(snapshot.repo, p, s);
           }
         }
       }
-      await this.persistScopeMeta();
-    } catch {
-      // Non-fatal: progress stays in memory and re-persists on the next change.
+      await this.persistScopeMeta(snapshot);
+    } catch (error) {
+      void vscode.window.showWarningMessage(m().review.saveFailed(String(error)));
     }
   }
 
@@ -426,7 +446,7 @@ export class ReviewSession {
       return true;
     }
     const s = this.fileState(path);
-    if (!s || !s.analyzed) {
+    if (!s || !s.analyzed || (this.reviewSet?.source && s.analysisSummary?.contextTruncated)) {
       return false;
     }
     const dispositions = s.dispositions ?? {};
@@ -1088,6 +1108,17 @@ export class ReviewSession {
     }
   }
 
+  async recordPostedConclusion(snapshot: ReviewSnapshot, conclusion: ReviewConclusion, submittedIds: readonly string[]): Promise<void> {
+    const active = this.snapshot;
+    const target = active && active.repo === snapshot.repo && active.scopeId === snapshot.scopeId && active.headSha === snapshot.headSha
+      ? active : snapshot;
+    const posted = new Set(submittedIds);
+    target.pendingComments = (target.pendingComments ?? []).filter((comment) => !posted.has(comment.id));
+    target.conclusion = conclusion;
+    await this.persistScopeMeta(target);
+    if (this.snapshot === target) this._onDidChange.fire({});
+  }
+
   get conclusion(): ReviewConclusion | undefined {
     return this.snapshot?.conclusion;
   }
@@ -1176,7 +1207,7 @@ export class ReviewSession {
       seen += state.totalLines > 0 ? Math.min(fileSeen, state.totalLines) : fileSeen;
       total += state.totalLines;
       if (
-        state.analyzed
+        this.fileReady(filePath)
         && state.findings
           .filter(isActionableFinding)
           .every((finding) => !!state.dispositions?.[finding.id])
@@ -1196,18 +1227,19 @@ export class ReviewSession {
     if (!this.snapshot) {
       return;
     }
-    const repo = this.getRepoName();
+    const snapshot = this.snapshot;
+    const repo = snapshot.repo;
     try {
       // Per-file progress → per-file storage (the source of truth). The scope
       // snapshot keeps only scope-level data; writing every file here too would
       // make each change re-serialize a huge object, so we DON'T — see
       // persistScopeMeta / persistFile for the granular writes.
       if (this.store.saveFile) {
-        for (const [filePath, state] of Object.entries(this.snapshot.perFile)) {
+        for (const [filePath, state] of Object.entries(snapshot.perFile)) {
           await this.store.saveFile(repo, filePath, state);
         }
       }
-      await this.persistScopeMeta();
+      await this.persistScopeMeta(snapshot);
     } catch (err) {
       const message = String((err as Error)?.message ?? err);
       void vscode.window.showWarningMessage(m().review.saveFailed(message));
@@ -1245,15 +1277,16 @@ export class ReviewSession {
     if (!this.snapshot) {
       return;
     }
-    const repo = this.getRepoName();
-    const state = this.snapshot.perFile[filePath];
+    const snapshot = this.snapshot;
+    const repo = snapshot.repo;
+    const state = snapshot.perFile[filePath];
     try {
       if (state && this.store.saveFile) {
         await this.store.saveFile(repo, filePath, state);
       }
-      await this.persistScopeMeta();
-    } catch {
-      // Non-fatal; stays in memory and re-persists on the next change.
+      await this.persistScopeMeta(snapshot);
+    } catch (error) {
+      void vscode.window.showWarningMessage(m().review.saveFailed(String(error)));
     }
   }
 
@@ -1268,21 +1301,24 @@ export class ReviewSession {
 
   /** Saves the scope-level snapshot (global report / conclusion / token usage),
    * with the bulky perFile map stripped — per-file storage owns that. */
-  private async persistScopeMeta(): Promise<void> {
-    if (!this.snapshot) {
+  private async persistScopeMeta(snapshot = this.snapshot): Promise<void> {
+    if (!snapshot) {
       return;
     }
-    this.snapshot.updatedAt = Date.now();
-    await this.store.save({ ...this.snapshot, perFile: {} });
+    snapshot.updatedAt = Date.now();
+    await this.store.save({ ...snapshot, perFile: {} });
   }
 
   /** Fire-and-forget scope-meta persist for scope-level mutations (no per-file rewrite). */
   private persistScope(): void {
-    void this.persistScopeMeta().catch(() => {/* non-fatal */});
+    void this.persistScopeMeta().catch((error) => {
+      void vscode.window.showWarningMessage(m().review.saveFailed(String(error)));
+    });
     this._onDidChange.fire({});
   }
 
   dispose(): void {
+    this.startGeneration++;
     void this.flushPendingFilePersists();
     this._onDidChange.dispose();
   }

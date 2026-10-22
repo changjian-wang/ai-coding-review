@@ -9,18 +9,20 @@ const MAX_BUFFER = 32 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
 
 /** Raised for any git failure with a user-facing message. */
-class GitError extends Error {}
+class GitError extends Error {
+  constructor(message: string, readonly exitCode?: string | number) { super(message); }
+}
 
 async function git(args: string[], cwd: string): Promise<string> {
   try {
     const { stdout } = await pexec('git', args, { cwd, maxBuffer: MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
     return stdout;
   } catch (err) {
-    const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string };
+    const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string; code?: string | number };
     if (e.killed || e.signal === 'SIGTERM') {
       throw new GitError(m().git.timeout(args[0], GIT_TIMEOUT_MS / 1000));
     }
-    throw new GitError((e.stderr || e.message || String(err)).trim());
+    throw new GitError((e.stderr || e.message || String(err)).trim(), e.code);
   }
 }
 
@@ -38,6 +40,150 @@ export async function headSha(cwd: string): Promise<string> {
   return (await git(['rev-parse', 'HEAD'], cwd)).trim();
 }
 
+export async function repositoryRoot(cwd: string): Promise<string> {
+  return (await git(['rev-parse', '--show-toplevel'], cwd)).trim();
+}
+
+export function remoteRepositoryIdentity(remote: string): string {
+  const scp = /^(?:[^/@:]+@)?([^/:]+):([^\\].*)$/.exec(remote);
+  const url = new URL(scp && !remote.includes('://') ? `ssh://${scp[1]}/${scp[2]}` : remote);
+  const pathname = url.pathname.replace(/\/+$/, '').replace(/\.git$/i, '');
+  if (!url.hostname || !pathname || !['http:', 'https:', 'ssh:', 'git:'].includes(url.protocol)) {
+    throw new GitError(m().git.invalidPrTarget);
+  }
+  const host = url.hostname.toLowerCase();
+  const port = url.protocol === 'ssh:' && url.port === '22' ? '' : url.port;
+  return `${host}${port ? `:${port}` : ''}${host === 'github.com' ? pathname.toLowerCase() : pathname}`;
+}
+
+export function prRepositoryIdentity(prUrl: string): string {
+  const url = new URL(prUrl);
+  const match = /^(\/[^/]+\/[^/]+)\/pull\/[0-9]+\/?$/.exec(url.pathname);
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port || url.username || url.password || !match) {
+    throw new GitError(m().git.invalidPrTarget);
+  }
+  return `${url.hostname}${match[1]}`.toLowerCase();
+}
+
+export async function repositoryRemoteIdentity(cwd: string): Promise<string | undefined> {
+  let remote: string;
+  try {
+    remote = (await git(['config', '--get', 'remote.origin.url'], cwd)).trim();
+  } catch (error) {
+    if (error instanceof GitError && error.exitCode === 1) return undefined;
+    throw error;
+  }
+  if (remote.startsWith('file:') || /^[a-z]:[\\/]/i.test(remote) || !remote.includes('://') && !/^(?:[^/@:]+@)?[^/:]+:[^\\]/.test(remote)) return undefined;
+  return remoteRepositoryIdentity(remote);
+}
+export async function resolveCommit(cwd: string, ref: string): Promise<string> {
+  if (!ref.trim() || ref.includes('\0')) {
+    throw new GitError(m().git.invalidRef);
+  }
+  const sha = (await git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], cwd)).trim();
+  if (!/^[0-9a-f]{40,64}$/i.test(sha)) {
+    throw new GitError(m().git.invalidRef);
+  }
+  return sha;
+}
+
+export function validateRepositoryPath(relPath: string): void {
+  if (!relPath || relPath.includes('\0') || relPath.includes('\\') || relPath.startsWith('/')
+    || /^[a-z]:/i.test(relPath) || relPath.split('/').some((part) => part === '..' || part === '.' || !part)) {
+    throw new GitError(m().git.invalidPath(relPath));
+  }
+}
+
+export async function snapshotPaths(cwd: string, sha: string): Promise<string[]> {
+  const commit = await resolveCommit(cwd, sha);
+  const out = await git(['ls-tree', '-r', '--name-only', '-z', commit], cwd);
+  return out.split('\0').filter(Boolean);
+}
+
+export async function readSnapshotFile(cwd: string, sha: string, relPath: string): Promise<string> {
+  validateRepositoryPath(relPath);
+  if (!/^[0-9a-f]{40,64}$/i.test(sha)) {
+    throw new GitError(m().git.invalidRef);
+  }
+  const type = (await git(['cat-file', '-t', `${sha}:${relPath}`], cwd)).trim();
+  if (type !== 'blob') {
+    throw new GitError(m().git.unsupportedSnapshotFile(relPath));
+  }
+  const entry = await git(['ls-tree', '-z', sha, '--', relPath], cwd);
+  if (!entry.startsWith('100644 ') && !entry.startsWith('100755 ')) {
+    throw new GitError(m().git.unsupportedSnapshotFile(relPath));
+  }
+  try {
+    const { stdout } = await pexec('git', ['show', `${sha}:${relPath}`], {
+      cwd, encoding: 'buffer', maxBuffer: MAX_BUFFER, timeout: GIT_TIMEOUT_MS,
+    });
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(stdout);
+    if (text.includes('\0')) {
+      throw new Error(m().git.unsupportedSnapshotFile(relPath));
+    }
+    return text;
+  } catch (err) {
+    throw new GitError(m().git.snapshotReadFailed(relPath, String((err as Error).message)));
+  }
+}
+
+export function parseSnapshotChanges(statusText: string, numstatText: string): ReviewFile[] {
+  const counts = new Map<string, { additions?: number; deletions?: number }>();
+  const stats = numstatText.split('\0');
+  for (let index = 0; index < stats.length; index++) {
+    if (!stats[index]) continue;
+    const match = /^([0-9]+|-)\t([0-9]+|-)\t([\s\S]*)$/.exec(stats[index]);
+    if (!match) throw new GitError(m().git.invalidDiff);
+    let filePath = match[3];
+    if (!filePath) {
+      index++;
+      filePath = stats[++index];
+    }
+    if (!filePath) throw new GitError(m().git.invalidDiff);
+    counts.set(filePath, {
+      additions: match[1] === '-' ? undefined : Number(match[1]),
+      deletions: match[2] === '-' ? undefined : Number(match[2]),
+    });
+  }
+  const tokens = statusText.split('\0');
+  const files: ReviewFile[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const code = tokens[index];
+    if (!code) continue;
+    const oldPath = tokens[++index];
+    const renamed = code.startsWith('R') || code.startsWith('C');
+    const filePath = renamed ? tokens[++index] : oldPath;
+    if (!filePath || !oldPath) throw new GitError(m().git.invalidDiff);
+    files.push({
+      path: filePath,
+      status: renamed ? 'renamed' : code === 'A' ? 'added' : code === 'D' ? 'deleted' : 'modified',
+      previousPath: renamed ? oldPath : undefined,
+      ...counts.get(filePath),
+    });
+  }
+  return files;
+}
+
+export async function diffSnapshotFiles(cwd: string, baseSha: string, head: string): Promise<ReviewFile[]> {
+  const [status, stats] = await Promise.all([
+    git(['diff', '--name-status', '-z', '--find-renames', baseSha, head, '--'], cwd),
+    git(['diff', '--numstat', '-z', '--find-renames', baseSha, head, '--'], cwd),
+  ]);
+  return parseSnapshotChanges(status, stats);
+}
+
+export async function fetchPrSnapshot(cwd: string, prUrl: string, number: number, baseRef: string): Promise<void> {
+  const url = new URL(prUrl);
+  const match = /^\/([^/]+)\/([^/]+)\/pull\/([0-9]+)\/?$/.exec(url.pathname);
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port || url.username || url.password
+    || !match || Number(match[3]) !== number || !baseRef || baseRef.startsWith('-') || baseRef.includes('\0')) {
+    throw new GitError(m().git.invalidPrTarget);
+  }
+  const repository = `https://github.com/${match[1]}/${match[2]}.git`;
+  await git(['check-ref-format', `refs/heads/${baseRef}`], cwd);
+  await git(['fetch', '--no-tags', '--no-write-fetch-head', '--recurse-submodules=no',
+    repository, `refs/pull/${number}/head`, `refs/heads/${baseRef}`], cwd);
+}
 /**
  * Best-effort default base branch: origin/HEAD's target, else main, else master.
  */
@@ -219,6 +365,10 @@ export async function listBranches(cwd: string): Promise<string[]> {
   return out.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
+export async function listReviewRefs(cwd: string): Promise<string[]> {
+  const out = await git(['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'], cwd);
+  return out.split(/\r?\n/).filter((ref) => ref && !ref.endsWith('/HEAD'));
+}
 /** True when the working tree or index has uncommitted changes. */
 async function hasUncommittedChanges(cwd: string): Promise<boolean> {
   const out = await git(['status', '--porcelain'], cwd);

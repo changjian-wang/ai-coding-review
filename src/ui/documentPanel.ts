@@ -53,6 +53,7 @@ export interface DocModel {
   /** Stable identity of the current source content. */
   revision: string;
   name: string;
+  sourceDescription?: string;
   isMarkdown: boolean;
   readingHtml?: string;
   /** Per-line highlighted HTML, index 0 = line 1. */
@@ -553,6 +554,7 @@ export class DocumentPanel {
     background:var(--elevated); flex:none;
   }
   .fname { font-weight:600; font-size:13px; }
+  .source-description { padding:7px 12px; font-size:11px; color:var(--dim); border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
   .spacer { flex:1; }
   .seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
   .seg button { border:0; }
@@ -846,6 +848,7 @@ export class DocumentPanel {
     <button id="act-analyze"><span class="ico">🔬</span><span class="btn-label">${t.analyzeFile}</span><span class="kbd">A</span></button>
   </div>
   <div class="doc-notice" id="docNotice" hidden></div>
+  <div class="source-description" id="source-description" hidden></div>
   <div class="findbar collapsed" id="findbar" style="display:none">
     <button class="findbar-toggle" id="findbar-toggle"></button>
     <div class="findlist" id="findlist"></div>
@@ -1454,6 +1457,8 @@ function flushSeen() {
 
 function render() {
   $('fname').textContent = model.name;
+  $('source-description').textContent = model.sourceDescription || '';
+  $('source-description').hidden = !model.sourceDescription;
   // Switching to a different file should start at the top; refreshing the same
   // file (e.g. after re-analysis) should keep the reader where they were.
   const firstFile = loadedPath === null;

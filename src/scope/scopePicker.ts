@@ -5,18 +5,17 @@ import {
   FileSystemScope,
   PrScope,
   PrByNumberScope,
+  BranchSnapshotScope,
 } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
-import { pickPr } from './prPickerPanel';
-import { pickScopeKind } from './scopeKindPicker';
-import { currentLogin, ensureAuth, ensureGhAvailable, GhError, listPrs, mergePrsByNumber, repoSlug } from '../gh/ghClient';
+import { createScopePreparation } from './scopePreparationPanel';
+import { ensureAuth, ensureGhAvailable, GhError } from '../gh/ghClient';
 import { promptInstallGh } from '../gh/ghInstall';
 import { withWorkbenchProgress } from '../ui/workbenchPanel';
 import type { ReviewScope, ReviewSet } from './types';
-import type { PrSummary } from '../gh/types';
 import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
-import { currentBranch, listWorkingFiles } from './gitClient';
+import { currentBranch, listWorkingFiles, repositoryRoot } from './gitClient';
 
 /** Result of {@link pickScope}: the chosen scope plus the workspace-folder cwd it should run against. */
 export interface PickedScope {
@@ -104,43 +103,21 @@ export async function pickScope(
   viewColumn?: vscode.ViewColumn,
   preselectedKind?: string,
 ): Promise<PickedScope | undefined> {
-  const kind = preselectedKind ?? await pickScopeKind({
-    title: m().scope.pickTitle,
-    heading: m().scope.pickTitle,
-    viewColumn,
-    options: [
-      {
-        id: 'files',
-        label: m().scope.pickFilesLabel,
-        description: m().scope.pickFilesDescription,
-        detail: m().scope.pickFilesDetail,
-      },
-      {
-        id: 'currentPr',
-        label: m().scope.pickPrLabel,
-        description: 'gh pr view',
-        detail: m().scope.pickPrDetail,
-      },
-      {
-        id: 'prList',
-        label: m().scope.pickPrListLabel,
-        description: 'gh pr list',
-        detail: m().scope.pickPrListDetail,
-      },
-    ],
-  });
-  switch (kind) {
-    case 'files':
-      return buildFileSystemScope();
-    case 'currentPr':
-      return (await ensureGhReady(defaultCwd))
-        ? { scope: new PrScope(), cwd: defaultCwd }
-        : undefined;
-    case 'prList':
-      return buildPrListScope();
-    default:
-      return undefined;
+  if (preselectedKind === 'files') return buildFileSystemScope();
+  if (preselectedKind === 'currentPr') {
+    return (await ensureGhReady(defaultCwd))
+      ? { scope: new PrScope(), cwd: await repositoryRoot(defaultCwd) }
+      : undefined;
   }
+  const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind).result;
+  if (!selected) return undefined;
+  defaultCwd = selected.cwd;
+  if (selected.kind === 'files') return buildFileSystemScope();
+  if (selected.kind === 'pr' && selected.prNumber !== undefined) {
+    return { scope: new PrByNumberScope(selected.prNumber), cwd: selected.cwd };
+  }
+  if (!selected.headRef) throw new Error(m().scope.staleSelection);
+  return { scope: new BranchSnapshotScope(selected.headRef, selected.baseRef), cwd: selected.cwd };
 
   async function buildFileSystemScope(): Promise<PickedScope | undefined> {
     // Scan the whole project root once, then let the reviewer narrow down via a
@@ -176,39 +153,6 @@ export async function pickScope(
     return { scope: new FileSystemScope(picked), cwd: defaultCwd };
   }
 
-  async function buildPrListScope(): Promise<PickedScope | undefined> {
-    // Keep the busy bar covering gh readiness + listing (shown immediately),
-    // and run the gh queries in parallel; it closes before the interactive picker.
-    const data = await withWorkbenchProgress(m().scope.loadingPrs, async () => {
-      if (!(await ensureGhReady(defaultCwd))) {
-        return null;
-      }
-      const [recent, mine, slug, login] = await Promise.all([
-        listPrs(defaultCwd),
-        listPrs(defaultCwd, { author: '@me' }).catch(() => [] as PrSummary[]),
-        repoSlug(defaultCwd).catch(() => ''),
-        currentLogin(defaultCwd).catch(() => ''),
-      ]);
-      return { prs: mergePrsByNumber(recent, mine), slug, login };
-    });
-    if (!data) {
-      return undefined;
-    }
-    if (data.prs.length === 0) {
-      transientWarning(m().scope.noPrs);
-      return undefined;
-    }
-    const number = await pickPr({
-      repoLabel: data.slug || path.basename(defaultCwd) || defaultCwd,
-      currentLogin: data.login,
-      prs: data.prs,
-      viewColumn,
-    });
-    if (number === undefined) {
-      return undefined;
-    }
-    return { scope: new PrByNumberScope(number), cwd: defaultCwd };
-  }
 }
 
 /** Ensures gh is installed and authenticated; otherwise prompts (install guide

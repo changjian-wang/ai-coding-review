@@ -703,6 +703,8 @@ export class WorkbenchPanel {
     const lang = resolveLanguage();
     const stripIcon = (s: string) => s.replace(/\$\([^)]*\)\s*/g, '');
     const scopeKinds = [
+      { id: 'branchChanges', label: stripIcon(m().scope.pickBranchChanges), detail: m().scope.pickBranchChangesDetail },
+      { id: 'branchFull', label: stripIcon(m().scope.pickBranchFull), detail: m().scope.pickBranchFullDetail },
       { id: 'files', label: stripIcon(m().scope.pickFilesLabel), detail: m().scope.pickFilesDetail },
       { id: 'currentPr', label: stripIcon(m().scope.pickPrLabel), detail: m().scope.pickPrDetail },
       { id: 'prList', label: stripIcon(m().scope.pickPrListLabel), detail: m().scope.pickPrListDetail },
