@@ -16,6 +16,10 @@ import type { TokenUsage } from '../ai/analyzer';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
 import { canonicalRepositoryPath, repositoryLabel, repositoryStorageId } from './repositoryIdentity';
+import {
+  requirementBoundary, requirementFingerprint, requirementReadiness,
+  requirementScopeKey, restoreRequirementsDraft, type RequirementsDraft,
+} from './requirements';
 
 export interface ReviewSessionChange {
   filePath?: string;
@@ -154,6 +158,7 @@ export class ReviewSession {
       }
     }
 
+    const requirements = scopeSnap?.requirements ? restoreRequirementsDraft(scopeSnap.requirements) : undefined;
     if (generation !== this.startGeneration) return;
     this.cwd = cwd;
     this.repoLabel = label;
@@ -171,6 +176,7 @@ export class ReviewSession {
       repositoryIdentity: reviewSet.repositoryIdentity,
       source: reviewSet.source,
       comparison: reviewSet.comparison,
+      requirements,
       repo,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
@@ -189,6 +195,39 @@ export class ReviewSession {
     // background so a large review set doesn't block opening.
     this._onDidChange.fire({ structureChanged: true });
     void this.persistInBackground(this.snapshot, toMigrate);
+  }
+
+  get requirements(): RequirementsDraft | undefined {
+    return this.snapshot?.requirements;
+  }
+
+  get requirementStatus(): string {
+    return requirementBoundary(this.requirements, this.reviewSet && this.cwd ? requirementScopeKey(this.cwd, this.reviewSet) : undefined);
+  }
+
+  async setRequirements(draft: RequirementsDraft): Promise<void> {
+    if (!this.snapshot || !this.reviewSet || !this.cwd) throw new Error(m().requirements.invalidState);
+    const next = restoreRequirementsDraft(draft);
+    const key = requirementScopeKey(this.cwd, this.reviewSet);
+    if (!requirementReadiness(next, key).confirmed) next.confirmation = undefined;
+    const previous = this.snapshot.requirements;
+    const changed = !previous || requirementFingerprint(previous, key) !== requirementFingerprint(next, key)
+      || previous.confirmation?.fingerprint !== next.confirmation?.fingerprint
+      || previous.technicalOnly !== next.technicalOnly;
+    this.snapshot.requirements = next;
+    if (changed) {
+      this.snapshot.globalDone = false;
+      this.snapshot.conclusion = undefined;
+    }
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+  }
+
+  /** M2 establishes evidence; only the later requirement-aware analyzer may approve its satisfaction. */
+  canSubmitConclusion(verdict: 'approve' | 'request-changes' | 'comment'): boolean {
+    if (!this.technicalGatePassed()) return false;
+    if (verdict !== 'approve') return true;
+    return this.requirements?.technicalOnly === true || !this.requirements?.materials.some((source) => source.selected);
   }
 
   /**
@@ -1220,6 +1259,10 @@ export class ReviewSession {
 
   /** Gate passes only when every file is ready and global analysis is confirmed. */
   gatePassed(): boolean {
+    return this.canSubmitConclusion('approve');
+  }
+
+  technicalGatePassed(): boolean {
     return this.allFilesReady() && !!this.snapshot?.globalDone;
   }
 

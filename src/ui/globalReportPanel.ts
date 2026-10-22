@@ -30,6 +30,7 @@ export interface GlobalReportStats {
   findings: number;
   /** The real review gate (files ready + global confirmed); the banner's single source of truth. */
   gatePassed?: boolean;
+  requirementStatus?: string;
 }
 
 /**
@@ -488,6 +489,7 @@ export class GlobalReportPanel {
 </head>
 <body>
   ${banner}
+  ${s?.requirementStatus ? `<p class="muted" style="border-left:2px solid var(--blue);padding:10px 12px;overflow-wrap:anywhere;">${esc(s.requirementStatus)}</p>` : ''}
 
   <h2>${esc(t.sectionReview)}</h2>
   <p class="muted section-sub">${esc(t.reviewSubtitle)}</p>

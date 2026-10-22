@@ -49,6 +49,7 @@ export const vscodeMockState: {
   inputBox?: MockInputBox;
   progress?: { options: unknown; reports: unknown[] };
   openTextDocument?: (uri: unknown) => Promise<{ getText(): string }>;
+  openDialog?: () => Promise<{ fsPath: string }[] | undefined>;
   clipboardText: string;
   clipboardReadError?: Error;
   contextKeys: Map<string, unknown>;
@@ -185,6 +186,7 @@ export function resetVscodeMock(): void {
   vscodeMockState.inputBox = undefined;
   vscodeMockState.progress = undefined;
   vscodeMockState.openTextDocument = undefined;
+  vscodeMockState.openDialog = undefined;
   vscodeMockState.clipboardText = '';
   vscodeMockState.clipboardReadError = undefined;
   vscodeMockState.contextKeys.clear();
@@ -207,6 +209,7 @@ export const workspace = {
 };
 
 export const window = {
+  showOpenDialog: async () => vscodeMockState.openDialog?.(),
   createWebviewPanel: (_viewType: string, title: string) => {
     return createMockWebviewPanel(title);
   },
@@ -278,6 +281,9 @@ export const LanguageModelChatMessage = {
 };
 
 export class LanguageModelError extends Error {}
+export class CancellationError extends Error {
+  constructor() { super('Canceled'); }
+}
 
 export class EventEmitter<T> {
   private readonly listeners = new Set<(value: T) => void>();

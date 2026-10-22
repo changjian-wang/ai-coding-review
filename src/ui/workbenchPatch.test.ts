@@ -32,6 +32,20 @@ describe('WorkbenchPanel incremental patching', () => {
       coverage: { seen: 5 },
     });
   });
+
+  it('patches requirement boundaries and separate feedback permission without showing approval', async () => {
+    vi.useFakeTimers();
+    const state = workbenchState();
+    WorkbenchPanel.show(() => state, {} as WorkbenchActions);
+    state.requirementStatus = 'Understanding confirmed; requirement consistency not assessed.';
+    state.feedbackAllowed = true;
+    WorkbenchPanel.refreshIfOpen();
+    await vi.advanceTimersByTimeAsync(80);
+    expect(vscodeMockState.panel?.webview.messages.at(-1)).toMatchObject({
+      type: 'patch', gatePassed: false, feedbackAllowed: true, requirementStatus: state.requirementStatus,
+    });
+    expect(vscodeMockState.panel?.webview.html).toContain('id="requirementPreparation"');
+  });
 });
 
 function workbenchState(): WorkbenchState {

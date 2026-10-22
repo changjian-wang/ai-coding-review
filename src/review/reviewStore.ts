@@ -1,6 +1,8 @@
 import type * as vscode from 'vscode';
 import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
 import type { ReviewComparison, ReviewSource } from '../scope/types';
+import { restoreRequirementsDraft, type RequirementsDraft, type RequirementPreparationRecord } from './requirements';
+import { m } from '../i18n';
 
 /** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
 export interface Annotation {
@@ -86,6 +88,7 @@ export interface ReviewSnapshot {
   repositoryIdentity?: string;
   source?: ReviewSource;
   comparison?: ReviewComparison;
+  requirements?: RequirementsDraft;
   repo: string;
   /** Stable id of the review scope (selected files / PR / branch / working tree). */
   scopeId: string;
@@ -213,7 +216,36 @@ export interface ReviewStore {
 
 /** Local, single-machine store backed by VS Code workspaceState. */
 export class WorkspaceStateReviewStore implements ReviewStore {
+  private readonly preparationWrites = new Map<string, Promise<void>>();
   constructor(private readonly memento: vscode.Memento) {}
+
+  async loadRequirementPreparation(repository: string): Promise<RequirementPreparationRecord | undefined> {
+    const raw = this.memento.get<unknown>(`codereview.requirementPreparation.v1:${repository}`);
+    if (raw === undefined) return undefined;
+    if (!raw || typeof raw !== 'object' || !('draft' in raw)) throw new Error(m().requirements.invalidState);
+    const selection = 'selection' in raw ? raw.selection : undefined;
+    if (selection !== undefined && (!selection || typeof selection !== 'object' || !('cwd' in selection)
+      || typeof selection.cwd !== 'string' || !('kind' in selection)
+      || !['pr', 'branchChanges', 'branchFull', 'files'].includes(String(selection.kind)))) {
+      throw new Error(m().requirements.invalidState);
+    }
+    return {
+      draft: restoreRequirementsDraft(raw.draft),
+      selection: selection as RequirementPreparationRecord['selection'],
+    };
+  }
+
+  async saveRequirementPreparation(repository: string, record: RequirementPreparationRecord): Promise<void> {
+    const saved = structuredClone(record);
+    const key = `codereview.requirementPreparation.v1:${repository}`;
+    const previous = this.preparationWrites.get(key);
+    // A previous caller already receives its write error; later explicit edits may retry.
+    const operation = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      .then(() => this.memento.update(key, saved));
+    this.preparationWrites.set(key, operation);
+    try { await operation; }
+    finally { if (this.preparationWrites.get(key) === operation) this.preparationWrites.delete(key); }
+  }
 
   async legacyArchive(legacyName: string): Promise<{ snapshots: ReviewSnapshot[]; files: Record<string, PerFileState> }> {
     const snapshots: ReviewSnapshot[] = [];

@@ -232,6 +232,35 @@ export async function getPrByNumber(cwd: string, number: number, target?: GitHub
   };
 }
 
+/** Reads only an explicitly supplied GitHub requirement URL using the selected repo account. */
+export async function readGitHubRequirement(cwd: string, url: URL): Promise<{ name: string; text: string }> {
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.port || url.username || url.password) {
+    throw new GhError(m().requirements.unsafeUrl);
+  }
+  const issue = /^\/([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/([1-9][0-9]*)\/?$/.exec(url.pathname);
+  if (issue) {
+    const endpoint = `repos/${issue[1]}/${issue[2]}/${issue[3] === 'pull' ? 'pulls' : 'issues'}/${issue[4]}`;
+    const output = await runGh(['api', '--hostname', 'github.com', endpoint], cwd);
+    const value: unknown = JSON.parse(output);
+    if (!value || typeof value !== 'object' || !('body' in value) || typeof value.body !== 'string'
+      || !('title' in value) || typeof value.title !== 'string') throw new GhError(m().requirements.urlType);
+    return { name: value.title, text: value.body };
+  }
+  const blob = /^\/([A-Za-z0-9-]+)\/([A-Za-z0-9_.-]+)\/blob\/([^/]+)\/(.+)$/.exec(url.pathname);
+  if (!blob) throw new GhError(m().requirements.urlType);
+  const file = blob[4].split('/').map(decodeURIComponent);
+  if (file.some((part) => !part || part === '..' || part === '.' || part.includes('\0') || part.includes('\\'))
+    || !/\.(md|markdown|txt)$/i.test(file.at(-1) ?? '')) throw new GhError(m().requirements.fileUnsupported);
+  const ref = decodeURIComponent(blob[3]);
+  if (!ref || ref.includes('\0')) throw new GhError(m().requirements.unsafeUrl);
+  const endpoint = `repos/${blob[1]}/${blob[2]}/contents/${file.map(encodeURIComponent).join('/')}`;
+  const text = await runGh([
+    'api', '--hostname', 'github.com', endpoint, '-X', 'GET', '-f', `ref=${ref}`,
+    '-H', 'Accept: application/vnd.github.raw+json',
+  ], cwd);
+  return { name: file.at(-1) ?? file.join('/'), text };
+}
+
 /** Checks out the PR's head branch locally so the working tree matches the PR. */
 export async function checkoutPr(cwd: string, number: number): Promise<void> {
   try {

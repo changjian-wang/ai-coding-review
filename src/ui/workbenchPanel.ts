@@ -48,6 +48,8 @@ export interface WorkbenchState {
   findings: WorkbenchFinding[];
   coverage: { seen: number; total: number; filesReady: number; filesTotal: number };
   gatePassed: boolean;
+  feedbackAllowed?: boolean;
+  requirementStatus?: string;
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
@@ -142,6 +144,8 @@ interface WorkbenchPatchSnapshot {
   selected?: string;
   coverage: WorkbenchState['coverage'];
   gatePassed: boolean;
+  feedbackAllowed?: boolean;
+  requirementStatus?: string;
   globalDone: boolean;
   hasGlobalReport: boolean;
   modelLabel: string;
@@ -524,6 +528,8 @@ export class WorkbenchPanel {
     selected?: string;
     coverage: WorkbenchState['coverage'];
     gatePassed: boolean;
+    feedbackAllowed?: boolean;
+    requirementStatus?: string;
     globalDone: boolean;
     hasGlobalReport: boolean;
     modelLabel: string;
@@ -541,6 +547,8 @@ export class WorkbenchPanel {
         selected: next.selected,
         coverage: next.coverage,
         gatePassed: next.gatePassed,
+        feedbackAllowed: next.feedbackAllowed,
+        requirementStatus: next.requirementStatus,
         globalDone: next.globalDone,
         hasGlobalReport: next.hasGlobalReport,
         modelLabel: next.modelLabel,
@@ -599,6 +607,8 @@ export class WorkbenchPanel {
     prev.selected = state.selected;
     prev.coverage = state.coverage;
     prev.gatePassed = state.gatePassed;
+    prev.feedbackAllowed = state.feedbackAllowed;
+    prev.requirementStatus = state.requirementStatus;
     prev.globalDone = state.globalDone;
     prev.hasGlobalReport = state.hasGlobalReport;
     prev.modelLabel = state.modelLabel;
@@ -611,6 +621,8 @@ export class WorkbenchPanel {
       selected: state.selected,
       coverage: state.coverage,
       gatePassed: state.gatePassed,
+      feedbackAllowed: state.feedbackAllowed,
+      requirementStatus: state.requirementStatus,
       globalDone: state.globalDone,
       hasGlobalReport: state.hasGlobalReport,
       modelLabel: state.modelLabel,
@@ -932,6 +944,8 @@ export class WorkbenchPanel {
           <button id="pickScope" class="sb-switch" title="${escAttr(t.switchScopeTitle)}">${esc(t.switchScope)}</button>
         </div>
         <div class="scope-menu" id="scopeMenu" hidden></div>
+        <p id="requirementStatus" style="font-size:11px;line-height:1.7;overflow-wrap:anywhere;color:var(--dim);">${esc(state.requirementStatus ?? '')}</p>
+        <button id="requirementPreparation" class="sb-switch">${esc(m().requirements.openPreparation)}</button>
       </div>
       <div class="wb-busy" id="wbBusy" hidden>
         <div class="gp-bar"><div class="gp-fill"></div></div>
@@ -997,7 +1011,7 @@ export class WorkbenchPanel {
           <span id="gateText">${gateOk ? esc(t.gatePass) : esc(t.gateFail)}</span>
         </div>
         <div id="gateReason" class="gate-reason" ${gateOk ? 'style="display:none"' : ''}>${gateOk ? '' : gateReason.map(esc).join(m().common.listSep)}</div>
-        <button class="primary" id="submit" style="width:100%; margin-top:.6rem;" ${gateOk ? '' : 'disabled'}>${esc(t.submitConclusion)}</button>
+        <button class="primary" id="submit" style="width:100%; margin-top:.6rem;" ${gateOk || state.feedbackAllowed ? '' : 'disabled'}>${esc(t.submitConclusion)}</button>
         <div id="conclusionWrap">${conclusionHtml}</div>
       </div>
     </div>
@@ -1140,7 +1154,8 @@ export class WorkbenchPanel {
       gateReason.textContent = reasons.join(T.listSep);
       gateReason.style.display = msg.gatePassed ? 'none' : '';
     }
-    const submit = byId('submit'); if (submit) submit.disabled = !msg.gatePassed;
+    const submit = byId('submit'); if (submit) submit.disabled = !(msg.gatePassed || msg.feedbackAllowed);
+    const requirements = byId('requirementStatus'); if (requirements) requirements.textContent = msg.requirementStatus || '';
     const showGlobal = byId('showGlobal'); if (showGlobal) showGlobal.disabled = !msg.hasGlobalReport;
     const modelLabel = byId('modelLabel');
     if (modelLabel) { modelLabel.title = msg.modelLabel; modelLabel.innerHTML = T.modelPrefix + '<b>' + esc(msg.modelLabel) + '</b>'; }
@@ -1280,6 +1295,7 @@ export class WorkbenchPanel {
   byId('globalCancel')?.addEventListener('click', () => send({ type:'cancelGlobal' }));
   byId('showGlobal')?.addEventListener('click', () => send({ type:'showGlobal' }));
   byId('exportReport')?.addEventListener('click', () => send({ type:'exportReport' }));
+  byId('requirementPreparation')?.addEventListener('click', () => send({ type:'pickScope' }));
   function bindDynMenu(id, kind) {
     const menu = byId(id);
     if (!menu) return;
@@ -1820,6 +1836,8 @@ function snapshotFor(
     selected: state.selected,
     coverage: state.coverage,
     gatePassed: state.gatePassed,
+    feedbackAllowed: state.feedbackAllowed,
+    requirementStatus: state.requirementStatus,
     globalDone: state.globalDone,
     hasGlobalReport: state.hasGlobalReport,
     modelLabel: state.modelLabel,

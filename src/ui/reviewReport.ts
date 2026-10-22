@@ -1,6 +1,8 @@
 import { isActionableFinding, type Finding, type GlobalReport } from '../ai/types';
 import type { Annotation, FindingDisposition, ReviewConclusion } from '../review/reviewStore';
 import type { Messages } from '../i18n/en';
+import type { RequirementsDraft } from '../review/requirements';
+import { currentMaterial } from '../review/requirements';
 
 /** Everything the report needs about one file in the review set. */
 export interface ReportFile {
@@ -20,6 +22,8 @@ export interface ReportData {
   files: ReportFile[];
   globalReport?: GlobalReport;
   conclusion?: ReviewConclusion;
+  requirements?: RequirementsDraft;
+  requirementStatus?: string;
 }
 
 function sevLabel(t: Messages['report'], s: Finding['severity']): string {
@@ -75,6 +79,32 @@ export function buildReviewReportMarkdown(data: ReportData, t: Messages['report'
   lines.push(`- **${t.repo}**: ${data.repo}`);
   lines.push(`- **${t.scope}**: ${data.scopeLabel}`);
   lines.push(`- **${t.generatedAt}**: ${fmtDate(data.generatedAt)}`, '');
+  if (data.requirementStatus) lines.push(`> ${data.requirementStatus}`, '');
+  if (data.requirements) {
+    const draft = data.requirements;
+    lines.push(`## ${t.requirementsHeading}`, '');
+    if (draft.understanding) {
+      lines.push(draft.understanding.summary, '');
+      for (const item of draft.understanding.requirements) {
+        lines.push(`- **${item.id} · ${item.title}** (${item.included ? t.requirementIncluded : t.requirementExcluded})`, item.text);
+        if (!item.included) lines.push(`  - ${t.reason}: ${item.exclusionReason}`);
+        for (const origin of item.origins) {
+          const source = draft.materials.find((material) => material.id === origin.sourceId);
+          lines.push(`  - ${source?.location ?? origin.sourceId} · v${origin.version} · L${origin.line}–${origin.endLine}`);
+          lines.push(...origin.quote.split('\n').map((line) => `    > ${line}`));
+        }
+      }
+      lines.push('', `### ${t.requirementChecks}`, '');
+      lines.push(...draft.understanding.checks.map((check) => `- ${check.requirementIds.join(', ')}: ${check.text}`));
+      lines.push('', `### ${t.requirementQuestions}`, '');
+      lines.push(...draft.understanding.questions.map((question) => `- ${question.text}`));
+    }
+    lines.push('', `### ${t.requirementSources}`, '');
+    for (const source of draft.materials) {
+      lines.push(`- ${source.name} · ${source.location} · v${currentMaterial(source).version} · ${source.selected ? t.requirementIncluded : t.requirementExcluded}`);
+    }
+    lines.push('');
+  }
 
   // Summary -------------------------------------------------------------------
   lines.push(`## ${t.summary}`, '');

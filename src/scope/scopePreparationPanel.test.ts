@@ -1,13 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createScopePreparation, validatePreparedScope } from './scopePreparationPanel';
 import { resetVscodeMock, vscodeMockState } from '../test/vscodeMock';
-import { repositoryRoot, listReviewRefs, currentBranch } from './gitClient';
+import { repositoryRoot, listReviewRefs, currentBranch, repositoryRemoteIdentity } from './gitClient';
 import { listPrs, ensureAuth } from '../gh/ghClient';
 
-vi.mock('./gitClient', () => ({ repositoryRoot: vi.fn(), listReviewRefs: vi.fn(), currentBranch: vi.fn() }));
+vi.mock('./gitClient', () => ({ repositoryRoot: vi.fn(), listReviewRefs: vi.fn(), currentBranch: vi.fn(), repositoryRemoteIdentity: vi.fn() }));
 vi.mock('../gh/ghClient', () => ({ ensureGhAvailable: vi.fn(), ensureAuth: vi.fn(), listPrs: vi.fn() }));
 
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
+beforeEach(() => vi.mocked(repositoryRemoteIdentity).mockResolvedValue(undefined));
 
 describe('preparation scope validation', () => {
   const data = {
@@ -39,7 +40,9 @@ describe('preparation host messaging', () => {
     vi.mocked(repositoryRoot).mockResolvedValue(root);
     vi.mocked(listReviewRefs).mockResolvedValue(['main', 'feature']);
     vi.mocked(currentBranch).mockResolvedValue('main');
-    const handle = createScopePreparation(root, undefined, 'branchChanges');
+    const handle = createScopePreparation(root, undefined, 'branchChanges', {
+      loadScope: async () => ({ scopeId: 'test', label: 'Feature', headSha: 'a'.repeat(40), files: [{ path: 'a.ts' }] }),
+    });
     const panel = vscodeMockState.panel!;
     expect(panel.webview.html).toContain('nonce-');
     expect(panel.webview.html).toContain('acquireVsCodeApi()');

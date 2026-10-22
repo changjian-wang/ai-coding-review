@@ -34,7 +34,19 @@ English | [简体中文](README.zh-CN.md)
 - Immutable snapshots do not apply or revert fixes against a different working tree. Explicitly select a local-file review to edit; verified delivery to the PR head is a later implementation stage.
 - Persistence uses canonical repository-path identities, with commit/base/scope isolation for snapshots. Same-name folders do not share reviews. Ambiguous legacy folder-name history remains available as a separate archive, without automatically reusing approvals or patches.
 
-Development status: this is the first foundation slice of the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md), not delivery of the entire vNext. Requirement intake/understanding, business-chain orchestration, the final three-stage workspace, and Reviewer Reply/Resolve remain planned. Snapshot evidence currently uses bounded text searches rather than language services for another working-tree version; context-limited analyses are not counted as fully ready.
+Development status: the scope foundation and M2 requirement preparation in the [Review vNext implementation plan](docs/REVIEW-VNEXT-IMPLEMENTATION-PLAN.zh-CN.md) are connected, not the entire vNext. Requirement-aware business-chain orchestration, the final three-stage workspace, and Reviewer Reply/Resolve remain later milestones. Snapshot evidence uses bounded text searches rather than language services for another working-tree version; context-limited analyses are not counted as fully ready.
+
+### Requirement preparation (M2)
+
+- Three preparation blocks select Repository/PR/branch, provide evidence, and inspect AI understanding. Add Markdown text, local UTF-8 Markdown/TXT, explicit public HTTP/HTTPS text or HTML URLs, GitHub Issue/PR bodies, or GitHub Markdown/TXT links.
+- GitHub reads use the selected repository account. Ordinary pages receive no browser cookies or third-party credentials, and scripts are not executed. Private/local addresses, cross-origin redirects, unsupported formats, access failures and missing content are explicit errors; convert or paste PDF/Word, login-only or client-rendered content.
+- Selected materials are sent to the chosen Copilot model to organize intent, explicit requirements, derived checks and unverified premises. Output structure and exact source-version/line quotations are checked before accepting understanding. Original snapshots and human revisions are stored separately in workspace state.
+- A single confirmation binds the repository, head/base and source versions, with no per-item checkboxes or per-document role classification. Material or scope changes invalidate confirmation. Local files are rechecked before analysis and confirmation; URLs remain explicitly read snapshots with a re-read action.
+- Markdown editing/preview and source provenance are available; HTML does not execute and images do not auto-load. File/URL originals are read-only and refreshed from their source; pasted material can be edited.
+- Model errors, cancellation and unavailable models preserve material without auto-confirmation or reverse-engineering requirements from code. Explicit technical-only continuation does not erase known code issues and still requires the technical review gate.
+- Each material is limited to 512,000 bytes, with at most 12 materials. Model input is also checked against 120,000 characters and the selected model's token limit; oversized content is rejected rather than silently truncated.
+
+**Current boundary: confirming understanding is not a requirement-satisfaction review.** Until M3 is connected, the workbench, source view, global report, posted review and export retain “requirement consistency not assessed.” The older technical analyzer cannot approve unassessed requirements unless a technical-only scope was explicitly selected; bounded technical feedback still follows the existing gate.
 
 ### Review workbench
 

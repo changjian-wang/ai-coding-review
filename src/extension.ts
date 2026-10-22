@@ -25,6 +25,7 @@ import {
   AnalysisError,
   setTokenUsageSink,
   verifyRootedRepositoryFindings,
+  analyzeRequirementUnderstanding,
   type GlobalContextFile,
 } from './ai/analyzer';
 import {
@@ -44,6 +45,8 @@ import { FileSystemScope, PrByNumberScope, BranchSnapshotScope, assertPrSnapshot
 import { currentBranch, listBranches, readFileAtRef, repositoryRoot } from './scope/gitClient';
 import { CommitSource } from './review/commitSource';
 import { realpath } from 'node:fs/promises';
+import type { ScopePreparationOptions } from './scope/scopePreparationPanel';
+import { repositoryStorageId } from './review/repositoryIdentity';
 import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
 import { getPrByNumber, submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
@@ -65,6 +68,7 @@ import {
 } from './review/repositoryEvidence';
 
 let session: ReviewSession;
+let reviewStore: WorkspaceStateReviewStore;
 const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
@@ -808,6 +812,7 @@ function rehydrateAppliedFixes(): void {
 export function activate(context: vscode.ExtensionContext): void {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
+  reviewStore = store;
   session = new ReviewSession(store, repo);
   WorkbenchPanel.init(context.extensionUri);
 
@@ -1053,14 +1058,15 @@ async function openInNewWindow(
     openingWorkbenchPanel = loading.panel;
     await moveActiveEditorToNewWindow();
 
-    const picked = await pickScope(chosenCwd, loading.panel.viewColumn);
+    const picked = await pickScope(chosenCwd, loading.panel.viewColumn, undefined, requirementPreparationOptions());
     if (!picked) {
       loading.panel.dispose();
       return;
     }
-    const reviewSet = await picked.scope.load(picked.cwd);
+    const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
     if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
     await activateReviewSet(reviewSet, picked.cwd);
+    if (picked.requirements) await session.setRequirements(picked.requirements);
     persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
     loading.progress.report(m().workbench.loadingOpening, 'open');
     WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
@@ -1170,13 +1176,14 @@ async function startReview(kind?: string): Promise<void> {
   }
   scopePickInFlight = true;
   try {
-    const picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind);
+    const picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind, requirementPreparationOptions());
     if (!picked) return;
     const { scope: source, cwd } = picked;
     await withWorkbenchProgress(m().review.loadingSource, async () => {
-      const reviewSet = await source.load(cwd);
+      const reviewSet = picked.reviewSet ?? await source.load(cwd);
       if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
       await activateReviewSet(reviewSet, cwd);
+      if (picked.requirements) await session.setRequirements(picked.requirements);
       persistScope(source, reviewSet, session.getCwd() ?? cwd);
       void vscode.commands.executeCommand('setContext', 'codereview.active', true);
       await openWorkbench();
@@ -1186,6 +1193,20 @@ async function startReview(kind?: string): Promise<void> {
   } finally {
     scopePickInFlight = false;
   }
+}
+
+function requirementPreparationOptions(): ScopePreparationOptions {
+  return {
+    load: (cwd, identity) => reviewStore.loadRequirementPreparation(repositoryStorageId(cwd, identity)),
+    save: (cwd, identity, record) => reviewStore.saveRequirementPreparation(repositoryStorageId(cwd, identity), record),
+    modelLabel: () => models.label,
+    pickModel: selectModel,
+    analyze: async (draft, scope, token, usage) => {
+      const model = await models.resolve();
+      if (!model) throw new AnalysisError(m().requirements.noModel);
+      return analyzeRequirementUnderstanding(model, draft, scope, token, usage);
+    },
+  };
 }
 
 /**
@@ -1638,6 +1659,8 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
     findings: selectedFindings,
     coverage: session.totalCoverage(),
     gatePassed: session.gatePassed(),
+    feedbackAllowed: session.canSubmitConclusion('comment'),
+    requirementStatus: session.requirementStatus,
     globalDone: session.globalConfirmed,
     hasGlobalReport: !!session.globalReport,
     modelLabel: models.label,
@@ -1884,9 +1907,9 @@ function buildDocModel(
     name: relPath.split('/').pop() ?? relPath,
     sourceDescription: session.reviewSet?.source
       ? isDeletedReviewFile(relPath) && session.reviewSet.comparison
-        ? m().scope.deletedSnapshotNotice(session.reviewSet.comparison.baseSha.slice(0, 8))
-        : m().scope.snapshotNotice(session.reviewSet.source.headRef, session.reviewSet.headSha.slice(0, 8))
-      : undefined,
+        ? `${m().scope.deletedSnapshotNotice(session.reviewSet.comparison.baseSha.slice(0, 8))}\n${session.requirementStatus}`
+        : `${m().scope.snapshotNotice(session.reviewSet.source.headRef, session.reviewSet.headSha.slice(0, 8))}\n${session.requirementStatus}`
+      : session.requirementStatus,
     isMarkdown: render.isMarkdown,
     readingHtml: render.readingHtml,
     sourceLines: render.sourceLines,
@@ -3312,6 +3335,7 @@ function showGlobalReport(): void {
       filesTotal: cov.filesTotal,
       findings: findingsCount,
       gatePassed: session.gatePassed(),
+      requirementStatus: session.requirementStatus,
     },
   });
   void ensureGlobalReportLocalized(report);
@@ -3685,7 +3709,7 @@ async function exportReviewReport(): Promise<void> {
   }
   const cov = session.totalCoverage();
   const data: ReportData = {
-    repo: session.getRepoName(),
+    repo: reviewSet.repositoryIdentity ?? session.getRepoLabel(),
     scopeLabel: reviewSet.label,
     generatedAt: Date.now(),
     coverage: {
@@ -3702,6 +3726,8 @@ async function exportReviewReport(): Promise<void> {
     })),
     globalReport: session.globalReport,
     conclusion: session.conclusion,
+    requirementStatus: session.requirementStatus,
+    requirements: session.requirements,
   };
   const localized = await localizeReportData(data, resolveLanguage());
   const markdown = buildReviewReportMarkdown(localized, m().report);
@@ -3902,7 +3928,7 @@ async function submitConclusion(): Promise<void> {
     transientWarning(m().review.notStartedWarn);
     return;
   }
-  if (!session.gatePassed()) {
+  if (!session.technicalGatePassed()) {
     const c = session.totalCoverage();
     const reasons: string[] = [];
     if (c.filesReady < c.filesTotal) {
@@ -3923,7 +3949,7 @@ async function submitConclusion(): Promise<void> {
   }
   const choice = await vscode.window.showQuickPick(
     [
-      { label: `$(check) ${m().conclusion.approve}`, value: 'approve' as const },
+      ...(session.canSubmitConclusion('approve') ? [{ label: `$(check) ${m().conclusion.approve}`, value: 'approve' as const }] : []),
       { label: `$(request-changes) ${m().conclusion.requestChanges}`, value: 'changes' as const },
       { label: `$(comment) ${m().conclusion.comment}`, value: 'comment' as const },
     ],
@@ -3932,7 +3958,7 @@ async function submitConclusion(): Promise<void> {
   if (!choice) {
     return;
   }
-  if (session.reviewSet !== reviewedSet || !session.gatePassed()) {
+  if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(choice.value === 'changes' ? 'request-changes' : choice.value)) {
     void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
     return;
   }
@@ -3951,7 +3977,7 @@ async function submitConclusion(): Promise<void> {
     if (confirm !== m().conclusion.submitToGitHub) {
       return;
     }
-    if (session.reviewSet !== reviewedSet || !session.gatePassed()) {
+    if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(conclusionVerdict)) {
       void vscode.window.showWarningMessage(m().scope.prSnapshotChanged);
       return;
     }
@@ -3960,7 +3986,7 @@ async function submitConclusion(): Promise<void> {
       return;
     }
     const c = session.totalCoverage();
-    const body = m().conclusion.prBody(c.filesReady, c.filesTotal);
+    const body = `${m().conclusion.prBody(c.filesReady, c.filesTotal)}\n\n${session.requirementStatus}`;
     const pending = [...session.pendingComments];
     try {
       if (reviewedSet.source) {
@@ -3968,7 +3994,7 @@ async function submitConclusion(): Promise<void> {
         if (!match) throw new Error(m().scope.prSnapshotChanged);
         const target = { host: match[1], nameWithOwner: match[2] };
         const current = await getPrByNumber(cwd, prNumber, target);
-        if (session.reviewSet !== reviewedSet || !session.gatePassed()) throw new Error(m().scope.prSnapshotChanged);
+        if (session.reviewSet !== reviewedSet || !session.canSubmitConclusion(conclusionVerdict)) throw new Error(m().scope.prSnapshotChanged);
         assertPrSnapshotCurrent(reviewedSet, current);
         await submitPrReviewWithComments(
           cwd, prNumber, reviewedSet.headSha, conclusionVerdict, body,

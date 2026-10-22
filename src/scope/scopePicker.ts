@@ -8,14 +8,13 @@ import {
   BranchSnapshotScope,
 } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
-import { createScopePreparation } from './scopePreparationPanel';
-import { ensureAuth, ensureGhAvailable, GhError } from '../gh/ghClient';
-import { promptInstallGh } from '../gh/ghInstall';
+import { createScopePreparation, type ScopePreparationOptions } from './scopePreparationPanel';
 import { withWorkbenchProgress } from '../ui/workbenchPanel';
 import type { ReviewScope, ReviewSet } from './types';
 import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
-import { currentBranch, listWorkingFiles, repositoryRoot } from './gitClient';
+import { currentBranch, listWorkingFiles } from './gitClient';
+import type { RequirementsDraft } from '../review/requirements';
 
 /** Result of {@link pickScope}: the chosen scope plus the workspace-folder cwd it should run against. */
 export interface PickedScope {
@@ -26,6 +25,8 @@ export interface PickedScope {
    * that **contains** the picked path, not necessarily the first root.
    */
   cwd: string;
+  reviewSet?: ReviewSet;
+  requirements?: RequirementsDraft;
 }
 
 export type PreferredScopeKind = 'currentPr' | 'branchSource';
@@ -102,22 +103,18 @@ export async function pickScope(
   defaultCwd: string,
   viewColumn?: vscode.ViewColumn,
   preselectedKind?: string,
+  preparationOptions?: ScopePreparationOptions,
 ): Promise<PickedScope | undefined> {
   if (preselectedKind === 'files') return buildFileSystemScope();
-  if (preselectedKind === 'currentPr') {
-    return (await ensureGhReady(defaultCwd))
-      ? { scope: new PrScope(), cwd: await repositoryRoot(defaultCwd) }
-      : undefined;
-  }
-  const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind).result;
+  const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind, preparationOptions).result;
   if (!selected) return undefined;
   defaultCwd = selected.cwd;
   if (selected.kind === 'files') return buildFileSystemScope();
   if (selected.kind === 'pr' && selected.prNumber !== undefined) {
-    return { scope: new PrByNumberScope(selected.prNumber), cwd: selected.cwd };
+    return { scope: new PrByNumberScope(selected.prNumber), cwd: selected.cwd, reviewSet: selected.reviewSet, requirements: selected.requirements };
   }
   if (!selected.headRef) throw new Error(m().scope.staleSelection);
-  return { scope: new BranchSnapshotScope(selected.headRef, selected.baseRef), cwd: selected.cwd };
+  return { scope: new BranchSnapshotScope(selected.headRef, selected.baseRef), cwd: selected.cwd, reviewSet: selected.reviewSet, requirements: selected.requirements };
 
   async function buildFileSystemScope(): Promise<PickedScope | undefined> {
     // Scan the whole project root once, then let the reviewer narrow down via a
@@ -153,28 +150,6 @@ export async function pickScope(
     return { scope: new FileSystemScope(picked), cwd: defaultCwd };
   }
 
-}
-
-/** Ensures gh is installed and authenticated; otherwise prompts (install guide
- * for a missing CLI, login hint for missing auth). Returns readiness. */
-async function ensureGhReady(cwd: string): Promise<boolean> {
-  try {
-    await ensureGhAvailable(cwd);
-  } catch (err) {
-    if (err instanceof GhError && err.code === 'not-found') {
-      await promptInstallGh();
-    } else {
-      transientWarning(String((err as Error)?.message ?? err));
-    }
-    return false;
-  }
-  try {
-    await ensureAuth(cwd);
-  } catch (err) {
-    transientWarning(err instanceof GhError ? err.message : String((err as Error)?.message ?? err));
-    return false;
-  }
-  return true;
 }
 
 interface ScanState {
