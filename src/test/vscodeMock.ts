@@ -68,7 +68,7 @@ function disposable(): Disposable {
 
 function createPanel(): MockWebviewPanel {
   const disposeListeners: Array<() => void> = [];
-  let messageListener: ((message: unknown) => void) | undefined;
+  const messageListeners = new Set<(message: unknown) => void>();
   let disposed = false;
   return {
     title: '',
@@ -77,15 +77,15 @@ function createPanel(): MockWebviewPanel {
       html: '',
       messages: [],
       onDidReceiveMessage(listener: (message: unknown) => void) {
-        messageListener = listener;
-        return disposable();
+        messageListeners.add(listener);
+        return { dispose: () => { messageListeners.delete(listener); } };
       },
       postMessage(message: unknown) {
         this.messages.push(message);
         return Promise.resolve(true);
       },
       receiveMessage(message: unknown) {
-        messageListener?.(message);
+        for (const listener of [...messageListeners]) listener(message);
       },
     },
     reveal() {},

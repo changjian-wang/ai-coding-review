@@ -61,6 +61,20 @@ beforeEach(() => {
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
 
 describe('three-block preparation with real host state transitions', () => {
+  it('persists pending material before returning from the retained preparation view without starting review', async () => {
+    const onReturn = vi.fn();
+    const { handle, panel, saved } = await open({ retainOnReturn: true, onReturn });
+    panel.webview.receiveMessage({ type: 'material', ...selection, name: 'Saved before returning', text: 'Charge once.' });
+    await vi.waitFor(() => expect(state()?.ready).toBe(true));
+    const count = saved.length;
+    panel.webview.receiveMessage({ type: 'return', stage: 'review' });
+    await expect(handle.result).resolves.toBeUndefined();
+    expect(saved.length).toBeGreaterThan(count);
+    expect(saved.at(-1)?.draft.materials[0].name).toBe('Saved before returning');
+    expect(onReturn).toHaveBeenCalledWith('review');
+    expect(saved.at(-1)?.draft.confirmation).toBeUndefined();
+    handle.dispose();
+  });
   it('retains materials while the PR choice is missing without calling the model or reporting a fake scope error', async () => {
     const analyze = vi.fn(async (draft: RequirementsDraft, scope: { key: string }) => understood(draft, scope.key));
     const { handle, panel, saved } = await open({ analyze });

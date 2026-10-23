@@ -129,9 +129,12 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
   assert.equal(vscode.window.tabGroups.all.length, groups, 'Restoring preparation must not relocate an existing panel');
   await restored.webview.postMessage({ type: 'startupCancel' });
   await within(restoring, 'Escape cancellation of restored preparation');
-  await waitFor(() => reviewTabs().length === 0, 'restored preparation tab closing');
+  await waitFor(() => !api.openingPanel() && restored.webview.html.includes('id="review-source"'), 'restored preparation returns to its review in place');
   assert.equal(api.openingPanel(), undefined);
-  assert.equal(reviewTabs().length, 0);
+  assert.equal(reviewTabs().length, 1);
+  assert.equal(api.session.reviewSet, selected);
+  restored.dispose();
+  await waitFor(() => reviewTabs().length === 0, 'closing the restored workbench');
 
   const confirming = vscode.commands.executeCommand('codereview.openInNewWindow', cwd);
   const final = await openingPanel(api);
@@ -153,7 +156,7 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
   return [
     'Chinese-first production preparation uses the prototype header and segmented target; repeated opening and cancellation leave no loading tab or empty group',
     'language switching respects explicit workspace configuration instead of an ineffective global-only override',
-    'saved preparation restores in place and Escape cancels it without activating a new review',
+    'saved preparation restores in place and Escape returns to the existing review without closing its workbench',
     'explicit confirmation adopts the same native panel as the review center without another tab or relocation',
   ];
 }

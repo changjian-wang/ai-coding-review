@@ -33,6 +33,60 @@ describe('WorkbenchPanel incremental patching', () => {
     });
   });
 
+  it('lends its existing panel to preparation without background refreshes or old actions replacing it', async () => {
+    vi.useFakeTimers();
+    const state = workbenchState();
+    const open = vi.fn();
+    const noop = () => {};
+    const actions: WorkbenchActions = {
+      open, openFocus: noop, focusDoc: noop, disposeFinding: noop, locate: noop,
+      globalAnalysis: noop, cancelGlobalAnalysis: noop, showGlobal: noop,
+      businessReview: noop, cancelBusinessReview: noop, showBusinessReview: noop,
+      exportReport: noop, submit: noop, pickModel: noop, pickLanguage: noop, pickBranch: noop,
+      pickProject: noop, pickScope: noop, pickScopeKind: noop, pickProjectCwd: noop, pickLanguageId: noop,
+      openDynMenu: noop, applyDynMenu: noop,
+    };
+    WorkbenchPanel.show(() => state, actions);
+    const panel = vscodeMockState.panel!;
+    const close = vi.fn();
+    panel.onDidDispose(close);
+    WorkbenchPanel.refreshIfOpen('src/a.ts');
+    const handoff = WorkbenchPanel.suspendForPreparation()!;
+    expect(handoff.panel).toBe(panel);
+    panel.webview.html = '<main>Complete preparation form</main>';
+    const previous = panel.webview.messages.length;
+    state.files[0].seen = 5;
+    WorkbenchPanel.refreshIfOpen('src/a.ts');
+    WorkbenchPanel.rerenderIfOpen();
+    WorkbenchPanel.show(() => state, actions);
+    panel.webview.receiveMessage({ type: 'select', path: 'src/a.ts' });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(panel.webview.html).toBe('<main>Complete preparation form</main>');
+    expect(panel.webview.messages).toHaveLength(previous);
+    expect(open).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+    handoff.resume();
+    expect(vscodeMockState.panel).toBe(panel);
+    expect(panel.webview.html).not.toContain('Complete preparation form');
+    panel.webview.receiveMessage({ type: 'select', path: 'src/a.ts' });
+    expect(open).toHaveBeenCalledWith('src/a.ts');
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('does not revive an old panel when preparation was closed and another workbench was created', () => {
+    const state = workbenchState();
+    WorkbenchPanel.show(() => state, {} as WorkbenchActions);
+    const handoff = WorkbenchPanel.suspendForPreparation()!;
+    vscodeMockState.panel!.dispose();
+    WorkbenchPanel.show(() => state, {} as WorkbenchActions);
+    const replacement = vscodeMockState.panel!;
+    const html = replacement.webview.html;
+    handoff.resume();
+    expect(vscodeMockState.panel).toBe(replacement);
+    expect(replacement.webview.html).toBe(html);
+    expect(handoff.panel).not.toBe(replacement);
+  });
+
   it('patches requirement boundaries and separate feedback permission without showing approval', async () => {
     vi.useFakeTimers();
     const state = workbenchState();

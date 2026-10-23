@@ -8,6 +8,7 @@ import type { BusinessReviewRun } from '../review/businessReview';
 import { businessHash } from '../review/businessReview';
 import { centerReferenceId, centerReferences } from '../ui/reviewCenterState';
 import { DocumentPanel } from '../ui/documentPanel';
+import { restorePreparationAfterRestart, savePreparationForRestart } from './stageNavigationHostIntegration';
 
 type HostApi = NonNullable<ReviewExtensionApi['test']>;
 async function waitFor(test: () => boolean, label: string): Promise<void> {
@@ -69,9 +70,11 @@ export async function runReviewCenterHostChecks(cwd: string, business: { run: Bu
     storageKey: api.workspaceState.keys().find((key) => key.startsWith('codereview:review:') && key.endsWith(`@${set.headSha}`)),
     view: api.session.workspaceView, runId: api.session.businessReview?.id, repo: api.session.snapshot?.repo,
   }));
+  const preparationRestart = await savePreparationForRestart(api);
   return [
     'production M4 single-panel source/associated-original navigation retains the finding without creating editor groups',
     'production M4 exact visible preview acknowledgement and local conclusion (no GitHub publication)',
+    preparationRestart,
   ];
 }
 
@@ -81,10 +84,11 @@ export async function runReviewCenterRestartChecks(cwd: string): Promise<string[
     view: unknown; runId: string; repo: string;
   };
   const api = await hostApi();
+  const preparationRestart = await restorePreparationAfterRestart(api);
   const marker = api.workspaceState.get('codereview.host.persistMarker');
   const stored = api.workspaceState.get<{ businessReview?: { id: string }; workspaceView?: unknown; repo: string }>(expected.storageKey);
   assert.ok(marker, `Real workspaceState marker was not restored: ${JSON.stringify({ keys: api.workspaceState.keys(), expectedKey: expected.storageKey })}`);
-  const set = await api.loadBranch(cwd, 'feature', 'main');
+  const set = api.session.reviewSet ?? await api.loadBranch(cwd, 'feature', 'main');
   assert.equal(api.session.businessReview?.id, expected.runId, JSON.stringify({
     storedRun: stored?.businessReview?.id, storedView: stored?.workspaceView, storedRepo: stored?.repo,
     activeRepo: api.session.snapshot?.repo, activeKeys: api.workspaceState.keys(),
@@ -102,6 +106,7 @@ export async function runReviewCenterRestartChecks(cwd: string): Promise<string[
   assert.equal(api.session.conclusionPreviewCurrent, false, 'The review stage must not acknowledge a hidden conclusion body');
   assert.equal(api.session.conclusion?.bodyHash, businessHash(expected.body));
   return [
+    preparationRestart,
     'real VS Code restart restores issue, original source, inspector and saved draft from actual workspaceState',
     'restart preserves the local receipt but does not acknowledge a hidden conclusion preview',
   ];

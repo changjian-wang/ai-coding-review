@@ -16,6 +16,7 @@ import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
 import { runStartupHostChecks } from './startupHostIntegration';
 import { runPreparationLoadingHostChecks } from './preparationLoadingHostIntegration';
+import { runStageNavigationHostChecks } from './stageNavigationHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -144,6 +145,7 @@ export async function run(): Promise<void> {
     const business = await runBusinessReviewHostChecks(root, set);
     checks.push(...business.checks);
     checks.push(...await runStartupHostChecks(root));
+    checks.push(...await runStageNavigationHostChecks(root, business));
     checks.push(...await runReviewCenterHostChecks(root, business));
     assert.equal(await git('branch', '--show-current'), 'main');
     assert.equal(await git('stash', 'list'), '');

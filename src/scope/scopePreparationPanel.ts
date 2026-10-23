@@ -41,6 +41,7 @@ interface RepositoryData {
 export interface ScopePreparationOptions {
   hostPanel?: vscode.WebviewPanel;
   retainOnSelect?: boolean;
+  retainOnReturn?: boolean;
   load?(cwd: string, identity?: string): Promise<{ draft: RequirementsDraft; selection?: PreparedScopeChoice } | undefined>;
   save?(cwd: string, identity: string | undefined, record: { draft: RequirementsDraft; selection?: PreparedScopeChoice }): Promise<void>;
   analyze?(draft: RequirementsDraft, scope: { key: string; description: string }, token: vscode.CancellationToken, usage: (record: TokenUsage) => void): Promise<RequirementUnderstanding>;
@@ -128,6 +129,8 @@ export function createScopePreparation(
   let disposed = false;
   let rerendering = false;
   let inbound: vscode.Disposable | undefined;
+  let lifecycle: vscode.Disposable | undefined;
+  let navigating = false;
   let selectedRoot = defaultCwd;
   let finish!: (value: PreparedScopeChoice | undefined) => void;
   let markReady!: (ready: boolean) => void;
@@ -137,6 +140,7 @@ export function createScopePreparation(
   const complete = (selected: PreparedScopeChoice) => {
     settled = true;
     inbound?.dispose();
+    lifecycle?.dispose();
     finish(selected);
     if (!options.retainOnSelect) panel.dispose();
   };
@@ -280,9 +284,9 @@ export function createScopePreparation(
       if (run === generation) post({ type: 'error', target: 'repository', message: String((error as Error).message) });
     }
   };
-  panel.onDidDispose(() => { disposed = true; generation++; inbound?.dispose(); cancel(); markReady(false); if (!settled) finish(undefined); });
+  lifecycle = panel.onDidDispose(() => { disposed = true; generation++; inbound?.dispose(); cancel(); markReady(false); if (!settled) finish(undefined); });
   inbound = panel.webview.onDidReceiveMessage(async (input: Record<string, unknown>) => {
-    if (settled || disposed) return;
+    if (settled || disposed || navigating) return;
     const run = generation;
     let inputVersion: number | undefined;
     try {
@@ -367,10 +371,22 @@ export function createScopePreparation(
         return;
       }
       if (input.type === 'cancelAnalysis') { cancel(); errorMessage = m().requirements.canceled; publish(); return; }
-      if (input.type === 'cancel') { panel.dispose(); return; }
-      if (input.type === 'return' && (input.stage === 'review' || input.stage === 'conclusion')) {
-        if (!options.onReturn) throw new Error(m().scope.staleSelection);
-        cancel(); settled = true; options.onReturn(input.stage); finish(undefined); panel.dispose(); return;
+      if (input.type === 'cancel' && !options.retainOnReturn) { panel.dispose(); return; }
+      if (input.type === 'cancel' || input.type === 'return') {
+        const stage = input.stage;
+        if (!options.onReturn || input.type === 'return' && stage !== 'review' && stage !== 'conclusion') throw new Error(m().scope.staleSelection);
+        navigating = true;
+        try {
+          cancel();
+          if (data && !storageBlocked) await save();
+          if (run !== generation || disposed) return;
+          settled = true;
+          inbound?.dispose(); lifecycle?.dispose();
+          if (input.type === 'return' && (stage === 'review' || stage === 'conclusion')) options.onReturn(stage);
+          finish(undefined);
+          if (!options.retainOnReturn) panel.dispose();
+        } finally { navigating = false; }
+        return;
       }
       if (input.type === 'model') { cancel(); await options.pickModel?.(); if (run === generation) publish(); return; }
       if (input.type === 'language') {

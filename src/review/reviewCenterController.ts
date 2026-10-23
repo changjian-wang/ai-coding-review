@@ -105,10 +105,12 @@ export class ReviewCenterController {
     switch (message.action) {
       case 'stage':
         if (value !== 'prepare' && value !== 'review' && value !== 'conclusion') throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
-        this.session.setWorkspaceView({ stage: value });
         if (value === 'prepare') await this.services.prepare();
-        else if (value === 'conclusion') await this.ensureDraft();
-        else await this.services.restoreSource();
+        else {
+          this.session.setWorkspaceView({ stage: value });
+          if (value === 'conclusion') await this.ensureDraft();
+          else await this.services.restoreSource();
+        }
         break;
       case 'navigator':
         if (value !== 'business' && value !== 'findings' && value !== 'feedback' && value !== 'files') throw new ConclusionDraftDataError();

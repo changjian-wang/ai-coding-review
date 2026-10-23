@@ -27,7 +27,7 @@ describe('review center selection and versioning', () => {
     const html = reviewCenterView(state, [], 'test-nonce');
     const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
     if (!script) throw new Error('Review center bootstrap script is missing');
-    let saved: Record<string, unknown> = { preparationCwd: 'C:\\repo', center: { filter: 'inventory', buffers: {} } };
+    let saved: Record<string, unknown> = { preparationCwd: 'C:\\repo', preparationHasReview: true, center: { filter: 'inventory', buffers: {} } };
     const api = { getState: () => saved, setState: (value: Record<string, unknown>) => { saved = value; }, postMessage() {} };
     const source = { attachShadow: () => ({ append() {} }) };
     const template = { content: { cloneNode: () => ({}) } };
@@ -35,6 +35,19 @@ describe('review center selection and versioning', () => {
       {}, { getElementById: (id: string) => id === 'review-source' ? source : template }, () => api,
     );
     expect(saved).toEqual({ center: { filter: 'inventory', buffers: {} } });
+    session.dispose();
+  });
+
+  it('hands preparation to the owning surface before changing the visible stage and preserves the previous conclusion', async () => {
+    const { session } = await reviewCenterFixture();
+    session.setWorkspaceView({ stage: 'conclusion' });
+    const deps = services();
+    deps.prepare = vi.fn(async () => { expect(session.workspaceView.stage).toBe('conclusion'); });
+    const controller = new ReviewCenterController(session, deps);
+    await controller.handle({ type: 'center', action: 'stage', value: 'prepare', contextKey: reviewCenterContextKey(session) });
+    expect(deps.prepare).toHaveBeenCalledTimes(1);
+    expect(session.workspaceView.stage).toBe('conclusion');
+    expect(deps.run).not.toHaveBeenCalled();
     session.dispose();
   });
 

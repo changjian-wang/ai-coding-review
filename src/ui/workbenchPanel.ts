@@ -229,6 +229,7 @@ export class WorkbenchPanel {
   private readonly pendingChangedPaths = new Set<string>();
   /** Whether the full HTML shell has been rendered at least once into the live webview. */
   private rendered = false;
+  private preparing = false;
   /** Signature of the file set last rendered as full HTML; a change forces a full rebuild. */
   private lastStructureSig?: string;
   /** Last dynamic snapshot used to compute incremental tree / HUD patches. */
@@ -355,6 +356,29 @@ export class WorkbenchPanel {
     return WorkbenchPanel.current?.panel.viewColumn;
   }
 
+  static suspendForPreparation(): { panel: vscode.WebviewPanel; resume(): void } | undefined {
+    const owner = WorkbenchPanel.current;
+    if (!owner) return;
+    owner.preparing = true;
+    owner.centerInstanceId = undefined;
+    owner.rendered = false;
+    if (owner.refreshTimer) { clearTimeout(owner.refreshTimer); owner.refreshTimer = undefined; }
+    owner.pendingChangedPaths.clear();
+    DocumentPanel.closeIfOpen();
+    owner.embeddedRegistration?.dispose();
+    owner.embeddedRegistration = undefined;
+    return {
+      panel: owner.panel,
+      resume: () => {
+        if (WorkbenchPanel.current !== owner) return;
+        owner.preparing = false;
+        owner.panel.title = m().workbench.title;
+        owner.forceFullRender();
+        owner.panel.reveal(undefined, false);
+      },
+    };
+  }
+
   /** Reveals (and focuses) the workbench so its window becomes the active group. */
   static reveal(): void {
     WorkbenchPanel.current?.panel.reveal(undefined, false);
@@ -377,6 +401,7 @@ export class WorkbenchPanel {
 
   static postCenterResult(message: CenterAction, error?: string, preview = false): void {
     const current = WorkbenchPanel.current;
+    if (current?.preparing) return;
     current?.refresh();
     void current?.panel.webview.postMessage({
       type: 'centerResult', contextKey: message.contextKey, clientId: message.clientId ?? current?.centerInstanceId,
@@ -454,6 +479,7 @@ export class WorkbenchPanel {
    * single re-render so the webview is not rebuilt dozens of times per second.
    */
   private scheduleRefresh(filePath?: string): void {
+    if (this.preparing) return;
     if (filePath) {
       this.pendingChangedPaths.add(filePath);
     }
@@ -469,6 +495,7 @@ export class WorkbenchPanel {
   }
 
   refresh(changedPaths?: ReadonlySet<string>): void {
+    if (this.preparing) return;
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
@@ -518,6 +545,7 @@ export class WorkbenchPanel {
    * switch, which rewrites every static label).
    */
   private forceFullRender(): void {
+    if (this.preparing) return;
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
@@ -742,6 +770,7 @@ export class WorkbenchPanel {
   }
 
   private handle(msg: InboundMessage): void {
+    if (this.preparing) return;
     switch (msg.type) {
       case 'document':
         if (msg.clientId === this.centerInstanceId) this.documentMessages.fire(msg.message);

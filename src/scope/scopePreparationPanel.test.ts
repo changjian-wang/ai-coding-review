@@ -82,6 +82,23 @@ describe('preparation host messaging', () => {
     expect(disposed).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['review', 'conclusion', 'cancel'])('returns %s from retained preparation without disposing the workbench panel', async (stage) => {
+    const hostPanel = vscode.window.createWebviewPanel('codereview.workbench', 'Preparation', vscode.ViewColumn.One, { enableScripts: true });
+    const panel = vscodeMockState.panel!;
+    const disposed = vi.fn();
+    panel.onDidDispose(disposed);
+    const onReturn = vi.fn();
+    const handle = createScopePreparation(process.cwd(), undefined, 'pr', {
+      hostPanel, retainOnReturn: true, onReturn,
+    });
+    panel.webview.receiveMessage(stage === 'cancel' ? { type: 'cancel' } : { type: 'return', stage });
+    await expect(handle.result).resolves.toBeUndefined();
+    expect(disposed).not.toHaveBeenCalled();
+    if (stage === 'cancel') expect(onReturn).not.toHaveBeenCalled();
+    else expect(onReturn).toHaveBeenCalledWith(stage);
+    handle.dispose();
+  });
+
   it('loads real repository choices asynchronously and validates messages before finishing', async () => {
     const root = process.cwd();
     vi.mocked(repositoryRoot).mockResolvedValue(root);
