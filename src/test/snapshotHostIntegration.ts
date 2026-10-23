@@ -14,6 +14,7 @@ import { readRequirementFile } from '../review/requirementSources';
 import { analyzeRequirementUnderstanding } from '../ai/analyzer';
 import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
+import { runStartupHostChecks } from './startupHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -140,6 +141,7 @@ export async function run(): Promise<void> {
     checks.push('real document webview load and seen acknowledgement');
     const business = await runBusinessReviewHostChecks(root, set);
     checks.push(...business.checks);
+    checks.push(...await runStartupHostChecks(root));
     checks.push(...await runReviewCenterHostChecks(root, business));
     assert.equal(await git('branch', '--show-current'), 'main');
     assert.equal(await git('stash', 'list'), '');
@@ -147,7 +149,7 @@ export async function run(): Promise<void> {
     checks.push('selected commit read without checkout, stash or overwriting dirty files');
     await writeFile(output, JSON.stringify({ status: 'passed', checks }, null, 2));
   } catch (error) {
-    await writeFile(output, JSON.stringify({ status: 'failed', checks, error: String(error) }, null, 2));
+    await writeFile(output, JSON.stringify({ status: 'failed', checks, error: error instanceof Error ? error.stack : String(error) }, null, 2));
     throw error;
   } finally {
     preparation?.dispose();

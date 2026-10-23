@@ -164,6 +164,8 @@ export interface ReviewExtensionApi {
     workspaceState: vscode.Memento;
     loadBranch(cwd: string, head: string, base?: string): Promise<ReviewSet>;
     open(): Promise<void>;
+    openingPanel(): vscode.WebviewPanel | undefined;
+    restorePanel(panel: vscode.WebviewPanel, state: unknown): Promise<void>;
     action(message: Omit<CenterAction, 'type' | 'contextKey'>): Promise<void>;
     recordLocal(): Promise<void>;
     document(): { path?: string; revision?: string; contextKey?: string; readOnly: boolean; embedded: boolean; loaded: boolean };
@@ -964,8 +966,8 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
   // the user to click 「Open in AI Coding Review」 again.
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer('codereview.workbench', {
-      deserializeWebviewPanel: async (panel) => {
-        await restoreWorkbenchInto(panel);
+      deserializeWebviewPanel: async (panel, state: unknown) => {
+        await restoreWorkbenchInto(panel, state);
       },
     }),
   );
@@ -1006,6 +1008,8 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
         return session.reviewSet!;
       },
       open: openWorkbench,
+      openingPanel: () => openingWorkbenchPanel,
+      restorePanel: restoreWorkbenchInto,
       action: (message) => handleCenterAction({ ...message, type: 'center', contextKey: reviewCenterContextKey(session) }),
       recordLocal: async () => {
         if (!session.reviewSet || /^pr-/.test(session.reviewSet.scopeId)) throw new Error('Host fixture permits local conclusions only.');
@@ -1127,8 +1131,9 @@ async function openInNewWindow(
     openingWorkbenchPanel?.reveal(undefined, false);
     return;
   }
+  if (scopePickInFlight) return;
   workbenchOpenInFlight = true;
-  let loadingPanel: vscode.WebviewPanel | undefined;
+  let preparationPanel: vscode.WebviewPanel | undefined;
   try {
     const folders = vscode.workspace.workspaceFolders ?? [];
     let chosenCwd: string | undefined = resolveCwdArg(cwdArg);
@@ -1157,36 +1162,46 @@ async function openInNewWindow(
       }
     }
     preferredDefaultCwd = chosenCwd;
-    setStatusBarBusy(true);
-
-    const loading = WorkbenchPanel.createLoading(m().review.loadingProject, 'scan');
-    loadingPanel = loading.panel;
-    openingWorkbenchPanel = loading.panel;
-    await moveActiveEditorToNewWindow();
-
-    const picked = await pickScope(chosenCwd, loading.panel.viewColumn, undefined, requirementPreparationOptions());
-    if (!picked) {
-      loading.panel.dispose();
-      return;
-    }
-    const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
-    if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
-    await activateReviewSet(reviewSet, picked.cwd);
-    if (picked.requirements) await session.setRequirements(picked.requirements);
-    persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
-    loading.progress.report(m().workbench.loadingOpening, 'open');
-    WorkbenchPanel.adopt(loading.panel, buildWorkbenchState, workbenchActions());
-    if (picked.requirements) void startBusinessReview();
+    preparationPanel = vscode.window.createWebviewPanel('codereview.workbench', m().scope.prepareTitle,
+      vscode.ViewColumn.One, { enableScripts: true, retainContextWhenHidden: true });
+    await prepareWorkbenchInto(preparationPanel, chosenCwd, true);
   } catch (error) {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
-    if (loadingPanel && !WorkbenchPanel.isOpen) {
-      loadingPanel.dispose();
+    if (preparationPanel && !WorkbenchPanel.isOpen) {
+      preparationPanel.dispose();
     }
     openingWorkbenchPanel = undefined;
     workbenchOpenInFlight = false;
     setStatusBarBusy(false);
   }
+}
+
+async function prepareWorkbenchInto(panel: vscode.WebviewPanel, cwd: string, moveToNewWindow = false): Promise<void> {
+  openingWorkbenchPanel = panel;
+  let closed = false;
+  const disposal = panel.onDidDispose(() => { closed = true; });
+  try {
+    const pending = pickScope(cwd, panel.viewColumn, undefined, {
+      ...requirementPreparationOptions(), hostPanel: panel, retainOnSelect: true,
+    });
+    if (moveToNewWindow) await moveActiveEditorToNewWindow();
+    const picked = await pending;
+    if (!picked || closed) return;
+    setStatusBarBusy(true);
+    const progress = WorkbenchPanel.showLoading(panel, m().review.loadingSource, 'restore');
+    const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
+    if (closed) return;
+    if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
+    await activateReviewSet(reviewSet, picked.cwd);
+    if (picked.requirements) await session.setRequirements(picked.requirements);
+    persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
+    if (closed) return;
+    progress.report(m().workbench.loadingOpening, 'open');
+    panel.title = m().workbench.title;
+    WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
+    if (picked.requirements) void startBusinessReview();
+  } finally { disposal.dispose(); }
 }
 
 /** Defaults to changed files and leaves whole-project review as an explicit choice. */
@@ -1280,6 +1295,7 @@ async function startReview(kind?: string): Promise<void> {
   }
 
   if (scopePickInFlight || workbenchOpenInFlight) {
+    openingWorkbenchPanel?.reveal(undefined, false);
     return;
   }
   scopePickInFlight = true;
@@ -2084,7 +2100,21 @@ async function publishCenterConclusion(input: { id: string; revision: number; pr
  * the restored panel. Falls back to disposing the panel when no prior review is
  * recorded, so the user is not left staring at an empty restored frame.
  */
-async function restoreWorkbenchInto(panel: vscode.WebviewPanel): Promise<void> {
+async function restoreWorkbenchInto(panel: vscode.WebviewPanel, state?: unknown): Promise<void> {
+  const preparationCwd = state && typeof state === 'object' && 'preparationCwd' in state
+    && typeof state.preparationCwd === 'string' && state.preparationCwd ? state.preparationCwd : undefined;
+  if (preparationCwd) {
+    if (workbenchOpenInFlight) { panel.dispose(); return; }
+    workbenchOpenInFlight = true;
+    try { await prepareWorkbenchInto(panel, preparationCwd); }
+    catch (error) { panel.dispose(); reportError(error); }
+    finally {
+      if (openingWorkbenchPanel === panel) openingWorkbenchPanel = undefined;
+      workbenchOpenInFlight = false;
+      setStatusBarBusy(false);
+    }
+    return;
+  }
   const cwd = workspaceMemento?.get<string>(LAST_REVIEW_FOLDER_KEY);
   if (!cwd) {
     panel.dispose();

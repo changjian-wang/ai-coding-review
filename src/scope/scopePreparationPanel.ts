@@ -36,6 +36,8 @@ interface RepositoryData {
 }
 
 export interface ScopePreparationOptions {
+  hostPanel?: vscode.WebviewPanel;
+  retainOnSelect?: boolean;
   load?(cwd: string, identity?: string): Promise<{ draft: RequirementsDraft; selection?: PreparedScopeChoice } | undefined>;
   save?(cwd: string, identity: string | undefined, record: { draft: RequirementsDraft; selection?: PreparedScopeChoice }): Promise<void>;
   analyze?(draft: RequirementsDraft, scope: { key: string; description: string }, token: vscode.CancellationToken, usage: (record: TokenUsage) => void): Promise<RequirementUnderstanding>;
@@ -96,8 +98,10 @@ export function createScopePreparation(
   defaultCwd: string, viewColumn?: vscode.ViewColumn, initialKind = 'pr', options: ScopePreparationOptions = {},
 ): { result: Promise<PreparedScopeChoice | undefined>; ready: Promise<boolean>; dispose(): void } {
   const t = m().scope;
-  const panel = vscode.window.createWebviewPanel('codereview.scopePreparation', t.prepareTitle,
+  const panel = options.hostPanel ?? vscode.window.createWebviewPanel('codereview.scopePreparation', t.prepareTitle,
     viewColumn ?? vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
+  panel.title = t.prepareTitle;
+  panel.webview.options = { ...panel.webview.options, enableScripts: true };
   const roots = [...new Set([defaultCwd, ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)])];
   let data: RepositoryData | undefined;
   let draft = createRequirementsDraft();
@@ -112,12 +116,19 @@ export function createScopePreparation(
   let errorMessage = '';
   let settled = false;
   let disposed = false;
+  let inbound: vscode.Disposable | undefined;
   let selectedRoot = defaultCwd;
   let finish!: (value: PreparedScopeChoice | undefined) => void;
   let markReady!: (ready: boolean) => void;
   const result = new Promise<PreparedScopeChoice | undefined>((resolve) => { finish = resolve; });
   const ready = new Promise<boolean>((resolve) => { markReady = resolve; });
-  const post = (message: object) => { if (!disposed) void panel.webview.postMessage(message); };
+  const post = (message: object) => { if (!disposed && !settled) void panel.webview.postMessage(message); };
+  const complete = (selected: PreparedScopeChoice) => {
+    settled = true;
+    inbound?.dispose();
+    finish(selected);
+    if (!options.retainOnSelect) panel.dispose();
+  };
   const cancel = () => {
     requestVersion++; analysis?.cancel(); analysis?.dispose(); analysis = undefined;
     readAbort?.abort(); readAbort = undefined; reading = false;
@@ -239,8 +250,9 @@ export function createScopePreparation(
       if (run === generation) post({ type: 'error', message: String((error as Error).message) });
     }
   };
-  panel.onDidDispose(() => { disposed = true; generation++; cancel(); markReady(false); if (!settled) finish(undefined); });
-  panel.webview.onDidReceiveMessage(async (input: Record<string, unknown>) => {
+  panel.onDidDispose(() => { disposed = true; generation++; inbound?.dispose(); cancel(); markReady(false); if (!settled) finish(undefined); });
+  inbound = panel.webview.onDidReceiveMessage(async (input: Record<string, unknown>) => {
+    if (settled || disposed) return;
     const run = generation;
     let inputVersion: number | undefined;
     try {
@@ -309,7 +321,7 @@ export function createScopePreparation(
         const selected = input.kind === 'files' && typeof input.cwd === 'string' && (input.cwd === selectedRoot || input.cwd === data?.cwd)
           ? { cwd: await realpath(selectedRoot), kind: 'files' as const }
           : choose(input);
-        if (selected.kind === 'files' && input.confirmed !== true && input.technicalOnly !== true) { settled = true; finish(selected); panel.dispose(); return; }
+        if (selected.kind === 'files' && input.confirmed !== true && input.technicalOnly !== true) { complete(selected); return; }
         cancel();
         const previousKey = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
         const version = requestVersion;
@@ -332,7 +344,7 @@ export function createScopePreparation(
             confirmRequirements(draft, key, input.confirmed === true);
           }
           if (!storageBlocked) await save();
-          settled = true; finish({ ...selected, reviewSet: set, requirements: structuredClone(draft) }); panel.dispose();
+          complete({ ...selected, reviewSet: set, requirements: structuredClone(draft) });
         } finally { if (run === generation && version === requestVersion) { reading = false; publish(); } }
         return;
       }

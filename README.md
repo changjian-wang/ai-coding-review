@@ -38,6 +38,8 @@ Development status: the scope foundation, M2 preparation, M3 requirement-aware r
 
 ### Requirement preparation (M2)
 
+- The new-window entry opens preparation directly, without a separate “Discover files” workbench tab while waiting for your choices. Confirmation hands the same panel to the review center; cancelling does not activate a new scope.
+- **Choose another local repository** selects an existing Git folder, without cloning or opening another VS Code window. The adjacent action refreshes the PR list or repository/branch choices; it says **Retry loading** only after a loading error and is separate from AI understanding retries.
 - Three preparation blocks select Repository/PR/branch, provide evidence, and inspect AI understanding. Add Markdown text, local UTF-8 Markdown/TXT, explicit public HTTP/HTTPS text or HTML URLs, GitHub Issue/PR bodies, or GitHub Markdown/TXT links.
 - GitHub reads use the selected repository account. Ordinary pages receive no browser cookies or third-party credentials, and scripts are not executed. Private/local addresses, cross-origin redirects, unsupported formats, access failures and missing content are explicit errors; convert or paste PDF/Word, login-only or client-rendered content.
 - Selected materials are sent to the chosen Copilot model to organize intent, explicit requirements, derived checks and unverified premises. Output structure and exact source-version/line quotations are checked before accepting understanding. Original snapshots and human revisions are stored separately in workspace state.

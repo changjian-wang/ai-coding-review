@@ -39,7 +39,7 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
     <footer class="bottom"><div id="center-notice" class="notice" role="alert" hidden style="width:100%;max-height:90px;overflow:auto;margin:0"><span id="center-notice-text"></span><button id="close-center-notice">${esc(t.close)}</button></div><span id="center-progress"></span><span id="center-tokens" hidden></span><span id="center-status"></span></footer>
   </div>
   <template id="source-template">${document.styles}${document.body}</template>
-  <script nonce="${token}">(()=>{const api=acquireVsCodeApi();const CLIENT=${json(token)};window.__reviewCenterApi=api;window.__reviewCenterClient=CLIENT;window.__reviewDocumentApi={
+  <script nonce="${token}">(()=>{const api=acquireVsCodeApi();const saved=api.getState();if(saved?.preparationCwd){const {preparationCwd,...reviewState}=saved;api.setState(reviewState);}const CLIENT=${json(token)};window.__reviewCenterApi=api;window.__reviewCenterClient=CLIENT;window.__reviewDocumentApi={
     getState:()=>api.getState()?.document||{},setState:value=>api.setState({...api.getState(),document:value}),
     postMessage:message=>api.postMessage({type:'document',clientId:CLIENT,message})};
     document.getElementById('review-source').attachShadow({mode:'open'}).append(document.getElementById('source-template').content.cloneNode(true));})();</script>

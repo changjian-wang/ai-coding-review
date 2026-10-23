@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as vscode from 'vscode';
 import { createScopePreparation, validatePreparedScope } from './scopePreparationPanel';
 import { resetVscodeMock, vscodeMockState } from '../test/vscodeMock';
 import { repositoryRoot, listReviewRefs, currentBranch, repositoryRemoteIdentity } from './gitClient';
 import { listPrs, ensureAuth } from '../gh/ghClient';
+import { m } from '../i18n';
 
 vi.mock('./gitClient', () => ({ repositoryRoot: vi.fn(), listReviewRefs: vi.fn(), currentBranch: vi.fn(), repositoryRemoteIdentity: vi.fn() }));
 vi.mock('../gh/ghClient', () => ({ ensureGhAvailable: vi.fn(), ensureAuth: vi.fn(), listPrs: vi.fn() }));
@@ -35,6 +37,50 @@ describe('preparation scope validation', () => {
 });
 
 describe('preparation host messaging', () => {
+  it('uses the supplied workbench panel directly and retains it for handoff only after confirmation', async () => {
+    const root = process.cwd();
+    vi.mocked(repositoryRoot).mockResolvedValue(root);
+    vi.mocked(listReviewRefs).mockResolvedValue(['main', 'feature']);
+    vi.mocked(currentBranch).mockResolvedValue('main');
+    const hostPanel = vscode.window.createWebviewPanel('codereview.workbench', 'Preparation', vscode.ViewColumn.One, { enableScripts: true });
+    const panel = vscodeMockState.panel!;
+    const disposed = vi.fn();
+    panel.onDidDispose(disposed);
+    const handle = createScopePreparation(root, undefined, 'branchChanges', {
+      hostPanel, retainOnSelect: true,
+      loadScope: async () => ({ scopeId: 'test', label: 'Feature', headSha: 'a'.repeat(40), files: [{ path: 'a.ts' }] }),
+    });
+    expect(vscodeMockState.panel).toBe(panel);
+    expect(panel.title).toBe(m().scope.prepareTitle);
+    expect(panel.webview.options).toMatchObject({ enableScripts: true });
+    expect(panel.webview.html).toContain(m().scope.prepareTitle);
+    expect(panel.webview.html).not.toContain('Loading AI Coding Review');
+    panel.webview.receiveMessage({ type: 'ready' });
+    await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'repository' })));
+    panel.webview.receiveMessage({ type: 'select', cwd: root, kind: 'branchChanges', headRef: 'feature', baseRef: 'main', confirmed: true });
+    await expect(handle.result).resolves.toMatchObject({ kind: 'branchChanges', reviewSet: { headSha: 'a'.repeat(40) } });
+    expect(disposed).not.toHaveBeenCalled();
+    const count = panel.webview.messages.length;
+    const loads = vi.mocked(repositoryRoot).mock.calls.length;
+    panel.webview.receiveMessage({ type: 'ready' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(repositoryRoot).toHaveBeenCalledTimes(loads);
+    expect(panel.webview.messages).toHaveLength(count);
+    handle.dispose();
+    expect(disposed).toHaveBeenCalledTimes(1);
+  });
+
+  it('still closes a retained preparation panel on cancellation without resolving a scope', async () => {
+    const hostPanel = vscode.window.createWebviewPanel('codereview.workbench', 'Preparation', vscode.ViewColumn.One, { enableScripts: true });
+    const panel = vscodeMockState.panel!;
+    const disposed = vi.fn();
+    panel.onDidDispose(disposed);
+    const handle = createScopePreparation(process.cwd(), undefined, 'pr', { hostPanel, retainOnSelect: true });
+    panel.webview.receiveMessage({ type: 'cancel' });
+    await expect(handle.result).resolves.toBeUndefined();
+    expect(disposed).toHaveBeenCalledTimes(1);
+  });
+
   it('loads real repository choices asynchronously and validates messages before finishing', async () => {
     const root = process.cwd();
     vi.mocked(repositoryRoot).mockResolvedValue(root);
@@ -102,5 +148,22 @@ describe('preparation host messaging', () => {
     expect(panel.webview.messages).not.toContainEqual({ type: 'error', message: 'Late authentication failure' });
     handle.dispose();
     await handle.result;
+  });
+
+  it('selects a browsed existing repository without opening a workspace or changing branches', async () => {
+    const root = process.cwd();
+    vi.mocked(repositoryRoot).mockResolvedValue(root);
+    vi.mocked(listReviewRefs).mockResolvedValue(['main', 'feature']);
+    vi.mocked(currentBranch).mockResolvedValue('main');
+    const handle = createScopePreparation(root);
+    const panel = vscodeMockState.panel!;
+    panel.webview.receiveMessage({ type: 'ready' });
+    await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'repository' })));
+    const chosen = `${root}\\src`;
+    vscodeMockState.openDialog = async () => [{ fsPath: chosen }];
+    panel.webview.receiveMessage({ type: 'browse' });
+    await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'repository', selected: chosen })));
+    expect(repositoryRoot).toHaveBeenLastCalledWith(chosen);
+    handle.dispose();
   });
 });

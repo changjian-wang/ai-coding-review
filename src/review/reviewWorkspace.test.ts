@@ -7,6 +7,7 @@ import { businessConclusionSummary } from '../ui/businessReviewPanel';
 import { businessHash } from './businessReview';
 import { m } from '../i18n';
 import { reviewCenterFixture } from '../test/reviewCenterFixture';
+import { reviewCenterView } from '../ui/reviewCenterView';
 
 function services(): ReviewCenterServices {
   return {
@@ -20,6 +21,23 @@ function services(): ReviewCenterServices {
 }
 
 describe('review center selection and versioning', () => {
+  it('clears the preparation-only restore marker on handoff while keeping saved review editor state', async () => {
+    const { session } = await reviewCenterFixture();
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    const html = reviewCenterView(state, [], 'test-nonce');
+    const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
+    if (!script) throw new Error('Review center bootstrap script is missing');
+    let saved: Record<string, unknown> = { preparationCwd: 'C:\\repo', center: { filter: 'inventory', buffers: {} } };
+    const api = { getState: () => saved, setState: (value: Record<string, unknown>) => { saved = value; }, postMessage() {} };
+    const source = { attachShadow: () => ({ append() {} }) };
+    const template = { content: { cloneNode: () => ({}) } };
+    Function('window', 'document', 'acquireVsCodeApi', script)(
+      {}, { getElementById: (id: string) => id === 'review-source' ? source : template }, () => api,
+    );
+    expect(saved).toEqual({ center: { filter: 'inventory', buffers: {} } });
+    session.dispose();
+  });
+
   it('keeps the selected business finding while reading associated files and original materials', async () => {
     const { session } = await reviewCenterFixture();
     const deps = services();
