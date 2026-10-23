@@ -60,11 +60,32 @@ beforeEach(() => {
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
 
 describe('three-block preparation with real host state transitions', () => {
+  it('switches the preparation language without reloading the repository or losing selected material and understanding', async () => {
+    const { handle, panel } = await open({
+      pickLanguage: async () => { vscodeMockState.language = 'zh-CN'; },
+    });
+    panel.webview.receiveMessage({ type: 'material', ...selection, name: 'Original contract', text: 'Charge once.' });
+    await vi.waitFor(() => expect(state()?.ready).toBe(true));
+    const previous = state()!;
+    const loads = vi.mocked(repositoryRoot).mock.calls.length;
+    panel.webview.receiveMessage({ type: 'language' });
+    await vi.waitFor(() => expect(panel.webview.html).toContain('<html lang="zh-CN">'));
+    panel.webview.receiveMessage({ type: 'ready' });
+    await vi.waitFor(() => expect(state()?.materials).toEqual(previous.materials));
+    expect(state()?.ready).toBe(true);
+    expect(state()?.html).toContain('Charge once.');
+    expect(repositoryRoot).toHaveBeenCalledTimes(loads);
+    expect(panel.webview.messages).toContainEqual(expect.objectContaining({
+      type: 'repository', selection: expect.objectContaining({ headRef: 'feature', baseRef: 'main' }),
+    }));
+    handle.dispose();
+  });
+
   it('saves material, organizes through the model adapter, and needs one explicit confirmation for the pinned scope', async () => {
     const { handle, panel, saved } = await open();
     const script = panel.webview.html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
     expect(() => new Function('acquireVsCodeApi', script ?? '')).not.toThrow();
-    expect(panel.webview.html.match(/<section>/g)).toHaveLength(3);
+    expect(panel.webview.html.match(/<section class="review-card">/g)).toHaveLength(3);
     panel.webview.receiveMessage({ type: 'material', ...selection, name: 'Goal', text: 'Charge once.' });
     await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, busy: false }));
     expect(state()?.html).toContain('<strong>Preserve charge consistency.</strong>');

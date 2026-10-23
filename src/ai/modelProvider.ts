@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { PickedModel } from './modelPicker';
+import { m } from '../i18n';
 
 const MEMENTO_KEY = 'codereview.pickedModel.v1';
 
@@ -40,7 +41,7 @@ export class ModelProvider {
   }
 
   get label(): string {
-    return this.picked?.label ?? 'Auto';
+    return this.picked && this.picked.id !== 'auto' ? this.picked.label : m().reviewCenter.autoModel;
   }
 
   /** Current model id ('auto' when none explicitly picked). */

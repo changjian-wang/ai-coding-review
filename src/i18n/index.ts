@@ -6,17 +6,18 @@ export type { Messages } from './en';
 
 /** The two languages the UI and LLM output can resolve to. */
 export type Language = 'zh-CN' | 'en';
+export const DEFAULT_LANGUAGE: Language = 'zh-CN';
 
 /**
  * Resolves the active language from the `codereview.language` setting.
- * Default is English; `auto` follows VS Code's display language.
+ * Defaults to Simplified Chinese; `auto` follows VS Code's display language.
  * This single resolver backs both the UI catalog and the LLM output directive,
  * so the whole extension speaks one language driven by one setting.
  */
 export function resolveLanguage(): Language {
   const choice = vscode.workspace
     .getConfiguration('codereview')
-    .get<string>('language', 'en');
+    .get<string>('language', DEFAULT_LANGUAGE);
   if (choice === 'zh-CN' || choice === 'en') {
     return choice;
   }

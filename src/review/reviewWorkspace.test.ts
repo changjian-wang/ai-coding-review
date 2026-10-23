@@ -38,6 +38,23 @@ describe('review center selection and versioning', () => {
     session.dispose();
   });
 
+  it('projects real open and dismissed findings into the conclusion without treating a handling note as a fix', async () => {
+    const { session, run } = await reviewCenterFixture();
+    const input = { running: false, publishBusy: false, model: 'Controlled', language: 'en' };
+    session.recordBusinessNote(run.findings[0].id, 'A comment is not verification.');
+    const open = buildReviewCenterState(session, input);
+    expect(open.conclusion.openItems.map((row) => row.id)).toEqual([run.findings[0].id]);
+    expect(open.conclusion.openItems[0].summary).toBe(run.findings[0].impact);
+    expect(open.conclusion.dismissedItems).toEqual([]);
+    run.findings[0].status = 'dismissed';
+    run.findings[0].kind = 'reasonable';
+    await session.setBusinessReview(run);
+    const dismissed = buildReviewCenterState(session, input);
+    expect(dismissed.conclusion.openItems).toEqual([]);
+    expect(dismissed.conclusion.dismissedItems.map((row) => row.id)).toEqual([run.findings[0].id]);
+    session.dispose();
+  });
+
   it('keeps the selected business finding while reading associated files and original materials', async () => {
     const { session } = await reviewCenterFixture();
     const deps = services();

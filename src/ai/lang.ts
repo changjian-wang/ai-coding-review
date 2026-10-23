@@ -3,7 +3,7 @@ import { resolveLanguage, type Language } from '../i18n';
 /** Backwards-compatible alias; language now resolves via the shared i18n resolver. */
 export type OutputLanguage = Language;
 
-/** Reads the active language from the shared `codereview.language` resolver (default English). */
+/** Reads the active language from the shared resolver (default Simplified Chinese). */
 export function getOutputLanguage(): OutputLanguage {
   return resolveLanguage();
 }

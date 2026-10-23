@@ -5,6 +5,9 @@ import { m } from '../i18n';
 
 interface PreparationReport {
   cards: number;
+  language: string;
+  prototypeChrome: boolean;
+  targetChoices: number;
   loading: boolean;
   refresh: string;
   browse: string;
@@ -47,6 +50,9 @@ async function inspectPreparation(panel: vscode.WebviewPanel): Promise<Preparati
       if (event.data.type === 'repository') {
         api.postMessage({type:'rendered',cwd:event.data.data.cwd,startupCheck:{
           cards:document.querySelectorAll('main>section').length,
+          language:document.documentElement.lang,
+          prototypeChrome:!!document.querySelector('.command .product-mark svg')&&document.querySelectorAll('.stages .stage-index').length===3,
+          targetChoices:document.querySelectorAll('.scope-kind input[type=radio]').length,
           loading:!!document.getElementById('loadingElapsed'),
           refresh:document.getElementById('retry').textContent,
           browse:document.getElementById('browse').textContent,saved:api.getState()
@@ -83,6 +89,9 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
   const first = await openingPanel(api);
   const report = await inspectPreparation(first);
   assert.equal(report.cards, 3);
+  assert.equal(report.language, 'zh-CN', 'A new profile must default to Simplified Chinese even with an English editor');
+  assert.equal(report.prototypeChrome, true);
+  assert.equal(report.targetChoices, 2);
   assert.equal(report.loading, false);
   assert.equal(report.refresh, m().scope.refreshRepository);
   assert.equal(report.browse, m().scope.browseRepository);
@@ -98,6 +107,17 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
   assert.equal(api.session.reviewSet, selected);
   await waitFor(() => vscode.window.tabGroups.all.length === groups, 'auxiliary group closing after cancellation');
   assert.equal(vscode.window.tabGroups.all.length, groups, 'Cancellation must not leave an empty auxiliary editor group');
+
+  const configuration = vscode.workspace.getConfiguration('codereview');
+  try {
+    await configuration.update('language', 'en', vscode.ConfigurationTarget.Workspace);
+    await api.setLanguage('zh-CN');
+    assert.equal(vscode.workspace.getConfiguration('codereview').get('language'), 'zh-CN');
+    assert.equal(vscode.workspace.getConfiguration('codereview').inspect('language')?.workspaceValue, 'zh-CN',
+      'An explicit workspace preference must be changed at workspace scope, not masked by a global write');
+  } finally {
+    await configuration.update('language', undefined, vscode.ConfigurationTarget.Workspace);
+  }
 
   const restored = vscode.window.createWebviewPanel('codereview.workbench', m().scope.prepareTitle,
     vscode.ViewColumn.One, { retainContextWhenHidden: true });
@@ -131,7 +151,8 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
     final.dispose();
   }
   return [
-    'production new-window entry shows one real preparation page with accurate repository actions; repeated opening and cancellation leave no loading tab or empty group',
+    'Chinese-first production preparation uses the prototype header and segmented target; repeated opening and cancellation leave no loading tab or empty group',
+    'language switching respects explicit workspace configuration instead of an ineffective global-only override',
     'saved preparation restores in place and Escape cancels it without activating a new review',
     'explicit confirmation adopts the same native panel as the review center without another tab or relocation',
   ];

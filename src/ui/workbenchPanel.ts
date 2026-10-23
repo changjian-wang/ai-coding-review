@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import type { FindingEvidenceRef, FindingSeverity } from '../ai/types';
 import { esc, escAttr, nonce as makeNonce } from './html';
-import { m, fmt, resolveLanguage, type Messages } from '../i18n';
+import { DEFAULT_LANGUAGE, m, fmt, resolveLanguage, type Messages } from '../i18n';
 import { DocumentPanel, type DocActions, type DocumentInbound, type EmbeddedDocumentSurface } from './documentPanel';
 import { reviewCenterView } from './reviewCenterView';
 import type { CenterAction, ReviewCenterState } from './reviewCenterState';
@@ -2122,7 +2122,7 @@ export async function withWorkbenchProgress<T>(
 
 /** Display name for the current `codereview.language` setting, e.g. "中文 (zh-CN)". */
 function languageLabel(t: Messages['workbench']): string {
-  const choice = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
+  const choice = vscode.workspace.getConfiguration('codereview').get<string>('language', DEFAULT_LANGUAGE);
   if (choice === 'zh-CN') {
     return t.langZh;
   }

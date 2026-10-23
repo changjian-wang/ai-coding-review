@@ -22,6 +22,7 @@ export interface CenterRow {
   detail: string;
   badge?: string;
   tone?: string;
+  summary?: string;
 }
 
 export interface CenterInspector {
@@ -50,6 +51,8 @@ export interface CenterConclusion {
   confirmed: boolean;
   published: boolean;
   unknownAttempt?: { id: string; error?: string };
+  openItems: CenterRow[];
+  dismissedItems: CenterRow[];
 }
 
 export interface ReviewCenterState {
@@ -180,6 +183,7 @@ export function buildReviewCenterState(
   const findings: CenterRow[] = (run?.findings ?? []).map((finding) => ({
     id: finding.id, kind: 'finding', title: finding.title,
     detail: finding.evidence.filter((ref) => ref.kind === 'code').map((ref) => ref.path).join(' · '),
+    summary: finding.impact,
     badge: `${b[finding.kind]} · ${b[finding.status]}`, tone: finding.status === 'confirmed' ? 'error' : finding.status === 'unresolved' ? 'warning' : 'ok',
   }));
   findings.push(...(run?.priorCritical ?? []).map((item): CenterRow => ({
@@ -276,6 +280,10 @@ export function buildReviewCenterState(
       target: pr ? `${set?.repositoryIdentity ?? session.getRepoLabel()} · PR #${pr[1]}` : `${session.getRepoLabel()} · ${t.localTarget}`,
       blockers: input.running || input.analysisBusy ? [b.incomplete] : run ? businessBlockers(run) : session.technicalGatePassed() ? [] : [b.incomplete],
       confirmed: run?.confirmed ?? false,
+      openItems: findings.filter((row) => row.kind === 'finding'
+        ? run?.findings.some((finding) => finding.id === row.id && finding.status !== 'dismissed')
+        : row.kind === 'critical' && !run?.priorCriticalVerdicts.some((verdict) => verdict.id === row.id && verdict.status === 'cleared')),
+      dismissedItems: findings.filter((row) => row.kind === 'finding' && run?.findings.some((finding) => finding.id === row.id && finding.status === 'dismissed')),
     },
   };
 }

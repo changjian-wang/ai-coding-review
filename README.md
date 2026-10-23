@@ -64,6 +64,8 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 
 ### Review center (M4 development slice)
 
+- The production pages now share the approved prototype's product header, numbered stages, card hierarchy and theme-aware surfaces. Preparation uses a centered 840px canvas, PR/branch segmented selection and compact evidence/understanding; review uses 244px / flexible source / 354px columns on wide screens, with drawers on narrow screens.
+- Conclusion keeps real open/overturned findings, source boundaries and the exact Markdown body in the main pane; approval blockers, verdict choices, acknowledgement and submission are grouped in the inspector. Summaries use current session facts, not the prototype's demo outcomes.
 - Prepare → Review → Conclusion. The review stage uses one webview with business/findings/PR-feedback/file navigation, the shared source/Diff/Markdown reader, and a judgment/evidence/handling inspector.
 - Reading associated files or original evidence preserves the selected finding. The overview remains directly accessible; read-only quotations do not add formal review coverage. Narrow windows use navigation/inspector drawers; focus mode and F8 finding navigation are available.
 - Edit Markdown and the verdict, then save and preview the exact body and frozen inline comments before publishing a GitHub Review or recording a local conclusion. Saving alone is not preview acknowledgement. The application limit is 60,000 body characters; oversize input stays editable rather than being truncated.
@@ -112,13 +114,13 @@ The legacy gate applies only when no business-review result is being used; it ca
 
 ## Language (bilingual)
 
-AI Coding Review is fully bilingual (English / 简体中文), **English by default**.
+AI Coding Review is fully bilingual (简体中文 / English), **Simplified Chinese by default**.
 
 - `codereview.language` drives the **whole experience** — both the extension UI (status bar, prompts, webview panels) and all LLM output (findings, fix proposals, explanations, global conclusions).
-  - `en` (default): everything in English
-  - `zh-CN`: everything in Simplified Chinese
+  - `zh-CN` (default): UI and new model output in Simplified Chinese
+  - `en`: UI and new model output in English
   - `auto`: follow the VS Code display language
-- Switching the setting takes effect **live** — the status bar and any open webview panels re-render immediately, no reload needed.
+- Use the language control in preparation or review to switch live. Preparation preserves the selected repository, requirement originals and understanding; finish or cancel an open material editor before switching. Existing explicit `en`/`auto` preferences are not overwritten, and saved findings, code identifiers and source quotations are not silently rewritten.
 - Command titles in the Command Palette follow the **VS Code display language** (a platform limitation for static contribution points), localized via `package.nls`.
 
 ## Commands and settings
@@ -143,7 +145,7 @@ AI Coding Review is fully bilingual (English / 简体中文), **English by defau
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `codereview.language` | `en` | Language for the whole experience (UI + LLM output): `en` / `zh-CN` / `auto` |
+| `codereview.language` | `zh-CN` | Language for the whole experience (UI + new LLM output): `zh-CN` / `en` / `auto` |
 | `codereview.focusedWorkbench` | `false` | When opening the workbench, hide the side bar / activity bar so it takes over the main editor area; restored on close |
 | `codereview.repositoryAwareAnalysis` | `auto` | `auto` recursively builds related repository context and self-reviews candidate bugs; `off` keeps legacy single-file behavior |
 | `codereview.repositoryContextTokenBudget` | `28000` | Maximum estimated repository-context input tokens; lower-value related excerpts are removed first |

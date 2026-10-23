@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { realpath } from 'node:fs/promises';
-import { m } from '../i18n';
+import { fmt, m, resolveLanguage } from '../i18n';
 import { esc, escAttr } from '../ui/html';
 import { currentBranch, listReviewRefs, repositoryRemoteIdentity, repositoryRoot } from './gitClient';
 import { ensureAuth, ensureGhAvailable, listPrs } from '../gh/ghClient';
@@ -44,6 +44,7 @@ export interface ScopePreparationOptions {
   loadScope?(selection: PreparedScopeChoice): Promise<ReviewSet>;
   modelLabel?(): string;
   pickModel?(): Promise<void>;
+  pickLanguage?(): Promise<void>;
   onRendered?(report: { materials: number; items: number; unsafeNodes: number; ready: boolean; error?: string }): void;
   onDraftChange?(cwd: string, scope: ReviewSet, draft: RequirementsDraft): Promise<void>;
   onReturn?(stage: 'review' | 'conclusion'): void;
@@ -85,19 +86,18 @@ function understandingHtml(draft: RequirementsDraft): string {
     const source = draft.materials.find((item) => item.id === ref.sourceId);
     return `<details><summary>${esc(source?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}–${ref.endLine}</summary><pre class="quote">${esc(ref.quote)}</pre><button class="secondary" data-source="${escAttr(ref.sourceId)}" data-version="${ref.version}">${esc(t.raw)}</button></details>`;
   };
-  return `<div class="markdown">${renderRequirementMarkdown(u.summary)}</div>${u.requirements.some((item) => item.basis === 'human') ? `<p class="hint">${esc(t.humanNotice)}</p>` : ''}${!u.requirements.length ? `<p>${esc(t.noRequirements)}</p>` : ''}
-    ${u.requirements.map((item) => `<article class="item ${item.included ? '' : 'excluded'}"><h3>${esc(item.id)} · ${esc(item.title)}</h3><small>${esc(item.basis === 'human' ? t.human : t.explicit)}${item.included ? '' : ` · ${esc(t.reason)}: ${esc(item.exclusionReason)}`}</small><div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}<button class="secondary" data-revise="${esc(item.id)}">${esc(t.revise)}</button></article>`).join('')}
-    <details><summary>${esc(t.checks)} (${u.checks.length})</summary>${u.checks.map((check) => `<p>${esc(check.requirementIds.join(', '))} · ${esc(check.text)}</p>`).join('')}</details>
-    <details><summary>${esc(t.questions)} (${u.questions.length})</summary>${u.questions.map((question) => `<article class="item"><p>${esc(question.text)}</p>${question.origins.map(origin).join('')}</article>`).join('')}</details>
-    <details><summary>${esc(t.history)} (${draft.history.length})</summary>${draft.history.map((item) => `<p class="hint">${esc(new Date(item.at).toISOString())} · ${esc(item.action)}</p>`).join('')}
+  return `<div class="understanding-intent markdown">${renderRequirementMarkdown(u.summary)}</div>${u.requirements.some((item) => item.basis === 'human') ? `<p class="hint">${esc(t.humanNotice)}</p>` : ''}${!u.requirements.length ? `<p>${esc(t.noRequirements)}</p>` : ''}
+    ${u.requirements.map((item) => `<article class="item ${item.included ? '' : 'excluded'}"><div class="understanding-row"><span class="understanding-marker" aria-hidden="true">◇</span><div><h3>${esc(item.id)} · ${esc(item.title)}</h3><small>${item.origins.map((ref) => `${esc(draft.materials.find((source) => source.id === ref.sourceId)?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}`).join(' / ')}</small></div><span class="badge accent">${esc(item.basis === 'human' ? t.human : t.explicit)}</span></div><details class="understanding-detail"><summary>${esc(m().reviewCenter.details)}</summary>${!item.included ? `<p class="hint">${esc(t.reason)}: ${esc(item.exclusionReason)}</p>` : ''}<div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}<button class="secondary" data-revise="${esc(item.id)}">${esc(t.revise)}</button></details></article>`).join('')}
+    ${u.checks.length || u.questions.length ? `<details class="understanding-extras"><summary>${esc(fmt(m().reviewCenter.understandingExtras, u.checks.length, u.questions.length))}</summary><h3>${esc(t.checks)}</h3>${u.checks.map((check) => `<p>${esc(check.requirementIds.join(', '))} · ${esc(check.text)}</p>`).join('')}<h3>${esc(t.questions)}</h3>${u.questions.map((question) => `<div><p>${esc(question.text)}</p>${question.origins.map(origin).join('')}</div>`).join('')}</details>` : ''}
+    <details><summary>${esc(t.history)} (${draft.history.length})</summary><p class="hint">${esc(u.modelId)} · ${new Date(u.createdAt).toISOString()}</p>${draft.history.map((item) => `<p class="hint">${esc(new Date(item.at).toISOString())} · ${esc(item.action)}</p>`).join('')}
     ${draft.understandingHistory.map((previous) => `<details><summary>${esc(previous.modelId)} · ${esc(new Date(previous.createdAt).toISOString())}</summary>${previous.requirements.map((item) => `<article class="item"><strong>${esc(item.title)}</strong><div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}</article>`).join('')}</details>`).join('')}</details>
-    <p class="hint">${esc(u.modelId)} · ${new Date(u.createdAt).toISOString()}</p>`;
+    `;
 }
 
 export function createScopePreparation(
   defaultCwd: string, viewColumn?: vscode.ViewColumn, initialKind = 'pr', options: ScopePreparationOptions = {},
 ): { result: Promise<PreparedScopeChoice | undefined>; ready: Promise<boolean>; dispose(): void } {
-  const t = m().scope;
+  let t = m().scope;
   const panel = options.hostPanel ?? vscode.window.createWebviewPanel('codereview.scopePreparation', t.prepareTitle,
     viewColumn ?? vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
   panel.title = t.prepareTitle;
@@ -116,6 +116,7 @@ export function createScopePreparation(
   let errorMessage = '';
   let settled = false;
   let disposed = false;
+  let rerendering = false;
   let inbound: vscode.Disposable | undefined;
   let selectedRoot = defaultCwd;
   let finish!: (value: PreparedScopeChoice | undefined) => void;
@@ -139,7 +140,11 @@ export function createScopePreparation(
       revision: draft.revision, hasSources: selectedMaterials(draft).length > 0,
       ready: !storageBlocked && !!key && requirementReadiness(draft, key).canConfirm,
       busy: !!analysis, reading, error: errorMessage,
-      modelLabel: options.modelLabel?.() ?? 'Auto',
+      modelLabel: options.modelLabel?.() ?? m().reviewCenter.autoModel,
+      requirementCount: draft.understanding?.requirements.filter((item) => item.included).length ?? 0,
+      scopeSummary: pinned ? `${pinned.source?.headRef ?? pinned.label}${pinned.source?.baseRef ? ` → ${pinned.source.baseRef}` : ''} · ${fmt(m().reviewCenter.scopeCount, pinned.files.filter((file) => !file.context).length)}` : '',
+      scopeFiles: pinned?.files.filter((file) => !file.context).slice(0, 50).map((file) => file.path) ?? [],
+      scopeMore: pinned ? Math.max(0, pinned.files.filter((file) => !file.context).length - 50) : 0,
       scopeDescription: pinned
         ? `${pinned.label} · ${m().scope.snapshotNotice(pinned.source?.headRef ?? '', pinned.headSha.slice(0, 12))}${pinned.comparison ? ` / ${m().scope.base}: ${pinned.comparison.baseSha.slice(0, 12)}` : ''}`
         : '',
@@ -256,7 +261,14 @@ export function createScopePreparation(
     const run = generation;
     let inputVersion: number | undefined;
     try {
-      if (input.type === 'ready') { await load(defaultCwd); return; }
+      if (input.type === 'ready') {
+        if (rerendering && data) {
+          rerendering = false;
+          post({ type: 'repository', data, roots, selected: selectedRoot, selection });
+          publish();
+        } else { rerendering = false; await load(selectedRoot); }
+        return;
+      }
       if (input.type === 'rendered') { if (data && input.cwd === data.cwd) markReady(true); return; }
       if (input.type === 'requirementsRendered') {
         if ([input.materials, input.items, input.unsafeNodes].every((value) => typeof value === 'number')) {
@@ -311,6 +323,20 @@ export function createScopePreparation(
         cancel(); settled = true; options.onReturn(input.stage); finish(undefined); panel.dispose(); return;
       }
       if (input.type === 'model') { cancel(); await options.pickModel?.(); if (run === generation) publish(); return; }
+      if (input.type === 'language') {
+        const previous = resolveLanguage();
+        cancel();
+        if (options.pickLanguage) await options.pickLanguage();
+        else await vscode.commands.executeCommand('codereview.pickLanguage');
+        if (run !== generation || disposed) return;
+        if (previous !== resolveLanguage()) {
+          t = m().scope;
+          rerendering = true;
+          panel.title = t.prepareTitle;
+          panel.webview.html = scopePreparationView(selectedRoot, selection?.kind ?? initialKind, !!options.onReturn, options.fileScope?.cwd);
+        } else publish();
+        return;
+      }
       if (input.type === 'editRequirement' && typeof input.id === 'string') {
         const item = draft.understanding?.requirements.find((entry) => entry.id === input.id);
         if (!item) throw new Error(m().requirements.stale);

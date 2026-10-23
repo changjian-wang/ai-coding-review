@@ -20,7 +20,7 @@ export async function listModels(): Promise<PickedModel[]> {
     models = [];
   }
   return [
-    { id: 'auto', label: 'Auto' },
+    { id: 'auto', label: m().reviewCenter.autoModel },
     ...models.map((mm) => ({ id: mm.id, label: mm.name, model: mm })),
   ];
 }
@@ -38,9 +38,9 @@ export async function pickModel(): Promise<PickedModel | undefined> {
   type Item = vscode.QuickPickItem & { value: PickedModel };
   const items: Item[] = [
     {
-      label: 'Auto',
+      label: m().reviewCenter.autoModel,
       description: m().model.autoDescription,
-      value: { id: 'auto', label: 'Auto' },
+      value: { id: 'auto', label: m().reviewCenter.autoModel },
     },
     ...models.map((m): Item => ({
       label: m.name,

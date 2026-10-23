@@ -74,7 +74,7 @@ import {
   registerIgnoreReasonPasteCommand,
   showIgnoreReasonInput,
 } from './ui/ignoreReasonInput';
-import { fmt, m, onLanguageChange, resolveLanguage, type Language } from './i18n';
+import { DEFAULT_LANGUAGE, fmt, m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 import { buildFullFileDiff } from './review/fullFileDiff';
 import {
   collectRelatedRepositoryContext,
@@ -166,6 +166,7 @@ export interface ReviewExtensionApi {
     open(): Promise<void>;
     openingPanel(): vscode.WebviewPanel | undefined;
     restorePanel(panel: vscode.WebviewPanel, state: unknown): Promise<void>;
+    setLanguage(language: Language | 'auto'): Promise<void>;
     action(message: Omit<CenterAction, 'type' | 'contextKey'>): Promise<void>;
     recordLocal(): Promise<void>;
     document(): { path?: string; revision?: string; contextKey?: string; readOnly: boolean; embedded: boolean; loaded: boolean };
@@ -1010,6 +1011,7 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
       open: openWorkbench,
       openingPanel: () => openingWorkbenchPanel,
       restorePanel: restoreWorkbenchInto,
+      setLanguage: applyLanguage,
       action: (message) => handleCenterAction({ ...message, type: 'center', contextKey: reviewCenterContextKey(session) }),
       recordLocal: async () => {
         if (!session.reviewSet || /^pr-/.test(session.reviewSet.scopeId)) throw new Error('Host fixture permits local conclusions only.');
@@ -1342,6 +1344,7 @@ function requirementPreparationOptions(): ScopePreparationOptions {
     save: (cwd, identity, record) => reviewStore.saveRequirementPreparation(repositoryStorageId(cwd, identity), record),
     modelLabel: () => models.label,
     pickModel: selectModel,
+    pickLanguage: selectLanguage,
     onDraftChange: async (cwd, set, draft) => {
       if (session.reviewSet && session.getCwd() === cwd && requirementScopeKey(cwd, set) === requirementScopeKey(cwd, session.reviewSet)) {
         await session.setRequirements(draft);
@@ -1660,17 +1663,19 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
  */
 /** Applies a language id chosen from the inline workbench menu. */
 async function applyLanguage(id: string): Promise<void> {
-  const cur = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
+  const configuration = vscode.workspace.getConfiguration('codereview');
+  const cur = configuration.get<string>('language', DEFAULT_LANGUAGE);
   if (id === cur) {
     return;
   }
-  await vscode.workspace
-    .getConfiguration('codereview')
-    .update('language', id, vscode.ConfigurationTarget.Global);
+  const source = configuration.inspect<string>('language');
+  const target = source?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.WorkspaceFolder
+    : source?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  await configuration.update('language', id, target);
 }
 
 async function selectLanguage(): Promise<void> {
-  const current = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
+  const current = vscode.workspace.getConfiguration('codereview').get<string>('language', DEFAULT_LANGUAGE);
   const t = m().model;
   const pick = await vscode.window.showQuickPick(
     [
@@ -1685,9 +1690,7 @@ async function selectLanguage(): Promise<void> {
   }
   // Update at the highest scope that already defines it, else global, so the
   // change actually takes effect regardless of where the user set it before.
-  await vscode.workspace
-    .getConfiguration('codereview')
-    .update('language', pick.value, vscode.ConfigurationTarget.Global);
+  await applyLanguage(pick.value);
 }
 
 /** Opens (or reveals) the Review Workbench webview. */
@@ -2347,7 +2350,7 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
       { id: 'en', label: m().workbench.langEn, current: cur === 'en' },
       { id: 'zh-CN', label: m().workbench.langZh, current: cur === 'zh-CN' },
       { id: 'auto', label: m().workbench.langAuto, current: cur === 'auto' },
-    ])(vscode.workspace.getConfiguration('codereview').get<string>('language', 'en')),
+    ])(vscode.workspace.getConfiguration('codereview').get<string>('language', DEFAULT_LANGUAGE)),
     tokenUsage: session.tokenUsage
       ? {
           input: session.tokenUsage.totalInput,

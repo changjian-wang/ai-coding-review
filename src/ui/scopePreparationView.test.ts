@@ -87,4 +87,21 @@ describe('preparation repository actions', () => {
     expect(page.get('retry').disabled).toBe(false);
     expect(page.messages).not.toContainEqual(expect.objectContaining({ type: 'organize' }));
   });
+
+  it('uses the prototype PR/branch segmented target and a separate branch comparison mode', () => {
+    const page = client('branchChanges');
+    page.repository();
+    expect(page.get('pr-field').hidden).toBe(true);
+    expect(page.get('scope-mode-field').hidden).toBe(false);
+    page.get('scope-mode').value = 'branchFull';
+    page.get('scope-mode').onchange?.();
+    expect(page.get('kind').value).toBe('branchFull');
+    expect(page.get('base-field').hidden).toBe(true);
+    expect(page.messages.at(-1)).toMatchObject({ type: 'selection', kind: 'branchFull' });
+    page.get('target-pr').onchange?.();
+    expect(page.get('pr-field').hidden).toBe(false);
+    expect(page.get('scope-mode-field').hidden).toBe(true);
+    expect(page.messages).toContainEqual({ type: 'prs', cwd: 'C:\\repo' });
+    expect(page.messages.at(-1)).toMatchObject({ type: 'selection', kind: 'pr' });
+  });
 });

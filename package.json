@@ -151,7 +151,7 @@
             "%config.language.zh%",
             "%config.language.en%"
           ],
-          "default": "en",
+          "default": "zh-CN",
           "description": "%config.language.description%"
         },
         "codereview.focusedWorkbench": {

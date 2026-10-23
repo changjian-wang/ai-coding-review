@@ -45,7 +45,7 @@ export interface MockInputBox {
 }
 
 export const vscodeMockState: {
-  language: string;
+  language: string | undefined;
   panel?: MockWebviewPanel;
   inputBox?: MockInputBox;
   progress?: { options: unknown; reports: unknown[] };
@@ -200,7 +200,7 @@ export const workspace = {
   textDocuments: new Array<{ uri: Uri; isDirty: boolean; getText(): string }>(),
   getConfiguration: () => ({
     get: <T>(section: string, defaultValue: T): T =>
-      (section === 'language' ? vscodeMockState.language : defaultValue) as T,
+      (section === 'language' ? vscodeMockState.language ?? defaultValue : defaultValue) as T,
   }),
   openTextDocument: async (uri: unknown) => {
     if (vscodeMockState.openTextDocument) {
