@@ -33,6 +33,9 @@ interface RepositoryData {
   current: string;
   repositoryIdentity?: string;
   prs?: PrSummary[];
+  prsLoading?: boolean;
+  prsCurrent?: boolean;
+  prsError?: string;
 }
 
 export interface ScopePreparationOptions {
@@ -42,6 +45,7 @@ export interface ScopePreparationOptions {
   save?(cwd: string, identity: string | undefined, record: { draft: RequirementsDraft; selection?: PreparedScopeChoice }): Promise<void>;
   analyze?(draft: RequirementsDraft, scope: { key: string; description: string }, token: vscode.CancellationToken, usage: (record: TokenUsage) => void): Promise<RequirementUnderstanding>;
   loadScope?(selection: PreparedScopeChoice): Promise<ReviewSet>;
+  loadPrs?(cwd: string): Promise<PrSummary[]>;
   modelLabel?(): string;
   pickModel?(): Promise<void>;
   pickLanguage?(): Promise<void>;
@@ -55,6 +59,7 @@ export function validatePreparedScope(data: RepositoryData | undefined, input: R
   if (!data || input.cwd !== data.cwd) throw new Error(m().scope.staleSelection);
   if (input.kind === 'files') return { cwd: data.cwd, kind: 'files' };
   if (input.kind === 'pr') {
+    if (data.prsLoading || data.prsCurrent === false) throw new Error(m().scope.staleSelection);
     const pr = data.prs?.find((item) => item.number === input.prNumber);
     if (!pr) throw new Error(m().scope.staleSelection);
     return { cwd: data.cwd, kind: 'pr', prNumber: pr.number };
@@ -109,6 +114,11 @@ export function createScopePreparation(
   let pinned: ReviewSet | undefined;
   let generation = 0;
   let analysis: vscode.CancellationTokenSource | undefined;
+  let analyzing = false;
+  let scopeLoading = false;
+  let scopeCurrent = false;
+  let scopeError = '';
+  let prVersion = 0;
   let requestVersion = 0;
   let reading = false;
   let readAbort: AbortController | undefined;
@@ -132,14 +142,16 @@ export function createScopePreparation(
   };
   const cancel = () => {
     requestVersion++; analysis?.cancel(); analysis?.dispose(); analysis = undefined;
+    analyzing = false; scopeLoading = false;
     readAbort?.abort(); readAbort = undefined; reading = false;
   };
   const publish = () => {
     const key = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
     post({ type: 'requirements', state: {
       revision: draft.revision, hasSources: selectedMaterials(draft).length > 0,
-      ready: !storageBlocked && !!key && requirementReadiness(draft, key).canConfirm,
-      busy: !!analysis, reading, error: errorMessage,
+      ready: !storageBlocked && scopeCurrent && !scopeLoading && !!key && requirementReadiness(draft, key).canConfirm,
+      busy: analyzing, reading, error: errorMessage,
+      scopeLoading, scopeReady: scopeCurrent && !scopeLoading, scopeError, scopeRetained: !!pinned && !scopeCurrent,
       modelLabel: options.modelLabel?.() ?? m().reviewCenter.autoModel,
       requirementCount: draft.understanding?.requirements.filter((item) => item.included).length ?? 0,
       scopeSummary: pinned ? `${pinned.source?.headRef ?? pinned.label}${pinned.source?.baseRef ? ` → ${pinned.source.baseRef}` : ''} · ${fmt(m().reviewCenter.scopeCount, pinned.files.filter((file) => !file.context).length)}` : '',
@@ -155,22 +167,29 @@ export function createScopePreparation(
     } });
   };
   const notifyDraft = async () => {
-    if (data && pinned) await options.onDraftChange?.(data.cwd, pinned, structuredClone(draft));
+    if (data && pinned && scopeCurrent) await options.onDraftChange?.(data.cwd, pinned, structuredClone(draft));
   };
   const save = async () => {
     if (!data || storageBlocked) throw new Error(m().requirements.loadFailed);
-    await options.save?.(data.cwd, data.repositoryIdentity, { draft: structuredClone(draft), selection: selection ? { ...selection } : undefined });
-    await notifyDraft();
+    const owner = data, original = draft, scope = pinned;
+    await options.save?.(owner.cwd, owner.repositoryIdentity, { draft: structuredClone(original), selection: selection ? { ...selection } : undefined });
+    if (owner === data && original === draft && scope === pinned) await notifyDraft();
   };
   const choose = (input: Record<string, unknown>) => {
     const next = validatePreparedScope(data, input);
+    if (next.kind !== 'pr' && data?.prsLoading) { prVersion++; data.prsLoading = false; }
     if (JSON.stringify(next) !== JSON.stringify(selection)) {
-      cancel(); pinned = undefined;
+      cancel(); pinned = undefined; scopeCurrent = false; scopeError = '';
       clearRequirementConfirmation(draft);
       selection = next;
     }
     return next;
   };
+  const targetProvided = (input: Record<string, unknown>) => input.cwd === data?.cwd
+    && (input.kind === 'pr' ? !data?.prsLoading && data?.prsCurrent !== false && Number(input.prNumber) > 0
+      : input.kind === 'branchFull' ? !!input.headRef
+        : input.kind === 'branchChanges' ? !!input.headRef && !!input.baseRef && input.headRef !== input.baseRef
+          : input.kind === 'files' && options.fileScope?.cwd === input.cwd);
   const refreshFiles = async (stillCurrent: () => boolean): Promise<void> => {
     const files = selectedMaterials(draft).filter((source) => source.kind === 'file');
     const reads = await Promise.all(files.map(async (source) => ({ source, loaded: await readRequirementFile(source.location) })));
@@ -194,13 +213,14 @@ export function createScopePreparation(
     const run = generation;
     const cts = new vscode.CancellationTokenSource();
     analysis = cts;
-    errorMessage = '';
+    scopeLoading = true; scopeCurrent = false; scopeError = ''; errorMessage = '';
     publish();
     try {
       const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
         ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
       if (disposed || run !== generation || version !== requestVersion) return;
       pinned = set;
+      scopeLoading = false; scopeCurrent = true;
       await notifyDraft();
       await refreshFiles(() => !disposed && run === generation && version === requestVersion);
       if (disposed || run !== generation || version !== requestVersion) return;
@@ -209,6 +229,8 @@ export function createScopePreparation(
       if (!selectedMaterials(draft).length || readiness.canConfirm && !force) return;
       clearRequirementConfirmation(draft);
       if (!options.analyze) throw new Error(m().requirements.noModel);
+      analyzing = true;
+      publish();
       const understanding = await options.analyze(structuredClone(draft), {
         key: scopeKey, description: `${set.repositoryIdentity ?? selected.cwd} / ${set.label} / head=${set.headSha} / base=${set.source?.baseTipSha ?? set.comparison?.baseSha ?? ''}`,
       }, cts.token, (usage) => {
@@ -219,18 +241,21 @@ export function createScopePreparation(
       await save();
     } catch (error) {
       if (run === generation && version === requestVersion && !disposed) {
-        errorMessage = String((error as Error).message);
+        if (scopeCurrent) errorMessage = String((error as Error).message);
+        else scopeError = String((error as Error).message);
         await save();
       }
     } finally {
-      if (analysis === cts) analysis = undefined;
+      if (analysis === cts) { analysis = undefined; analyzing = false; scopeLoading = false; }
       cts.dispose();
       if (run === generation && version === requestVersion) publish();
     }
   };
   const load = async (selected: string) => {
     const run = ++generation;
+    prVersion++;
     cancel(); data = undefined; selection = undefined; pinned = undefined; draft = createRequirementsDraft();
+    scopeCurrent = false; scopeError = '';
     storageBlocked = false; errorMessage = ''; reading = false;
     try {
       if (!roots.includes(selected)) throw new Error(t.staleSelection);
@@ -240,7 +265,7 @@ export function createScopePreparation(
       const [refs, current, identity] = await Promise.all([listReviewRefs(cwd), currentBranch(cwd), repositoryRemoteIdentity(cwd)]);
       if (run !== generation || disposed) return;
       if (!refs.length) throw new Error(t.noBranches);
-      data = { cwd, refs, current, repositoryIdentity: identity };
+      data = { cwd, refs, current, repositoryIdentity: identity, prsCurrent: false };
       try {
         const stored = await options.load?.(cwd, identity);
         if (run !== generation || disposed) return;
@@ -252,7 +277,7 @@ export function createScopePreparation(
       post({ type: 'repository', data, roots, selected, selection });
       publish();
     } catch (error) {
-      if (run === generation) post({ type: 'error', message: String((error as Error).message) });
+      if (run === generation) post({ type: 'error', target: 'repository', message: String((error as Error).message) });
     }
   };
   panel.onDidDispose(() => { disposed = true; generation++; inbound?.dispose(); cancel(); markReady(false); if (!settled) finish(undefined); });
@@ -282,7 +307,11 @@ export function createScopePreparation(
       if (input.type === 'clientError') { throw new Error(`Webview: ${String(input.message)}`); }
       if (input.type === 'repository' && typeof input.cwd === 'string') { await load(input.cwd); return; }
       if (input.type === 'browse') {
-        const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, title: t.browseRepository });
+        post({ type: 'repositoryBrowse', pending: true });
+        let picked: vscode.Uri[] | undefined;
+        try {
+          picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, title: t.browseRepository });
+        } finally { if (run === generation) post({ type: 'repositoryBrowse', pending: false }); }
         if (run !== generation || disposed) return;
         if (picked?.[0]) { const cwd = picked[0].fsPath; if (!roots.includes(cwd)) roots.push(cwd); await load(cwd); }
         return;
@@ -290,16 +319,37 @@ export function createScopePreparation(
       if (input.type === 'prs') {
         const owner = data;
         if (!owner || input.cwd !== owner.cwd) throw new Error(t.staleSelection);
-        owner.prs = undefined;
-        try {
-          await ensureGhAvailable(owner.cwd); await ensureAuth(owner.cwd);
-          const prs = await listPrs(owner.cwd);
-          if (run !== generation || disposed || owner !== data) return;
-          owner.prs = prs;
-          post({ type: 'prs', prs, selectedPr: selection?.prNumber });
-        } catch (error) {
-          if (run === generation && owner === data) post({ type: 'error', message: String((error as Error).message) });
+        const attempt = ++prVersion;
+        const current = () => run === generation && attempt === prVersion && !disposed && owner === data;
+        owner.prsLoading = true; owner.prsCurrent = false; owner.prsError = undefined;
+        if (selection?.kind === 'pr') {
+          cancel(); scopeCurrent = false; scopeError = '';
         }
+        publish();
+        try {
+          let prs: PrSummary[];
+          if (options.loadPrs) prs = await options.loadPrs(owner.cwd);
+          else {
+            await ensureGhAvailable(owner.cwd);
+            if (!current()) return;
+            await ensureAuth(owner.cwd);
+            if (!current()) return;
+            prs = await listPrs(owner.cwd);
+          }
+          if (!current()) return;
+          owner.prs = prs; owner.prsLoading = false; owner.prsCurrent = true;
+          post({ type: 'prs', cwd: owner.cwd, requestId: input.requestId, prs, selectedPr: selection?.prNumber });
+        } catch (error) {
+          if (current()) {
+            owner.prsLoading = false; owner.prsError = String((error as Error).message);
+            post({ type: 'error', target: 'prs', cwd: owner.cwd, requestId: input.requestId, message: owner.prsError });
+          }
+        }
+        return;
+      }
+      if (input.type === 'cancelPrs') {
+        if (!data || input.cwd !== data.cwd) throw new Error(t.staleSelection);
+        prVersion++; data.prsLoading = false;
         return;
       }
       if (input.type === 'markdown' && typeof input.text === 'string') {
@@ -330,6 +380,7 @@ export function createScopePreparation(
         else await vscode.commands.executeCommand('codereview.pickLanguage');
         if (run !== generation || disposed) return;
         if (previous !== resolveLanguage()) {
+          if (data?.prsLoading) { prVersion++; data.prsLoading = false; }
           t = m().scope;
           rerendering = true;
           panel.title = t.prepareTitle;
@@ -343,7 +394,7 @@ export function createScopePreparation(
         post({ type: 'editRequirement', item: { id: item.id, name: item.title, text: item.text, included: item.included, reason: item.exclusionReason } }); return;
       }
       if (input.type === 'select') {
-        if (reading) throw new Error(m().requirements.busy);
+        if (reading || scopeLoading || analyzing) throw new Error(m().requirements.busy);
         const selected = input.kind === 'files' && typeof input.cwd === 'string' && (input.cwd === selectedRoot || input.cwd === data?.cwd)
           ? { cwd: await realpath(selectedRoot), kind: 'files' as const }
           : choose(input);
@@ -352,13 +403,13 @@ export function createScopePreparation(
         const previousKey = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
         const version = requestVersion;
         inputVersion = version;
-        reading = true; publish();
+        scopeLoading = true; scopeCurrent = false; scopeError = ''; publish();
         try {
           const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
             ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
           if (run !== generation || version !== requestVersion || disposed) return;
           const key = requirementScopeKey(selected.cwd, set);
-          pinned = set;
+          pinned = set; scopeCurrent = true;
           if (input.technicalOnly === true) {
             clearRequirementConfirmation(draft);
             draft.technicalOnly = true;
@@ -371,10 +422,20 @@ export function createScopePreparation(
           }
           if (!storageBlocked) await save();
           complete({ ...selected, reviewSet: set, requirements: structuredClone(draft) });
-        } finally { if (run === generation && version === requestVersion) { reading = false; publish(); } }
+        } finally { if (run === generation && version === requestVersion) { scopeLoading = false; publish(); } }
         return;
       }
       if (storageBlocked || !data) throw new Error(m().requirements.loadFailed);
+      if (input.type === 'clearSelection') {
+        if (input.cwd !== data.cwd || !['pr', 'branchChanges', 'branchFull', 'files'].includes(String(input.kind))) throw new Error(t.staleSelection);
+        cancel(); selection = undefined; pinned = undefined; scopeCurrent = false; scopeError = ''; errorMessage = '';
+        inputVersion = requestVersion;
+        if (input.kind === 'branchChanges' && typeof input.headRef === 'string' && input.headRef && input.baseRef === input.headRef) scopeError = t.sameComparison;
+        clearRequirementConfirmation(draft);
+        await save();
+        if (run === generation && inputVersion === requestVersion && !disposed) publish();
+        return;
+      }
       if (input.type === 'selection') {
         choose(input); inputVersion = requestVersion;
         await save();
@@ -434,14 +495,16 @@ export function createScopePreparation(
       await save();
       if (run !== generation || inputVersion !== undefined && inputVersion !== requestVersion || disposed) return;
       post({ type: 'editorSaved' }); publish();
-      if (input.kind && input.cwd) {
+      if (targetProvided(input)) {
         try { await organize(input); } catch (error) { errorMessage = String((error as Error).message); publish(); }
       }
     } catch (error) {
       if (run === generation && (inputVersion === undefined || inputVersion === requestVersion) && !disposed) {
-        errorMessage = String((error as Error).message);
+        const target = ['select', 'selection', 'organize'].includes(String(input.type)) ? 'scope' : undefined;
+        if (target === 'scope') scopeError = String((error as Error).message);
+        else errorMessage = String((error as Error).message);
         publish();
-        post({ type: input.type === 'link' || input.type === 'material' || input.type === 'revise' ? 'editorError' : 'error', message: errorMessage });
+        post({ type: input.type === 'link' || input.type === 'material' || input.type === 'revise' ? 'editorError' : 'error', target, message: target === 'scope' ? scopeError : errorMessage });
       }
     }
   });

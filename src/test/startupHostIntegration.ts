@@ -55,7 +55,7 @@ async function inspectPreparation(panel: vscode.WebviewPanel): Promise<Preparati
           targetChoices:document.querySelectorAll('.scope-kind input[type=radio]').length,
           loading:!!document.getElementById('loadingElapsed'),
           refresh:document.getElementById('retry').textContent,
-          browse:document.getElementById('browse').textContent,saved:api.getState()
+          browse:document.getElementById('browse-repository').textContent,saved:api.getState()
         }});
       } else if (event.data.type === 'startupCancel') {
         window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));

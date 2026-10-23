@@ -29,6 +29,7 @@ function understood(draft: RequirementsDraft, key: string) {
 
 interface ClientState {
   revision: number; ready: boolean; busy: boolean; reading: boolean; error: string; html: string;
+  scopeLoading: boolean; scopeReady: boolean; scopeError: string;
   materials: { id: string; name: string; selected: boolean; version: number }[];
 }
 
@@ -60,6 +61,57 @@ beforeEach(() => {
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
 
 describe('three-block preparation with real host state transitions', () => {
+  it('retains materials while the PR choice is missing without calling the model or reporting a fake scope error', async () => {
+    const analyze = vi.fn(async (draft: RequirementsDraft, scope: { key: string }) => understood(draft, scope.key));
+    const { handle, panel, saved } = await open({ analyze });
+    panel.webview.receiveMessage({ type: 'material', cwd: root, kind: 'pr', prNumber: 0, name: 'While waiting', text: 'Charge once.' });
+    await vi.waitFor(() => expect(state()?.materials).toHaveLength(1));
+    expect(saved.at(-1)?.draft.materials[0].versions[0].text).toBe('Charge once.');
+    expect(state()?.error).toBe('');
+    expect(state()?.scopeError).toBe('');
+    expect(analyze).not.toHaveBeenCalled();
+    handle.dispose();
+  });
+
+  it('reports source reading separately from actual AI work and keeps newly added material during the pending read', async () => {
+    let read!: (scope: ReviewSet) => void;
+    const pendingScope = new Promise<ReviewSet>((resolve) => { read = resolve; });
+    let finishModel!: () => void;
+    const { handle, panel, saved } = await open({
+      loadScope: async () => pendingScope,
+      analyze: (draft, scope) => new Promise((resolve) => { finishModel = () => resolve(understood(draft, scope.key)); }),
+    });
+    panel.webview.receiveMessage({ type: 'selection', ...selection });
+    await vi.waitFor(() => expect(state()).toMatchObject({ scopeLoading: true, busy: false }));
+    panel.webview.receiveMessage({ type: 'material', ...selection, name: 'While source loads', text: 'Charge once.' });
+    await vi.waitFor(() => expect(saved.at(-1)?.draft.materials).toHaveLength(1));
+    expect(state()?.busy).toBe(false);
+    read(structuredClone(set));
+    await vi.waitFor(() => expect(state()).toMatchObject({ scopeLoading: false, busy: true }));
+    finishModel();
+    await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, scopeReady: true, busy: false }));
+    expect(state()?.materials[0].name).toBe('While source loads');
+    handle.dispose();
+  });
+
+  it('surfaces scope I/O failures in the target card without claiming an AI-understanding failure', async () => {
+    const analyze = vi.fn();
+    const { handle, panel } = await open({ loadScope: async () => { throw new Error('Missing source object'); }, analyze });
+    panel.webview.receiveMessage({ type: 'selection', ...selection });
+    await vi.waitFor(() => expect(state()?.scopeError).toBe('Missing source object'));
+    expect(state()).toMatchObject({ scopeLoading: false, scopeReady: false, busy: false, error: '' });
+    expect(analyze).not.toHaveBeenCalled();
+    handle.dispose();
+  });
+
+  it('reports an invalid identical branch/base explicitly when clearing the old selected scope', async () => {
+    const { handle, panel } = await open();
+    panel.webview.receiveMessage({ type: 'clearSelection', ...selection, headRef: 'main', baseRef: 'main' });
+    await vi.waitFor(() => expect(state()?.scopeError).toContain('same commit'));
+    expect(state()).toMatchObject({ scopeReady: false, scopeLoading: false, busy: false, error: '' });
+    handle.dispose();
+  });
+
   it('switches the preparation language without reloading the repository or losing selected material and understanding', async () => {
     const { handle, panel } = await open({
       pickLanguage: async () => { vscodeMockState.language = 'zh-CN'; },
@@ -91,7 +143,7 @@ describe('three-block preparation with real host state transitions', () => {
     expect(state()?.html).toContain('<strong>Preserve charge consistency.</strong>');
     expect(saved.at(-1)?.draft.confirmation).toBeUndefined();
     panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: false });
-    await vi.waitFor(() => expect(state()?.error).toMatch(/Explicitly confirm/));
+    await vi.waitFor(() => expect(state()?.scopeError).toMatch(/Explicitly confirm/));
     panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
     const result = await handle.result;
     expect(result?.reviewSet?.headSha).toBe(set.headSha);
@@ -121,7 +173,7 @@ describe('three-block preparation with real host state transitions', () => {
     expect(state()?.ready).toBe(false);
     expect(saved.at(-1)?.draft.materials[0].versions[0].text).toBe('Charge once.');
     panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
-    await vi.waitFor(() => expect(state()?.error).toContain('changed'));
+    await vi.waitFor(() => expect(state()?.scopeError).toContain('changed'));
     panel.webview.receiveMessage({ type: 'select', ...selection, technicalOnly: true });
     const result = await handle.result;
     expect(result?.requirements?.confirmation).toBeUndefined();
@@ -136,7 +188,7 @@ describe('three-block preparation with real host state transitions', () => {
     await vi.waitFor(() => expect(state()?.ready).toBe(true));
     currentSet = { ...set, headSha: 'b'.repeat(40) };
     panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
-    await vi.waitFor(() => expect(state()?.error).toContain('code version changed'));
+    await vi.waitFor(() => expect(state()?.scopeError).toContain('code version changed'));
     expect(state()?.ready).toBe(false);
     handle.dispose();
   });

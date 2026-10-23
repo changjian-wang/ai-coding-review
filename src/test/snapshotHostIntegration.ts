@@ -15,6 +15,7 @@ import { analyzeRequirementUnderstanding } from '../ai/analyzer';
 import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
 import { runStartupHostChecks } from './startupHostIntegration';
+import { runPreparationLoadingHostChecks } from './preparationLoadingHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -65,6 +66,7 @@ export async function run(): Promise<void> {
     preparation.dispose();
     assert.equal(await preparation.result, undefined);
     checks.push('real preparation webview script and repository render');
+    checks.push(...await runPreparationLoadingHostChecks(root));
 
     const requirementFile = path.join(root, 'requirements.md');
     await writeFile(requirementFile, '# Goal\n\nAn order must only be charged once.\n\n- [ ] Verify retries\n');
