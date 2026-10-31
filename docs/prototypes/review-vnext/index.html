@@ -17,9 +17,8 @@
   <a class="skip-link" href="#review-main">跳到主要内容</a>
   <div class="review-shell">
     <div class="demo-bar">
-      <div class="demo-identity"><span class="prototype-indicator"></span><strong>Review vNext</strong><span>审查中心 · 交互原型</span></div>
+      <div class="demo-identity"><span class="prototype-indicator"></span><strong>Review vNext · 离线原型</strong><span>未连接模型与真实仓库</span></div>
       <div class="demo-controls">
-        <span class="offline-label">虚构案例 / 未连接模型</span>
         <label><span class="sr-only">选择独立演示场景</span><select id="demo-scenario" aria-label="选择独立演示场景">
           <option value="fresh" selected>准备 · 选择代码与需求</option>
           <option value="standard">审查中 · 关键问题未闭合</option>
@@ -27,7 +26,25 @@
           <option value="partial">部分完成 · 证据受限</option>
           <option value="ready">结论 · 已处理的独立示例</option>
         </select></label>
-        <button id="center-reset" class="icon-button" data-action="reset" aria-label="重置当前演示" title="重置当前演示"></button>
+        <details id="demo-tools" class="demo-tools">
+          <summary>演示工具</summary>
+          <div class="demo-tool-panel">
+            <div class="demo-tool-actions">
+              <button class="button small" data-action="use-example-materials">载入示例需求</button>
+              <button class="button small" data-action="materials">选择可用材料</button>
+              <button class="button small" data-action="demo-paste">体验粘贴示例</button>
+              <button class="button small" data-action="demo-link">体验链接示例</button>
+              <button id="demo-requirement" class="button small" data-action="demo-requirement">澄清超时需求示例</button>
+            </div>
+            <label class="field-label" for="demo-source">来源快照</label>
+            <select id="demo-source" aria-label="选择演示来源快照"></select>
+            <button id="demo-update-source" class="button small" data-action="demo-update-source">更新所选来源快照</button>
+            <div class="demo-tool-actions">
+              <button id="center-code-change" class="button small" data-action="simulate-code-change" title="仅切换演示快照，不创建真实提交">模拟新提交</button>
+              <button id="center-reset" class="button small" data-action="reset">重置当前演示</button>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
     <header class="command-bar">
@@ -45,7 +62,6 @@
       <main id="review-main" tabindex="-1"></main>
       <aside id="review-inspector" class="review-inspector" aria-label="判断依据与处置"></aside>
     </div>
-    <footer id="center-status" class="center-status"></footer>
   </div>
   <dialog id="center-modal" aria-labelledby="center-modal-title"></dialog>
   <div id="center-toast" class="toast" role="status" aria-live="polite" hidden></div>

@@ -8,7 +8,8 @@ const {
   createCenterState, currentFinding, currentChain, switchMode, selectFinding,
   completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, statusLabel,
   preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, approvalGate, submitVerdict,
-  scopeState, changeScope, understandingChecks,
+  scopeState, changeScope, coverageLimits, understandingChecks,
+  beginRequirementEdit, saveRequirementEdit, conclusionState, requestApproval, confirmApproval, updateNotes,
 } = require('./center.js');
 
 function preparedFreshState() {
@@ -405,6 +406,214 @@ test('未变化的范围不无故清除确认或示例修复，进行中禁止�
   assert.equal(state.baselineVersion, version);
   state.runStatus = 'running';
   assert.throws(() => changeScope(state, { kind: 'branch' }), /结束或取消/);
+});
+
+test('覆盖限制直接提供给审查和结论，正常示例不额外制造限制', () => {
+  assert.deepEqual(coverageLimits(createCenterState()), []);
+  assert.deepEqual(coverageLimits(createCenterState('ready')), []);
+  const state = createCenterState('partial');
+  assert.equal(coverageLimits(state).length, 1);
+  assert.match(coverageLimits(state)[0], /通道契约读取受限/);
+  state.sourceReview.limited = true;
+  assert.equal(coverageLimits(state).length, 2);
+  assert.ok(coverageLimits(state).some((limit) => /尚未.*语义评审/.test(limit)));
+});
+
+test('新快照缺少分析与自定义材料受限分别说明，不能互相覆盖', () => {
+  const state = createCenterState('ready');
+  changeScope(state, { snapshot: 2 });
+  state.sourceReview.limited = true;
+  const limits = coverageLimits(state);
+  assert.equal(limits.length, 2);
+  assert.match(limits[0], /没有对应的预设发现/);
+  assert.match(limits[1], /预设发现仅供对照/);
+  assert.equal(approvalGate(state).eligible, false);
+  assert.equal(approvalGate(state).feedbackAllowed, false);
+});
+
+test('不再保留独立范围弹窗或入口，文件仍由主导航打开', () => {
+  const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
+  assert.doesNotMatch(controller, /function scopeDialog\b|data-action="scope(?:-source)?"/);
+  assert.doesNotMatch(controller, /action === 'scope(?:-source)?'/);
+  assert.match(controller, /data-action="source" data-source="\$\{file\.key\}"/);
+});
+
+test('模拟新提交只在原型演示工具中提供，不再藏在范围弹窗', () => {
+  const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
+  const controls = html.match(/<details id="demo-tools"[\s\S]*?<\/details>/);
+  assert.ok(controls);
+  assert.match(controls[0], /data-action="simulate-code-change"/);
+  assert.equal([...html.matchAll(/data-action="simulate-code-change"/g)].length, 1);
+  const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
+  assert.doesNotMatch(controller, /data-action="simulate-code-change"/);
+});
+
+test('需求就地修订先保留草稿，保存不覆盖来源原文', () => {
+  const state = preparedFreshState();
+  const original = sources.getSource(state, 'payments').text;
+  const draft = beginRequirementEdit(state, 'RQ-01');
+  assert.equal(draft.text, preparationState(state).items.find((item) => item.id === 'RQ-01').text);
+  draft.title = '补充扣款边界';
+  draft.text = '**人工补充**：失败重试和人工补单也必须满足单次扣款约束。';
+  assert.equal(preparationState(state).canStart, false);
+  assert.throws(() => prepareForReview(state, true), /保存或取消/);
+  saveRequirementEdit(state);
+  assert.equal(state.center.requirementEdit, null);
+  assert.equal(sources.getSource(state, 'payments').text, original);
+  const revised = preparationState(state).items.find((item) => item.id === 'RQ-01');
+  assert.equal(revised.text, draft.text);
+  assert.equal(revised.basis, 'human');
+  assert.equal(preparationState(state).needsConfirmation, true);
+});
+
+test('未保存修订不能批准，也不能静默被另一条修订替换', () => {
+  const state = createCenterState('ready');
+  beginRequirementEdit(state, 'RQ-01');
+  assert.equal(approvalGate(state).eligible, false);
+  assert.throws(() => beginRequirementEdit(state, 'RQ-02'), /保存或取消/);
+  assert.equal(state.center.requirementEdit.id, 'RQ-01');
+  state.center.requirementEdit = null;
+  assert.equal(approvalGate(state).eligible, true);
+});
+
+test('材料变化后拒绝保存旧修订草稿，但保留输入供核对', () => {
+  const state = preparedFreshState();
+  const draft = beginRequirementEdit(state, 'RQ-01');
+  draft.text = '尚未保存的输入';
+  chooseMaterial(state, 'design', true);
+  assert.throws(() => saveRequirementEdit(state), /材料已变化/);
+  assert.equal(state.center.requirementEdit.text, '尚未保存的输入');
+  assert.equal(state.baselineConfirmed, false);
+});
+
+test('移出来源后保留完整修订快照，不把过期草稿当作当前要求', () => {
+  const state = preparedFreshState();
+  const draft = beginRequirementEdit(state, 'RQ-01');
+  const quote = draft.original.origins[0].quote;
+  draft.text = '尚未保存的原文修订';
+  chooseMaterial(state, 'payments', false);
+  assert.equal(preparationState(state).items.some((item) => item.id === 'RQ-01'), false);
+  assert.equal(preparationState(state).canStart, false);
+  assert.equal(state.center.requirementEdit.original.origins[0].quote, quote);
+  assert.equal(state.center.requirementEdit.text, '尚未保存的原文修订');
+  assert.throws(() => saveRequirementEdit(state), /材料已变化/);
+});
+
+test('演示需求修订仍需保存、确认和重审，不直接解除问题', () => {
+  const state = createCenterState();
+  const draft = beginRequirementEdit(state, 'RQ-02', true);
+  assert.equal(draft.text, demo.revisedRequirement);
+  assert.equal(state.pending.requirement, undefined);
+  saveRequirementEdit(state);
+  assert.equal(state.pending.requirement, true);
+  assert.equal(state.baselineConfirmed, false);
+  assert.equal(state.stale, true);
+  assert.equal(approvalGate(state).eligible, false);
+});
+
+test('结论只展示当前动作的阻断，关键问题不阻止有效评论', () => {
+  const state = createCenterState('partial');
+  const approval = conclusionState(state, 'approve');
+  assert.equal(approval.allowed, false);
+  assert.ok(approval.blockers.some((reason) => reason.includes('F-01')));
+  const feedback = conclusionState(state, 'comment');
+  assert.equal(feedback.allowed, true);
+  assert.deepEqual(feedback.blockers, []);
+  assert.throws(() => conclusionState(state, 'unknown'), /未知/);
+});
+
+test('新范围无有效结果时，反馈说明有效性问题而不是批准专用条件', () => {
+  const state = createCenterState();
+  changeScope(state, { pr: '105' });
+  const feedback = conclusionState(state, 'request-changes');
+  assert.equal(feedback.allowed, false);
+  assert.ok(feedback.blockers.some((reason) => reason.includes('有效')));
+  assert.equal(feedback.blockers.some((reason) => reason.includes('F-01')), false);
+});
+
+test('批准只在最终确认时记录人工意图，打开确认不算批准', () => {
+  const state = createCenterState('ready');
+  const request = requestApproval(state);
+  assert.equal(state.humanConfirmed, false);
+  assert.equal(state.submission, null);
+  assert.throws(() => submitVerdict(state, 'approve'), /人工确认/);
+  confirmApproval(state, request);
+  assert.equal(state.humanConfirmed, true);
+  assert.equal(state.submission.verdict, 'approve');
+});
+
+test('确认期间待提交内容或结论改变，旧批准意图不能沿用', () => {
+  const state = createCenterState('ready');
+  const request = requestApproval(state);
+  state.notes = '新增的待提交说明';
+  assert.throws(() => confirmApproval(state, request), /变化/);
+  assert.equal(state.humanConfirmed, false);
+  assert.equal(state.submission, null);
+  state.notes = '';
+  state.verdict = 'comment';
+  assert.throws(() => confirmApproval(state, request), /通过/);
+});
+
+test('待提交正文改变使旧记录失效，但不要求重复分析未变代码', () => {
+  const state = createCenterState('ready');
+  confirmApproval(state, requestApproval(state));
+  assert.equal(updateNotes(state, '新增需要提交的说明'), true);
+  assert.equal(state.submission, null);
+  assert.equal(state.humanConfirmed, false);
+  assert.equal(state.stale, false);
+  assert.equal(state.hasResults, true);
+  assert.equal(approvalGate(state).eligible, true);
+});
+
+test('输出未变的空白调整不增加确认，非文本说明显式报错', () => {
+  const state = createCenterState('ready');
+  confirmApproval(state, requestApproval(state));
+  const record = state.submission;
+  assert.equal(updateNotes(state, ' \n'), false);
+  assert.equal(state.submission, record);
+  assert.equal(state.humanConfirmed, true);
+  assert.throws(() => updateNotes(state, null), /文本/);
+});
+
+test('代码快照改变或关键问题未闭合时不能生成或确认批准意图', () => {
+  const blocked = createCenterState();
+  blocked.verdict = 'approve';
+  assert.throws(() => requestApproval(blocked), /通过/);
+  const state = createCenterState('ready');
+  const request = requestApproval(state);
+  changeScope(state, { snapshot: 2 });
+  assert.throws(() => confirmApproval(state, request), /通过/);
+  assert.equal(state.humanConfirmed, false);
+});
+
+test('材料读取中阻止提交和最终确认，不能抢在迟到结果前批准', () => {
+  const state = createCenterState('ready');
+  const request = requestApproval(state);
+  state.sourceReview.readingFile = true;
+  assert.equal(conclusionState(state, 'approve').allowed, false);
+  assert.equal(conclusionState(state, 'comment').allowed, false);
+  assert.throws(() => confirmApproval(state, request), /通过|读取/);
+  assert.equal(state.humanConfirmed, false);
+});
+
+test('审查运行中按钮状态与提交约束一致，取消后可提交仍有效的反馈', () => {
+  const state = createCenterState('ready');
+  state.runStatus = 'running';
+  assert.equal(conclusionState(state, 'comment').allowed, false);
+  assert.ok(conclusionState(state, 'comment').blockers.some((reason) => reason.includes('审查正在进行')));
+  assert.throws(() => submitVerdict(state, 'comment'), /有效结果/);
+  state.runStatus = 'cancelled';
+  assert.equal(conclusionState(state, 'comment').allowed, true);
+});
+
+test('摘要保留覆盖限制，但界面不再设置第二套全文或批准复选框', () => {
+  const state = createCenterState('partial');
+  assert.match(summaryText(state), /覆盖限制/);
+  assert.match(summaryText(state), /通道契约读取受限/);
+  const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
+  assert.equal(/function (understandingDialog|openSummary|editorTabs|journey|relatedContext|gateChecks)\b/.test(controller), false);
+  assert.equal(/data-action="(?:summary|recheck|related|read-material)"/.test(controller), false);
+  assert.equal(/id="center-human"/.test(controller), false);
 });
 
 test('回到支持的范围必须重新确认，重建发现不继承旧修复并对齐新需求', () => {
