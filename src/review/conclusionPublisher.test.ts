@@ -3,6 +3,7 @@ import { ReviewSession } from './reviewSession';
 import { publishConclusionDraft, type ConclusionPublicationServices } from './conclusionPublisher';
 import { reviewCenterFixture } from '../test/reviewCenterFixture';
 import { businessHash } from './businessReview';
+import { conclusionDraftText } from './conclusionDraft';
 
 async function preview(session: ReviewSession, verdict: 'approve' | 'comment' | 'request-changes' = 'request-changes', body = '# Exact saved review\n\nA bounded conclusion.') {
   const initial = session.conclusionDraft ?? await session.generateConclusionDraft(body);
@@ -18,6 +19,40 @@ function services(): ConclusionPublicationServices {
 }
 
 describe('version-bound conclusion publication', () => {
+  it('publishes valid partial feedback without an approval-only confirmation dialog', async () => {
+    const { session } = await reviewCenterFixture();
+    const input = await preview(session, 'comment');
+    const deps = services();
+    await expect(publishConclusionDraft(session, input, deps)).resolves.toBe('posted');
+    expect(deps.confirm).not.toHaveBeenCalled();
+    expect(deps.post).toHaveBeenCalledOnce();
+    session.dispose();
+  });
+
+  it('uses the exact saved body and comments for a single copy/save preview', async () => {
+    const { session } = await reviewCenterFixture();
+    session.addPendingComment({ id: 'inline', path: 'src/restore.ts', startLine: 2, endLine: 3, body: 'Keep **this** exact comment.', source: 'manual', createdAt: 1 });
+    await preview(session, 'comment', '# Exact saved body\n');
+    const text = conclusionDraftText(session.conclusionDraft!, 'Comments');
+    expect(text).toBe('# Exact saved body\n\n## Comments\n\n### `src/restore.ts:2-3`\n\nKeep **this** exact comment.\n');
+    expect(session.conclusionDraft?.body).toBe('# Exact saved body\n');
+    session.dispose();
+  });
+
+  it('keeps out-of-diff feedback in the exact preview and body without sending invalid inline locations', async () => {
+    const { session } = await reviewCenterFixture();
+    session.addPendingComment({ id: 'outside', path: 'src/restore.ts', startLine: 500, endLine: 500, body: 'Whole-file feedback.', source: 'manual', createdAt: 1, bodyOnly: true });
+    const input = await preview(session, 'comment', '# Saved review');
+    const expected = conclusionDraftText(session.conclusionDraft!, 'Review comments');
+    const deps = services();
+    deps.post = vi.fn(async (request) => {
+      expect(request.body).toBe(expected);
+      expect(request.comments).toEqual([]);
+    });
+    await expect(publishConclusionDraft(session, input, deps)).resolves.toBe('posted');
+    expect(session.pendingComments).toEqual([]);
+    session.dispose();
+  });
   it('sends exactly the saved body and frozen inline comments, preserving newly added drafts', async () => {
     const { session } = await reviewCenterFixture();
     session.addPendingComment({ id: 'old', path: 'src/restore.ts', startLine: 2, endLine: 2, body: '**Original inline comment**', source: 'manual', createdAt: 1 });
@@ -59,8 +94,8 @@ describe('version-bound conclusion publication', () => {
   });
 
   it('does not submit if the body changes while the confirmation dialog is open', async () => {
-    const { session } = await reviewCenterFixture();
-    const input = await preview(session);
+    const { session } = await reviewCenterFixture({ defect: false });
+    const input = await preview(session, 'approve');
     const deps = services();
     deps.confirm = async () => { await session.saveConclusionDraft(input.id, input.revision, 'New unpreviewed text.', 'comment'); return true; };
     await expect(publishConclusionDraft(session, input, deps)).rejects.toThrow();
@@ -80,8 +115,8 @@ describe('version-bound conclusion publication', () => {
   });
 
   it('prevents concurrent submission and repeat publication of the same saved revision', async () => {
-    const { session } = await reviewCenterFixture();
-    const input = await preview(session);
+    const { session } = await reviewCenterFixture({ defect: false });
+    const input = await preview(session, 'approve');
     const deps = services();
     let release!: (confirmed: boolean) => void;
     deps.confirm = () => new Promise((resolve) => { release = resolve; });
@@ -90,7 +125,7 @@ describe('version-bound conclusion publication', () => {
     await expect(publishConclusionDraft(session, input, deps)).rejects.toThrow(/Checking/);
     release(true);
     await first;
-    const same = await preview(session);
+    const same = await preview(session, 'approve');
     expect(same.revision).toBe(input.revision);
     await expect(publishConclusionDraft(session, same, services())).rejects.toThrow(/already/);
     expect(deps.post).toHaveBeenCalledTimes(1);

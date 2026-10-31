@@ -40,7 +40,8 @@ export function validateRequirementUrl(address: string): URL {
   let url: URL;
   try { url = new URL(address); } catch { throw new Error(m().requirements.unsafeUrl); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || !url.hostname
-    || /(^|\.)localhost$|\.local$|\.internal$/i.test(url.hostname)) throw new Error(m().requirements.unsafeUrl);
+    || /(^|\.)localhost$|\.local$|\.internal$/i.test(url.hostname)
+    || [...url.searchParams.keys()].some((key) => /^(token|access_token|api[_-]?key|password|secret|sig|signature|auth|x-amz-(credential|signature|security-token)|x-goog-(credential|signature))$/i.test(key))) throw new Error(m().requirements.unsafeUrl);
   return url;
 }
 

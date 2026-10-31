@@ -73,6 +73,7 @@ export interface ReviewConclusion {
  * model) when the conclusion is submitted.
  */
 export interface PendingComment {
+  bodyOnly?: boolean;
   id: string;
   /** Review-set relative path of the commented file. */
   path: string;

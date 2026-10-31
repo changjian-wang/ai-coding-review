@@ -3,7 +3,7 @@ import { fmt, m } from '../i18n';
 import type { ReviewSet } from '../scope/types';
 import { repositoryStorageId } from './repositoryIdentity';
 
-export const REQUIREMENT_LIMITS = { sources: 12, bytes: 512_000, characters: 120_000, items: 80 } as const;
+export const REQUIREMENT_LIMITS = { sources: 12, bytes: 512_000, characters: 128_000, sourceCharacters: 64_000, items: 80 } as const;
 
 export interface RequirementSourceVersion {
   version: number;
@@ -14,7 +14,7 @@ export interface RequirementSourceVersion {
 
 export interface RequirementMaterial {
   id: string;
-  kind: 'paste' | 'file' | 'url' | 'github';
+  kind: 'paste' | 'file' | 'url' | 'github' | 'human';
   name: string;
   location: string;
   format: 'markdown' | 'text' | 'html';
@@ -118,9 +118,15 @@ function invalidate(draft: RequirementsDraft, action: string): void {
   draft.history.push({ at: Date.now(), action });
 }
 
-export function validateMaterialText(text: string): void {
-  if (typeof text !== 'string' || !text.trim() || text.includes('\0')) throw new Error(m().requirements.invalidText);
-  if (Buffer.byteLength(text, 'utf8') > REQUIREMENT_LIMITS.bytes) throw new Error(m().requirements.sourceTooLarge);
+export function validateMaterialText(text: string, historical = false): void {
+  if (typeof text !== 'string' || !text.trim() || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) throw new Error(m().requirements.invalidText);
+  if (Buffer.byteLength(text, 'utf8') > REQUIREMENT_LIMITS.bytes || !historical && text.length > REQUIREMENT_LIMITS.sourceCharacters) throw new Error(m().requirements.sourceTooLarge);
+}
+
+function validateSelectedSize(draft: RequirementsDraft, additional: string, replacing?: string): void {
+  const total = selectedMaterials(draft).filter((source) => source.id !== replacing)
+    .reduce((count, source) => count + currentMaterial(source).text.length, additional.length);
+  if (total > REQUIREMENT_LIMITS.characters) throw new Error(m().requirements.tooMuchContext);
 }
 
 export function addRequirementMaterial(
@@ -128,6 +134,7 @@ export function addRequirementMaterial(
   input: Pick<RequirementMaterial, 'kind' | 'name' | 'location' | 'format'> & { text: string },
 ): string {
   validateMaterialText(input.text);
+  validateSelectedSize(draft, input.text);
   if (!input.name.trim() || !input.location.trim()) throw new Error(m().requirements.invalidText);
   if (draft.materials.length >= REQUIREMENT_LIMITS.sources) throw new Error(m().requirements.tooManySources);
   const source: RequirementMaterial = {
@@ -146,6 +153,7 @@ export function updateRequirementMaterial(draft: RequirementsDraft, id: string, 
   if (!source) throw new Error(m().requirements.invalidState);
   const previous = currentMaterial(source);
   if (previous.text === text) return;
+  if (source.selected) validateSelectedSize(draft, text, id);
   source.versions.push({ version: previous.version + 1, text, hash: hash(text), readAt: Date.now() });
   invalidate(draft, m().requirements.materialChanged);
 }
@@ -154,6 +162,7 @@ export function selectRequirementMaterial(draft: RequirementsDraft, id: string, 
   const source = draft.materials.find((item) => item.id === id);
   if (!source || typeof selected !== 'boolean') throw new Error(m().requirements.invalidState);
   if (source.selected === selected) return;
+  if (selected) validateSelectedSize(draft, currentMaterial(source).text, id);
   source.selected = selected;
   invalidate(draft, m().requirements.materialChanged);
 }
@@ -164,7 +173,7 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function text(value: unknown): string {
-  if (typeof value !== 'string' || !value.trim() || value.length > 20_000) throw new Error(m().requirements.invalidOutput);
+  if (typeof value !== 'string' || !value.trim() || value.length > REQUIREMENT_LIMITS.sourceCharacters) throw new Error(m().requirements.invalidOutput);
   return value;
 }
 
@@ -208,11 +217,25 @@ export function parseRequirementUnderstanding(
   };
   const requirements = list(root.requirements).map((entry): RequirementItem => {
     const item = record(entry);
+    const references = origins(item.origins, draft, historical);
+    if (!historical && references.some((origin) => draft.materials.find((source) => source.id === origin.sourceId)?.kind === 'human')) {
+      throw new Error(m().requirements.invalidOutput);
+    }
     return {
       id: uniqueId(item.id), title: text(item.title), text: text(item.text), extractedText: text(item.text), basis: 'explicit',
-      origins: origins(item.origins, draft, historical), included: true, exclusionReason: '',
+      origins: references, included: true, exclusionReason: '',
     };
   });
+  if (!historical) for (const source of selectedMaterials(draft).filter((item) => item.kind === 'human')) {
+    const original = currentMaterial(source);
+    const lines = original.text.split(/\r?\n/);
+    requirements.push({
+      id: uniqueId(`RH-${hash(source.id).slice(0, 20)}`), title: source.name, text: original.text, extractedText: original.text,
+      basis: 'human', included: true, exclusionReason: '',
+      origins: [{ sourceId: source.id, version: original.version, line: 1, endLine: lines.length, quote: lines.join('\n') }],
+    });
+  }
+  if (requirements.length > REQUIREMENT_LIMITS.items) throw new Error(m().requirements.invalidOutput);
   const checks = list(root.checks).map((entry): RequirementCheck => {
     const item = record(entry);
     const requirementIds = list(item.requirementIds).map(text);
@@ -230,6 +253,12 @@ export function parseRequirementUnderstanding(
     summary: text(root.summary), requirements, checks, questions,
     sourceKey: requirementSourceKey(draft), scopeKey, modelId, createdAt: Date.now(),
   };
+}
+
+export function humanRequirementUnderstanding(draft: RequirementsDraft, scopeKey: string): RequirementUnderstanding {
+  return parseRequirementUnderstanding({
+    summary: m().requirements.humanNotice, requirements: [], checks: [], questions: [],
+  }, draft, scopeKey, 'human');
 }
 
 export function acceptRequirementUnderstanding(draft: RequirementsDraft, understanding: RequirementUnderstanding): void {
@@ -271,6 +300,8 @@ export function reviseRequirement(draft: RequirementsDraft, id: string, title: s
   if (!included && !reason.trim()) throw new Error(m().requirements.exclusionRequired);
   const validTitle = text(title);
   const validBody = text(body);
+  if (item.title === validTitle && item.text === validBody && item.included === included
+    && item.exclusionReason === (included ? '' : reason)) return;
   draft.understandingHistory.push(structuredClone(draft.understanding!));
   item.title = validTitle;
   item.text = validBody;
@@ -342,13 +373,13 @@ export function restoreRequirementsDraft(value: unknown): RequirementsDraft {
     const format = source.format;
     if (typeof source.id !== 'string' || !source.id || ids.has(source.id) || typeof source.name !== 'string'
       || typeof source.location !== 'string' || typeof source.selected !== 'boolean'
-      || kind !== 'paste' && kind !== 'file' && kind !== 'url' && kind !== 'github'
+      || kind !== 'paste' && kind !== 'file' && kind !== 'url' && kind !== 'github' && kind !== 'human'
       || format !== 'markdown' && format !== 'text' && format !== 'html'
       || !Array.isArray(source.versions) || !source.versions.length) throw new Error(m().requirements.invalidState);
     const versions = source.versions.map((entry, index): RequirementSourceVersion => {
       const version = record(entry);
       if (typeof version.text !== 'string') throw new Error(m().requirements.invalidState);
-      validateMaterialText(version.text);
+      validateMaterialText(version.text, true);
       if (version.version !== index + 1 || version.hash !== hash(version.text) || typeof version.readAt !== 'number' || !Number.isFinite(version.readAt)) {
         throw new Error(m().requirements.invalidState);
       }

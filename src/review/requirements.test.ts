@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acceptRequirementUnderstanding, addRequirementMaterial, confirmRequirements, createRequirementsDraft, currentMaterial,
   parseRequirementUnderstanding, requirementBoundary, requirementReadiness, requirementScopeKey, requirementSourceKey,
-  restoreRequirementsDraft, reviseRequirement, selectRequirementMaterial, updateRequirementMaterial, REQUIREMENT_LIMITS,
+  restoreRequirementsDraft, reviseRequirement, selectRequirementMaterial, updateRequirementMaterial, humanRequirementUnderstanding, REQUIREMENT_LIMITS,
 } from './requirements';
 import type { ReviewSet } from '../scope/types';
 
@@ -23,6 +23,43 @@ function fixture() {
 }
 
 describe('requirement evidence and confirmation', () => {
+  it('does not invalidate a confirmed baseline when saving an unchanged in-place revision', () => {
+    const { draft, output } = fixture();
+    acceptRequirementUnderstanding(draft, parseRequirementUnderstanding(output, draft, 'scope', 'model'));
+    confirmRequirements(draft, 'scope', true);
+    const item = draft.understanding!.requirements[0];
+    const revision = draft.revision;
+    reviseRequirement(draft, item.id, item.title, item.text, true, '');
+    expect(draft.revision).toBe(revision);
+    expect(requirementReadiness(draft, 'scope').confirmed).toBe(true);
+    expect(item.basis).toBe('explicit');
+  });
+  it('keeps explicit human additions verbatim with stable IDs and immutable source citations', () => {
+    const draft = createRequirementsDraft();
+    const original = 'Keep one effect.\r\n  Preserve this spacing.  \r\n';
+    addRequirementMaterial(draft, { kind: 'human', name: 'Human rule', location: 'User', format: 'text', text: original });
+    const understanding = humanRequirementUnderstanding(draft, 'scope');
+    expect(understanding.requirements[0].text).toBe(original);
+    expect(understanding.requirements[0].basis).toBe('human');
+    expect(understanding.requirements[0].id).toBe(humanRequirementUnderstanding(draft, 'scope').requirements[0].id);
+    acceptRequirementUnderstanding(draft, understanding);
+    confirmRequirements(draft, 'scope', true);
+    expect(restoreRequirementsDraft(draft).understanding?.requirements[0].text).toBe(original);
+    const item = understanding.requirements[0];
+    expect(() => parseRequirementUnderstanding({
+      summary: 'Rewritten by a model', requirements: [{ ...item, text: 'Different policy.' }], checks: [], questions: [],
+    }, draft, 'scope', 'model')).toThrow();
+  });
+
+  it('rejects selected totals above the exact limit without dropping original sources', () => {
+    const draft = createRequirementsDraft();
+    const input = { kind: 'paste' as const, name: 'Text', location: 'Input', format: 'text' as const, text: 'x'.repeat(64_000) };
+    addRequirementMaterial(draft, input);
+    addRequirementMaterial(draft, input);
+    expect(() => addRequirementMaterial(draft, { ...input, text: 'one more' })).toThrow();
+    expect(draft.materials).toHaveLength(2);
+    expect(currentMaterial(draft.materials[0]).text).toHaveLength(64_000);
+  });
   it('keeps original whitespace/CRLF and versioned snapshots separate from human understanding', () => {
     const { draft, id, output } = fixture();
     const original = currentMaterial(draft.materials[0]).text;
@@ -120,9 +157,9 @@ describe('requirement evidence and confirmation', () => {
   it('enforces source limits exactly without silently trimming or truncating', () => {
     const draft = createRequirementsDraft();
     const input = { kind: 'paste' as const, name: 'Text', location: 'Input', format: 'text' as const };
-    addRequirementMaterial(draft, { ...input, text: 'x'.repeat(REQUIREMENT_LIMITS.bytes) });
-    expect(currentMaterial(draft.materials[0]).text.length).toBe(REQUIREMENT_LIMITS.bytes);
-    expect(() => addRequirementMaterial(draft, { ...input, text: 'x'.repeat(REQUIREMENT_LIMITS.bytes + 1) })).toThrow(/512,000/);
+    addRequirementMaterial(draft, { ...input, text: 'x'.repeat(REQUIREMENT_LIMITS.sourceCharacters) });
+    expect(currentMaterial(draft.materials[0]).text.length).toBe(REQUIREMENT_LIMITS.sourceCharacters);
+    expect(() => addRequirementMaterial(draft, { ...input, text: 'x'.repeat(REQUIREMENT_LIMITS.sourceCharacters + 1) })).toThrow(/64,000/);
     expect(() => addRequirementMaterial(draft, { ...input, text: 'a\0b' })).toThrow(/NUL/);
     for (let index = 1; index < REQUIREMENT_LIMITS.sources; index++) addRequirementMaterial(draft, { ...input, text: 'a' });
     expect(() => addRequirementMaterial(draft, { ...input, text: 'a' })).toThrow(/12/);

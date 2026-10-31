@@ -61,6 +61,7 @@ export const en = {
   },
 
   model: {
+    unavailable: (label: string) => `Selected model "${label}" is unavailable. Choose an available model or Auto; it was not silently replaced.`,
     switched: (label: string) => `Analysis model switched: ${label}`,
     noModel: 'AI Coding Review: no available Copilot model found.',
     autoDescription: 'Let Copilot pick the most suitable model automatically',
@@ -352,6 +353,11 @@ export const en = {
   },
 
   reviewCenter: {
+    copyDraft: 'Copy',
+    commentInBody: 'This location is outside commentable PR diff lines. Its feedback is included in the review body, not an invalid inline comment.',
+    saveDraft: 'Save Markdown',
+    copied: 'Review content copied.',
+    saved: 'Review report saved.',
     title: 'Review center',
     prepareEyebrow: '01 / PREPARE',
     prepareHint: 'Select the code, provide evidence, check understanding',
@@ -393,7 +399,7 @@ export const en = {
     draftTitle: 'Review body and publication preview',
     decisionTitle: 'Approval conditions and submission',
     decisionReady: 'The current host-side approval gate is satisfied.',
-    approveHint: 'Requires complete current evidence and explicit acknowledgement.',
+    approveHint: 'Requires complete current evidence and one final confirmation.',
     requestChangesHint: 'Report defects or unresolved decisive issues.',
     commentHint: 'Share bounded feedback without approving the scope.',
     submitHint: 'Only the saved, previewed revision can be submitted.',
@@ -490,7 +496,7 @@ export const en = {
     remoteChecked: 'Checked; allow another request',
     alreadyPublished: 'This saved draft revision was already recorded or published. It will not be submitted twice.',
     receiptSaveFailed: 'The review was published, but the local receipt could not be persisted. Check GitHub; do not blindly retry.',
-    pendingComments: 'Draft inline review comments',
+    pendingComments: 'Review comments',
     noPendingComments: 'No inline comments are included.',
     bodyDisclosure: 'Only the displayed body and included inline comments will be sent. Check for private requirement information before publishing. Original materials are not attached automatically.',
     previewRequired: 'Preview the latest saved body before publishing.',
@@ -602,6 +608,8 @@ export const en = {
   },
 
   requirements: {
+    addHuman: 'Add an explicit requirement',
+    unsavedEdit: 'Save or cancel the requirement revision first.',
     section: 'Requirement evidence (optional)',
     understanding: 'AI understanding of this review',
     paste: 'Paste content',
@@ -644,7 +652,7 @@ export const en = {
     confirmedUnreviewed: 'Understanding v{0} confirmed ({1} requirements). Requirement consistency not assessed: run the current business review before drawing a conclusion.',
     invalidState: 'Requirement state is invalid or unsupported. It was not converted into an empty successful baseline.',
     invalidText: 'Material must contain non-empty UTF-8 text without binary NUL bytes.',
-    sourceTooLarge: 'This material exceeds the 512,000-byte limit; select a smaller requirement document.',
+    sourceTooLarge: 'Use at most 64,000 characters per source and 128,000 selected characters in total, with a 512,000-byte read ceiling. Original historical snapshots are retained.',
     tooManySources: 'At most 12 materials can be included in this preparation.',
     tooMuchContext: 'Selected requirements exceed the model input budget. Reduce or split materials; no content was silently truncated.',
     invalidOutput: 'The model returned invalid requirement structure. Original materials remain available; retry or correct the input.',

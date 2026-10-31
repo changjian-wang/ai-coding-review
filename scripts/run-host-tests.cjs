@@ -11,7 +11,7 @@ async function main() {
     throw new Error('Set VSCODE_EXECUTABLE to the absolute VS Code executable path; this test does not download or install VS Code.');
   }
   await access(executable);
-  const root = await mkdtemp(path.join(tmpdir(), 'codereview-host-tests-'));
+  const root = await mkdtemp(path.join(process.platform === 'darwin' ? '/tmp' : tmpdir(), 'acr-host-'));
   const workspace = path.join(root, 'workspace');
   const output = path.join(root, 'result.json');
   await mkdir(workspace);
@@ -41,7 +41,7 @@ async function main() {
     const launch = async (phase) => {
       const { stdout, stderr } = await promisify(execFile)(executable, [
         '--new-window', '--disable-extensions', '--disable-workspace-trust',
-        '--skip-welcome', '--skip-release-notes',
+        '--skip-welcome', '--skip-release-notes', '--disable-updates', '--disable-telemetry',
         `--user-data-dir=${path.join(root, 'profile')}`,
         `--extensions-dir=${path.join(root, 'extensions')}`,
         `--extensionDevelopmentPath=${path.resolve(__dirname, '..')}`,

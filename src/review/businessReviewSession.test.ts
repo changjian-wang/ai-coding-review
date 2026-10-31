@@ -40,18 +40,19 @@ function finding(): BusinessFinding {
 }
 
 describe('business review session gates and persistence', () => {
-  it('uses actual M3 coverage rather than human scroll flags and requires a fresh report confirmation', async () => {
+  it('uses actual M3 coverage without requiring a second report checkbox or auto-approving', async () => {
     const { session } = fixture();
     await session.start(set, cwd);
     await session.setBusinessReview(completeRun());
     expect(session.totalCoverage().seen).toBe(0);
     expect(session.technicalGatePassed()).toBe(false);
     expect(session.canSubmitConclusion('comment')).toBe(true);
-    expect(session.canSubmitConclusion('approve')).toBe(false);
-    session.confirmBusinessReview();
     expect(session.canSubmitConclusion('approve')).toBe(true);
+    expect(session.businessReview?.confirmed).toBe(false);
+    expect(session.conclusion).toBeUndefined();
     await session.setBusinessReview(completeRun());
-    expect(session.canSubmitConclusion('approve')).toBe(false);
+    expect(session.canSubmitConclusion('approve')).toBe(true);
+    expect(session.conclusion).toBeUndefined();
     session.dispose();
   });
 

@@ -50,6 +50,7 @@ export const zh: Messages = {
   },
 
   model: {
+    unavailable: (label: string) => `所选模型“${label}”不可用，请选择可用模型或自动选择；未自动替换为其他模型。`,
     switched: (label) => `分析模型已切换：${label}`,
     noModel: 'AI Coding Review：未找到可用的 Copilot 模型。',
     autoDescription: '让 Copilot 自动选择最合适的模型',
@@ -312,6 +313,11 @@ export const zh: Messages = {
   },
 
   reviewCenter: {
+    copyDraft: '复制',
+    commentInBody: '该位置不在 PR 可行内评论的差异行内，反馈已保留在审查正文，不生成无效的行内评论。',
+    saveDraft: '保存 Markdown',
+    copied: '审查内容已复制。',
+    saved: '审查报告已保存。',
     title: '审查中心',
     prepareEyebrow: '01 / 准备',
     prepareHint: '确定代码对象，提供依据，核对理解',
@@ -353,7 +359,7 @@ export const zh: Messages = {
     draftTitle: '审查正文与发布预览',
     decisionTitle: '通过条件与提交',
     decisionReady: '当前宿主侧批准门禁已满足。',
-    approveHint: '需要当前证据完整，并明确核对报告。',
+    approveHint: '需要当前证据完整，并在提交时最终确认一次。',
     requestChangesHint: '反馈确认缺陷或尚未闭合的关键问题。',
     commentHint: '保留未知，只提交有边界的意见。',
     submitHint: '只提交已保存并实际预览的这一版。',
@@ -450,7 +456,7 @@ export const zh: Messages = {
     remoteChecked: '已核对，允许再次请求',
     alreadyPublished: '本版已保存的草稿已经记录或发布，不会重复提交。',
     receiptSaveFailed: 'Review 已经发布，但本地回执保存失败；请核对 GitHub，不要直接重试。',
-    pendingComments: '待提交的行内审查评论',
+    pendingComments: '审查评论',
     noPendingComments: '未包含行内评论。',
     bodyDisclosure: '仅发送当前展示的正文与纳入的行内评论；发布前请检查私有需求信息。不会自动附加原始材料。',
     previewRequired: '发布前请预览最新已保存的正文。',
@@ -562,6 +568,8 @@ export const zh: Messages = {
   },
 
   requirements: {
+    addHuman: '补充明确要求',
+    unsavedEdit: '请先保存或取消当前需求修订。',
     section: '提供需求依据（可选）',
     understanding: 'AI 对本次需求的理解',
     paste: '粘贴内容',
@@ -604,7 +612,7 @@ export const zh: Messages = {
     confirmedUnreviewed: '理解 v{0} 已确认（{1} 条要求）。当前业务审查完成前，需求一致性仍未评审。',
     invalidState: '需求状态无效或版本不受支持，没有转换为空白成功基线。',
     invalidText: '材料必须是非空 UTF-8 文本，不能包含二进制 NUL 字节。',
-    sourceTooLarge: '单份材料超过 512,000 字节限制，请选择较小的需求文档。',
+    sourceTooLarge: '每份材料最多 64,000 字符，选中合计最多 128,000 字符，读取上限为 512,000 字节；旧原文历史仍保留。',
     tooManySources: '一次准备最多保存 12 份材料。',
     tooMuchContext: '选中材料超过模型输入预算，请精简或拆分；不会静默截断原文。',
     invalidOutput: '模型返回的需求结构无效，原文仍保留，请重试或修正输入。',

@@ -120,6 +120,7 @@ export interface BusinessPriorCritical {
   normativeOrigins?: RequirementOrigin[];
 }
 export interface BusinessReviewRun {
+  blockingLimitations?: string[];
   version: typeof BUSINESS_REVIEW_VERSION;
   id: string;
   bindingKey: string;
@@ -451,21 +452,20 @@ export function parseBusinessAssessment(
 
 export function businessBlockers(run: BusinessReviewRun): string[] {
   const reasons: string[] = [];
-  if (run.status !== 'completed' || !run.globalCompleted || run.errors.length || run.limitations.length) reasons.push(m().businessReview.incomplete);
+  if (run.status !== 'completed' || !run.globalCompleted || run.errors.length || run.blockingLimitations?.length) reasons.push(m().businessReview.incomplete);
   if (!run.coverage.length || run.coverage.some((item) => !coverageComplete(item))) reasons.push(m().businessReview.incompleteCoverage);
   if (run.findings.some((finding) => finding.critical && finding.status !== 'dismissed')
     || run.requirements.some((item) => item.critical) || run.premises.some((item) => item.critical)
     || run.priorCriticalVerdicts.some((item) => item.status !== 'cleared')
     || run.priorCriticalVerdicts.length !== run.priorCritical.length) reasons.push(m().businessReview.criticalBlocked);
   if (run.findings.some((finding) => finding.status === 'confirmed')) reasons.push(m().businessReview.defectsBlocked);
-  if (!run.confirmed) reasons.push(m().businessReview.humanConfirm);
   return reasons;
 }
 
 export function businessKnownCritical(run: BusinessReviewRun | undefined): BusinessPriorCritical[] {
   if (!run) return [];
   return [
-    ...run.findings.filter((item) => item.status !== 'dismissed' && (item.critical || item.status === 'confirmed' && item.severity === 'high')).map((item) => ({
+    ...run.findings.filter((item) => item.status !== 'dismissed' && (item.critical || item.status === 'confirmed')).map((item) => ({
       id: `finding-${businessHash(JSON.stringify([item.id, item.critical?.dependsOn, item.critical?.question])).slice(0, 24)}`,
       title: item.title,
       detail: [
@@ -630,6 +630,7 @@ function assertStoredRun(value: unknown): asserts value is BusinessReviewRun {
   });
   Object.values(businessRecord(run.dependencies)).forEach(businessText);
   array(run.limitations).forEach(businessText); array(run.errors).forEach(businessText);
+  if (run.blockingLimitations !== undefined) array(run.blockingLimitations).forEach(businessText);
   businessList(run.cache, BUSINESS_REVIEW_LIMITS.modelCalls).forEach((entry) => {
     const item = businessRecord(entry);
     businessText(item.key);

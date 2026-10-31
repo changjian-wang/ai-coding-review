@@ -11,6 +11,7 @@ export interface DocumentRender {
   readingHtml?: string;
   /** Per-source-line highlighted HTML; index 0 is line 1. */
   sourceLines: string[];
+  raw: string[];
   /** Total number of source lines (drives coverage). */
   totalLines: number;
   /** Stable identity for the exact source text, used by the webview DOM cache. */
@@ -141,6 +142,7 @@ export function renderDocument(text: string, languageId: string, fileName: strin
     isMarkdown,
     readingHtml: isMarkdown ? renderMarkdownReading(text) : undefined,
     sourceLines: sourceLines.slice(0, rawLines.length),
+    raw: rawLines,
     totalLines: rawLines.length,
     revision: businessHash(text),
   };

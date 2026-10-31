@@ -10,7 +10,7 @@ import { BranchSnapshotScope, PrByNumberScope } from './scopes';
 import {
   acceptRequirementUnderstanding, addRequirementMaterial, clearRequirementConfirmation, confirmRequirements, createRequirementsDraft,
   currentMaterial, requirementReadiness, requirementScopeKey, restoreRequirementsDraft, reviseRequirement,
-  selectedMaterials, selectRequirementMaterial, updateRequirementMaterial, type RequirementsDraft, type RequirementUnderstanding,
+  humanRequirementUnderstanding, selectedMaterials, selectRequirementMaterial, updateRequirementMaterial, type RequirementsDraft, type RequirementUnderstanding,
 } from '../review/requirements';
 import { readRequirementFile, readRequirementLink } from '../review/requirementSources';
 import { renderRequirementMarkdown } from '../ui/requirementMarkdown';
@@ -93,7 +93,7 @@ function understandingHtml(draft: RequirementsDraft): string {
     return `<details><summary>${esc(source?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}–${ref.endLine}</summary><pre class="quote">${esc(ref.quote)}</pre><button class="secondary" data-source="${escAttr(ref.sourceId)}" data-version="${ref.version}">${esc(t.raw)}</button></details>`;
   };
   return `<div class="understanding-intent markdown">${renderRequirementMarkdown(u.summary)}</div>${u.requirements.some((item) => item.basis === 'human') ? `<p class="hint">${esc(t.humanNotice)}</p>` : ''}${!u.requirements.length ? `<p>${esc(t.noRequirements)}</p>` : ''}
-    ${u.requirements.map((item) => `<article class="item ${item.included ? '' : 'excluded'}"><div class="understanding-row"><span class="understanding-marker" aria-hidden="true">◇</span><div><h3>${esc(item.id)} · ${esc(item.title)}</h3><small>${item.origins.map((ref) => `${esc(draft.materials.find((source) => source.id === ref.sourceId)?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}`).join(' / ')}</small></div><span class="badge accent">${esc(item.basis === 'human' ? t.human : t.explicit)}</span></div><details class="understanding-detail"><summary>${esc(m().reviewCenter.details)}</summary>${!item.included ? `<p class="hint">${esc(t.reason)}: ${esc(item.exclusionReason)}</p>` : ''}<div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}<button class="secondary" data-revise="${esc(item.id)}">${esc(t.revise)}</button></details></article>`).join('')}
+    ${u.requirements.map((item) => `<article class="item ${item.included ? '' : 'excluded'}" data-requirement="${escAttr(item.id)}"><div class="understanding-row"><span class="understanding-marker" aria-hidden="true">◇</span><div><h3>${esc(item.id)} · ${esc(item.title)}</h3><small>${item.origins.map((ref) => `${esc(draft.materials.find((source) => source.id === ref.sourceId)?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}`).join(' / ')}</small></div><span class="badge accent">${esc(item.basis === 'human' ? t.human : t.explicit)}</span></div><div class="markdown requirement-text">${renderRequirementMarkdown(item.text)}</div>${!item.included ? `<p class="hint">${esc(t.reason)}: ${esc(item.exclusionReason)}</p>` : ''}<details class="understanding-detail"><summary>${esc(m().reviewCenter.details)}</summary>${item.origins.map(origin).join('')}</details><button class="secondary" data-revise="${escAttr(item.id)}">${esc(t.revise)}</button></article>`).join('')}
     ${u.checks.length || u.questions.length ? `<details class="understanding-extras"><summary>${esc(fmt(m().reviewCenter.understandingExtras, u.checks.length, u.questions.length))}</summary><h3>${esc(t.checks)}</h3>${u.checks.map((check) => `<p>${esc(check.requirementIds.join(', '))} · ${esc(check.text)}</p>`).join('')}<h3>${esc(t.questions)}</h3>${u.questions.map((question) => `<div><p>${esc(question.text)}</p>${question.origins.map(origin).join('')}</div>`).join('')}</details>` : ''}
     <details><summary>${esc(t.history)} (${draft.history.length})</summary><p class="hint">${esc(u.modelId)} · ${new Date(u.createdAt).toISOString()}</p>${draft.history.map((item) => `<p class="hint">${esc(new Date(item.at).toISOString())} · ${esc(item.action)}</p>`).join('')}
     ${draft.understandingHistory.map((previous) => `<details><summary>${esc(previous.modelId)} · ${esc(new Date(previous.createdAt).toISOString())}</summary>${previous.requirements.map((item) => `<article class="item"><strong>${esc(item.title)}</strong><div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}</article>`).join('')}</details>`).join('')}</details>
@@ -104,6 +104,7 @@ export function createScopePreparation(
   defaultCwd: string, viewColumn?: vscode.ViewColumn, initialKind = 'pr', options: ScopePreparationOptions = {},
 ): { result: Promise<PreparedScopeChoice | undefined>; ready: Promise<boolean>; dispose(): void } {
   let t = m().scope;
+  let editingRequirement: string | undefined;
   const panel = options.hostPanel ?? vscode.window.createWebviewPanel('codereview.scopePreparation', t.prepareTitle,
     viewColumn ?? vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
   panel.title = t.prepareTitle;
@@ -232,10 +233,11 @@ export function createScopePreparation(
       const readiness = requirementReadiness(draft, scopeKey);
       if (!selectedMaterials(draft).length || readiness.canConfirm && !force) return;
       clearRequirementConfirmation(draft);
-      if (!options.analyze) throw new Error(m().requirements.noModel);
+      const humanOnly = selectedMaterials(draft).every((source) => source.kind === 'human');
+      if (!options.analyze && !humanOnly) throw new Error(m().requirements.noModel);
       analyzing = true;
       publish();
-      const understanding = await options.analyze(structuredClone(draft), {
+      const understanding = humanOnly ? humanRequirementUnderstanding(draft, scopeKey) : await options.analyze!(structuredClone(draft), {
         key: scopeKey, description: `${set.repositoryIdentity ?? selected.cwd} / ${set.label} / head=${set.headSha} / base=${set.source?.baseTipSha ?? set.comparison?.baseSha ?? ''}`,
       }, cts.token, (usage) => {
         ownerDraft.usage.input += usage.input; ownerDraft.usage.output += usage.output; ownerDraft.usage.calls++;
@@ -291,12 +293,21 @@ export function createScopePreparation(
     let inputVersion: number | undefined;
     try {
       if (input.type === 'ready') {
+        editingRequirement = undefined;
         if (rerendering && data) {
           rerendering = false;
           post({ type: 'repository', data, roots, selected: selectedRoot, selection });
           publish();
         } else { rerendering = false; await load(selectedRoot); }
         return;
+      }
+      if (input.type === 'editingRequirement') {
+        if (input.id !== undefined && typeof input.id !== 'string') throw new Error(m().requirements.invalidState);
+        editingRequirement = typeof input.id === 'string' && input.id ? input.id : undefined;
+        return;
+      }
+      if (editingRequirement && ['select', 'selection', 'clearSelection', 'repository', 'browse', 'return', 'cancel', 'organize', 'model', 'language'].includes(String(input.type))) {
+        throw new Error(m().requirements.unsavedEdit);
       }
       if (input.type === 'rendered') { if (data && input.cwd === data.cwd) markReady(true); return; }
       if (input.type === 'requirementsRendered') {
@@ -367,7 +378,8 @@ export function createScopePreparation(
         if (!version) throw new Error(m().requirements.invalidState);
         post({ type: 'source', id: source.id, name: source.name, text: version.text,
           context: `${source.location} / v${version.version} / ${new Date(version.readAt).toISOString()}${source.format === 'html' ? ` / ${m().requirements.htmlNotice}` : ''}`,
-          readOnly: source.kind !== 'paste' || version.version !== currentMaterial(source).version });
+          readOnly: !['paste', 'human'].includes(source.kind) || version.version !== currentMaterial(source).version,
+          human: source.kind === 'human' });
         return;
       }
       if (input.type === 'cancelAnalysis') { cancel(); errorMessage = m().requirements.canceled; publish(); return; }
@@ -407,7 +419,9 @@ export function createScopePreparation(
       if (input.type === 'editRequirement' && typeof input.id === 'string') {
         const item = draft.understanding?.requirements.find((entry) => entry.id === input.id);
         if (!item) throw new Error(m().requirements.stale);
-        post({ type: 'editRequirement', item: { id: item.id, name: item.title, text: item.text, included: item.included, reason: item.exclusionReason } }); return;
+        if (editingRequirement && editingRequirement !== item.id) throw new Error(m().requirements.unsavedEdit);
+        editingRequirement = item.id;
+        post({ type: 'editRequirement', item: { id: item.id, name: item.title, text: item.text, included: item.included, reason: item.exclusionReason, revision: draft.revision, cwd: data?.cwd } }); return;
       }
       if (input.type === 'select') {
         if (reading || scopeLoading || analyzing) throw new Error(m().requirements.busy);
@@ -464,11 +478,11 @@ export function createScopePreparation(
         cancel();
         inputVersion = requestVersion;
         if (typeof input.id === 'string') {
-          if (draft.materials.find((source) => source.id === input.id)?.kind !== 'paste') throw new Error(m().requirements.invalidState);
+          if (!['paste', 'human'].includes(draft.materials.find((source) => source.id === input.id)?.kind ?? '')) throw new Error(m().requirements.invalidState);
           updateRequirementMaterial(draft, input.id, input.text);
         }
         else addRequirementMaterial(draft, {
-          kind: 'paste', name: typeof input.name === 'string' && input.name.trim() ? input.name : m().requirements.content,
+          kind: input.human === true ? 'human' : 'paste', name: typeof input.name === 'string' && input.name.trim() ? input.name : m().requirements.content,
           location: m().requirements.paste, format: 'markdown', text: input.text,
         });
       } else if (input.type === 'include' && typeof input.id === 'string' && typeof input.selected === 'boolean') {
@@ -487,7 +501,7 @@ export function createScopePreparation(
         try {
           let loaded;
           const existing = input.type === 'reloadSource' ? draft.materials.find((source) => source.id === input.id) : undefined;
-          if (input.type === 'reloadSource' && (!existing || existing.kind === 'paste')) throw new Error(m().requirements.invalidState);
+          if (input.type === 'reloadSource' && (!existing || existing.kind === 'paste' || existing.kind === 'human')) throw new Error(m().requirements.invalidState);
           if (existing?.kind === 'file') loaded = await readRequirementFile(existing.location);
           else if (input.type === 'file') {
             const picked = await vscode.window.showOpenDialog({

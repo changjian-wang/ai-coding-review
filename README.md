@@ -46,10 +46,11 @@ Development status: the scope foundation, M2 preparation, M3 requirement-aware r
 - Three preparation blocks select Repository/PR/branch, provide evidence, and inspect AI understanding. Add Markdown text, local UTF-8 Markdown/TXT, explicit public HTTP/HTTPS text or HTML URLs, GitHub Issue/PR bodies, or GitHub Markdown/TXT links.
 - GitHub reads use the selected repository account. Ordinary pages receive no browser cookies or third-party credentials, and scripts are not executed. Private/local addresses, cross-origin redirects, unsupported formats, access failures and missing content are explicit errors; convert or paste PDF/Word, login-only or client-rendered content.
 - Selected materials are sent to the chosen Copilot model to organize intent, explicit requirements, derived checks and unverified premises. Output structure and exact source-version/line quotations are checked before accepting understanding. Original snapshots and human revisions are stored separately in workspace state.
+- Requirement bodies are visible directly and revised in place; reading originals does not switch stages. Explicit human additions remain verbatim and do not require a model extraction call. Save or cancel an unfinished revision before starting.
 - A single confirmation binds the repository, head/base and source versions, with no per-item checkboxes or per-document role classification. Material or scope changes invalidate confirmation. Local files are rechecked before analysis and confirmation; URLs remain explicitly read snapshots with a re-read action.
 - Markdown editing/preview and source provenance are available; HTML does not execute and images do not auto-load. File/URL originals are read-only and refreshed from their source; pasted material can be edited.
 - Model errors, cancellation and unavailable models preserve material without auto-confirmation or reverse-engineering requirements from code. Explicit technical-only continuation does not erase known code issues and still requires the technical review gate.
-- Each material is limited to 512,000 bytes, with at most 12 materials. Model input is also checked against 120,000 characters and the selected model's token limit; oversized content is rejected rather than silently truncated.
+- New material is limited to 64,000 characters per source and 128,000 selected characters, with at most 12 materials and a 512,000-byte read ceiling. Historical originals are preserved; measured model-input budgets still apply without silent truncation.
 
 **Confirmation establishes intent and scope, not correctness or satisfaction.** It now starts M3 automatically. Until the current business review produces valid conclusions, requirement consistency remains unassessed; the older file/global analyzer cannot substitute for this workflow.
 
@@ -57,9 +58,9 @@ Development status: the scope foundation, M2 preparation, M3 requirement-aware r
 
 - One confirmation or the workbench's business-review button runs planning, complete source segments, independent global discovery, requested contract/counterevidence, candidate verification and per-requirement/premise assessment. Opening or scrolling every file is not a prerequisite.
 - Source intervals, old/new sides, hashes and exact quotations are tracked. Added files have no invented old side; deletion and rename baselines retain their original paths. Missing facts remain unknown; upstream safeguards can overturn local suspicions, and invalid requirement premises are classified separately from implementation defects.
-- Known critical questions survive retries, technical-only mode and changed requirement identities. Notes, model agreement, confirmation or re-uploading the same normative text do not clear them. Only independently supported current facts can close them.
+- Known critical questions and confirmed defects survive retries, technical-only mode and changed requirement identities. Notes, model agreement, confirmation or re-uploading the same normative text do not clear them. Only independently supported current facts can close them.
 - Cancellation, failures, input changes and limits retain incomplete results. Completed calls can be reused only for the same exact input, captured output language, model version and prompt version; restored running work is interrupted, not silently completed. Current branch/PR endpoints, code and local requirement files are checked before using a conclusion.
-- Approval requires complete source coverage and global analysis, no workflow limits/errors, no confirmed defects or decisive unresolved premises, and explicit report acknowledgement. Noncritical unknowns do not automatically prevent approval, but must not be described as satisfied. Partial findings may still support bounded comments or requested changes.
+- Approval requires complete source coverage and necessary global analysis, no blocking workflow limits/errors, no confirmed defects or decisive unresolved premises, and one final human confirmation. Noncritical unknowns and ordinary context-budget notices do not automatically prevent approval, but must not be described as satisfied. Partial findings may still support bounded comments or requested changes.
 - The report supports source-snapshot reading and local Markdown export. Conclusion drafts start with bounded coverage/status metadata; findings are appended only on explicit action. Private originals and full source quotations are not attached automatically. Publication uses the exact saved and visibly previewed body and inline comments, not a regenerated summary. Late receipts cannot approve a newer draft or business run.
 - Engine limits: 80 formal files, 24 units, 16,000-character segments, 100,000-character measured model inputs, 24 evidence requests/related files, 80 candidates, 128 model calls and a 180-second engine budget. The model's token capacity also applies. Startup/submission freshness checks are separate I/O. Limits are visible, not proof of a complete repository review.
 
@@ -68,10 +69,10 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 ### Review center (M4 development slice)
 
 - The production pages now share the approved prototype's product header, numbered stages, card hierarchy and theme-aware surfaces. Preparation uses a centered 840px canvas, PR/branch segmented selection and compact evidence/understanding; review uses 244px / flexible source / 354px columns on wide screens, with drawers on narrow screens.
-- Conclusion keeps real open/overturned findings, source boundaries and the exact Markdown body in the main pane; approval blockers, verdict choices, acknowledgement and submission are grouped in the inspector. Summaries use current session facts, not the prototype's demo outcomes.
+- Conclusion keeps real open/overturned findings, source boundaries and one exact Markdown preview in the main pane; verdict-specific blockers and submission are grouped in the inspector. Approval has one final confirmation, without an additional report checkbox.
 - Prepare → Review → Conclusion. The review stage uses one webview with business/findings/PR-feedback/file navigation, the shared source/Diff/Markdown reader, and a judgment/evidence/handling inspector.
 - Reading associated files or original evidence preserves the selected finding. The overview remains directly accessible; read-only quotations do not add formal review coverage. Narrow windows use navigation/inspector drawers; focus mode and F8 finding navigation are available.
-- Edit Markdown and the verdict, then save and preview the exact body and frozen inline comments before publishing a GitHub Review or recording a local conclusion. Saving alone is not preview acknowledgement. The application limit is 60,000 body characters; oversize input stays editable rather than being truncated.
+- Edits are saved for one exact preview of the body and frozen inline comments; Copy and Save Markdown use the same content. Saving alone is not preview acknowledgement. Comments and requested changes do not use the approval-only confirmation. The body limit is 60,000 characters; oversize input stays editable.
 - Drafts and receipts bind to scope, requirements, analysis and draft revision. Busy/stale inputs, concurrent or repeated publication and unknown write outcomes are guarded on the host. An uncertain write requires explicit remote checking; that acknowledgement does not claim the remote state was automatically reconciled.
 - A local working-tree business fix explicitly selects a single repair file when several reviewed files are available; the first evidence citation is not treated as the required repair location. Applying a patch invalidates the report, not the defect. Cached proposals can still be inspected/undone, but generating or applying another fix requires a current review.
 - Workspace navigation, source and saved drafts survive a real window restart. A hidden saved preview does not inherit publication acknowledgement. Async annotations/comments stay bound to their original snapshot and source hash.
@@ -99,7 +100,7 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 
 ### Gate and conclusion
 
-- Business-review approval requires complete/current source coverage and global workflow, no confirmed defects or decisive unknowns, and explicit report acknowledgement. Valid partial findings may support bounded comments or requested changes, not complete approval.
+- Business-review approval requires complete/current source coverage and necessary global workflow, no confirmed defects or decisive unknowns, and one final confirmation. Valid partial findings may support bounded comments or requested changes, not complete approval.
 - Conclusion: Approve / Request Changes / Comment
 - Every submission entry opens the conclusion editor and exact preview. A PR uses the GitHub CLI after confirmation and freshness checks; other scopes record the conclusion locally.
 
@@ -108,7 +109,7 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 ```text
 business approval = complete current coverage/workflow
                     && no confirmed defect / decisive unknown
-                    && report acknowledged
+                    && exact current preview + final human confirmation
 legacy technical gate = all files ready && global analysis confirmed
 legacy file ready = analysis done && every actionable finding disposed
 ```

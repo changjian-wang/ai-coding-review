@@ -27,7 +27,7 @@ import { m } from '../i18n';
 import { businessReviewPrompt } from './businessReviewPrompts';
 import { BUSINESS_REVIEW_LIMITS, type BusinessModelPhase } from '../review/businessReview';
 import {
-  currentMaterial, parseRequirementUnderstanding, requirementSourceKey, selectedMaterials, REQUIREMENT_LIMITS,
+  currentMaterial, humanRequirementUnderstanding, parseRequirementUnderstanding, requirementSourceKey, selectedMaterials, REQUIREMENT_LIMITS,
   type RequirementsDraft, type RequirementUnderstanding,
 } from '../review/requirements';
 
@@ -356,7 +356,10 @@ export async function analyzeRequirementUnderstanding(
   token: vscode.CancellationToken,
   onUsage: (usage: TokenUsage) => void,
 ): Promise<RequirementUnderstanding> {
-  const materials = selectedMaterials(draft).map((source) => {
+  if (token.isCancellationRequested) throw new vscode.CancellationError();
+  const human = humanRequirementUnderstanding(draft, scope.key).requirements;
+  if (selectedMaterials(draft).length && selectedMaterials(draft).every((source) => source.kind === 'human')) return humanRequirementUnderstanding(draft, scope.key);
+  const materials = selectedMaterials(draft).filter((source) => source.kind !== 'human').map((source) => {
     const current = currentMaterial(source);
     return {
       sourceId: source.id, name: source.name, location: source.location, version: current.version,
@@ -365,14 +368,15 @@ export async function analyzeRequirementUnderstanding(
   });
   if (!materials.length) throw new AnalysisError(m().requirements.invalidText);
   const sourceKey = requirementSourceKey(draft);
-  const user = JSON.stringify({ codeScope: scope.description, materials });
+  const user = JSON.stringify({ codeScope: scope.description, materials, humanRequirements: human });
+  const system = `${REQUIREMENTS_PROMPT}\nHumanRequirements are explicit human input, not material for extraction. Do not rewrite, duplicate or extract requirements from them. They are appended verbatim by the host. Checks may reference their exact RH identifiers.`;
   if (user.length > REQUIREMENT_LIMITS.characters) throw new AnalysisError(m().requirements.tooMuchContext);
-  const count = await model.countTokens(`${languageDirective()}\n\n${REQUIREMENTS_PROMPT}\n\n${user}`, token);
+  const count = await model.countTokens(`${languageDirective()}\n\n${system}\n\n${user}`, token);
   if (!Number.isFinite(count) || !Number.isFinite(model.maxInputTokens) || count > model.maxInputTokens - 512) {
     throw new AnalysisError(m().requirements.tooMuchContext);
   }
   if (token.isCancellationRequested) throw new vscode.CancellationError();
-  const raw = await ask(model, REQUIREMENTS_PROMPT, user, token, { op: 'requirements', onUsage });
+  const raw = await ask(model, system, user, token, { op: 'requirements', onUsage });
   if (token.isCancellationRequested || sourceKey !== requirementSourceKey(draft)) throw new AnalysisError(m().requirements.stale);
   return parseRequirementUnderstanding(parseJson<unknown>(raw), draft, scope.key, model.id);
 }

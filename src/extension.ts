@@ -44,7 +44,7 @@ import {
   type PreferredScopeKind,
 } from './scope/scopePicker';
 import { FileSystemScope, PrByNumberScope, BranchSnapshotScope } from './scope/scopes';
-import { currentBranch, listBranches, readFileAtRef, repositoryRoot } from './scope/gitClient';
+import { currentBranch, listBranches, readFileAtRef, repositoryRoot, reviewCommentRanges } from './scope/gitClient';
 import { CommitSource } from './review/commitSource';
 import { businessBaseline, businessBindingKey, businessBlockers, businessHash, businessKnownCritical, coverageComplete, type BusinessCitation } from './review/businessReview';
 import { runBusinessReview, type BusinessLegacyCandidate } from './review/businessReviewEngine';
@@ -55,7 +55,9 @@ import { ReviewCenterController, type CenterFileTarget } from './review/reviewCe
 import { captureReviewFileAction } from './review/reviewWorkspace';
 import { businessReviewPrompt } from './ai/businessReviewPrompts';
 import { publishConclusionDraft } from './review/conclusionPublisher';
-import { ConclusionDraftDataError } from './review/conclusionDraft';
+import { conclusionDraftText, ConclusionDraftDataError } from './review/conclusionDraft';
+import { homedir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import { createRequirementsDraft, requirementScopeKey } from './review/requirements';
 import { renderRequirementMarkdown } from './ui/requirementMarkdown';
 import { realpath } from 'node:fs/promises';
@@ -1876,6 +1878,23 @@ function reviewCenterController(): ReviewCenterController {
     model: selectModel,
     language: selectLanguage,
     export: exportReviewReport,
+    copyDraft: async () => {
+      const draft = session.conclusionDraft;
+      if (!draft) throw new ConclusionDraftDataError(m().reviewCenter.draftRequired);
+      await vscode.env.clipboard.writeText(conclusionDraftText(draft, m().reviewCenter.pendingComments));
+      transientInfo(m().reviewCenter.copied);
+    },
+    saveDraft: async () => {
+      const draft = session.conclusionDraft;
+      if (!draft) throw new ConclusionDraftDataError(m().reviewCenter.draftRequired);
+      const text = conclusionDraftText(draft, m().reviewCenter.pendingComments);
+      const file = await vscode.window.showSaveDialog({
+        title: m().reviewCenter.saveDraft,
+        defaultUri: vscode.Uri.file(joinPath(homedir(), 'Downloads', `review-${session.reviewSet?.headSha.slice(0, 12) ?? 'local'}.md`)),
+        filters: { Markdown: ['md'] },
+      });
+      if (file) { await vscode.workspace.fs.writeFile(file, Buffer.from(text)); transientInfo(m().reviewCenter.saved); }
+    },
     confirmReport: async (confirmed) => {
       if (confirmed && !await verifyBusinessInputsCurrent()) throw new ConclusionDraftDataError(m().businessReview.verifyCurrent);
       session.confirmBusinessReview(confirmed);
@@ -2647,7 +2666,7 @@ function buildDocModel(
   diffLines?: DocDiffLine[],
 ): DocModel {
   const state = session.fileState(relPath);
-  const rawLines = render.isMarkdown ? deHighlight(render.sourceLines) : [];
+  const rawLines = render.raw;
   const lang = resolveLanguage();
   const set = session.reviewSet;
   const cwd = session.getCwd();
@@ -2837,19 +2856,6 @@ function locateSnippetLines(
   return undefined;
 }
 
-/** Recovers raw source lines by stripping highlight markup. */
-function deHighlight(lines: string[]): string[] {
-  return lines.map((l) =>
-    l
-      .replace(/<[^>]+>/g, '')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&amp;/g, '&'),
-  );
-}
-
 /** Pushes an updated model into the document panel if it shows this file. */
 async function refreshDocPanel(relPath: string): Promise<void> {
   const snapshot = session.snapshot;
@@ -3030,6 +3036,8 @@ async function addPrComment(
   endLine: number,
   selectedText: string,
 ): Promise<void> {
+  const set = session.reviewSet;
+  const cwd = session.getCwd();
   if (!session.reviewSet) {
     transientWarning(m().review.notStartedWarn);
     return;
@@ -3100,6 +3108,9 @@ async function addPrComment(
     return;
   }
   try {
+    const file = set?.files.find((file) => file.path === relPath);
+    const inline = !!file && !!cwd && !!set?.comparison && !file.context && file.status !== 'deleted'
+      && (await reviewCommentRanges(cwd, set.comparison.baseSha, set.headSha, file)).some((range) => startLine >= range.start && endLine <= range.end);
     await target.commit(() => session.addPendingComment({
       id: `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       path: relPath,
@@ -3108,8 +3119,9 @@ async function addPrComment(
       body,
       source: 'manual',
       createdAt: Date.now(),
+      bodyOnly: !inline,
     }));
-    transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
+    transientInfo(inline ? `${m().documentPanel.commentAdded} (${session.pendingComments.length})` : m().reviewCenter.commentInBody);
   } catch (error) { reportError(error); }
 }
 

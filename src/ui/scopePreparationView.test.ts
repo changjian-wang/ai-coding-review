@@ -88,6 +88,13 @@ function client(kind = 'pr') {
 afterEach(() => resetVscodeMock());
 
 describe('preparation repository actions', () => {
+  it('provides one in-place revision surface and an explicit human requirement action', () => {
+    const page = client();
+    expect(page.html).toContain('id="human"');
+    expect(page.html).toContain('id="requirement-inline"');
+    expect(page.html).toContain("renderInline()");
+    expect(page.html).not.toContain("openEditor('revise',msg.item)");
+  });
   it.each(['en', 'zh-CN'])('describes repository browsing and refresh/retry accurately in %s', (language) => {
     vscodeMockState.language = language;
     const page = client();

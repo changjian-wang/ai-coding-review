@@ -500,6 +500,9 @@ export class WorkbenchPanel {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
+    const pending = new Set([...this.pendingChangedPaths, ...(changedPaths ?? [])]);
+    this.pendingChangedPaths.clear();
+    changedPaths = pending.size ? pending : changedPaths;
     const state = this.getState(changedPaths);
     const sig = String(state.structureVersion);
     if (state.center) {

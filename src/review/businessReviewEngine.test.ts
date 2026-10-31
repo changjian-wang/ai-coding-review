@@ -244,7 +244,8 @@ describe('requirement-aware business review execution', () => {
     expect(run.coverage[0].characters).toBe(text.length);
     expect(coverageComplete(run.coverage[0])).toBe(true);
     expect(run.coverage[0].reviewed.length).toBeGreaterThan(3);
-    expect(run.status).toBe('partial');
+    expect(run.status).toBe('completed');
+    expect(businessBlockers(run)).toEqual([]);
     expect(run.limitations).toContain('Global analysis could not receive the full available source context; coverage is limited.');
   });
 

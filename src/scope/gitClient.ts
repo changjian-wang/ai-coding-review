@@ -15,7 +15,7 @@ class GitError extends Error {
 
 async function git(args: string[], cwd: string): Promise<string> {
   try {
-    const { stdout } = await pexec('git', args, { cwd, maxBuffer: MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
+    const { stdout } = await pexec('git', ['--no-replace-objects', ...args], { cwd, maxBuffer: MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
     return stdout;
   } catch (err) {
     const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string; code?: string | number };
@@ -114,7 +114,7 @@ export async function readSnapshotFile(cwd: string, sha: string, relPath: string
     throw new GitError(m().git.unsupportedSnapshotFile(relPath));
   }
   try {
-    const { stdout } = await pexec('git', ['show', `${sha}:${relPath}`], {
+    const { stdout } = await pexec('git', ['--no-replace-objects', 'show', `${sha}:${relPath}`], {
       cwd, encoding: 'buffer', maxBuffer: MAX_BUFFER, timeout: GIT_TIMEOUT_MS,
     });
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(stdout);
@@ -166,10 +166,19 @@ export function parseSnapshotChanges(statusText: string, numstatText: string): R
 
 export async function diffSnapshotFiles(cwd: string, baseSha: string, head: string): Promise<ReviewFile[]> {
   const [status, stats] = await Promise.all([
-    git(['diff', '--name-status', '-z', '--find-renames', baseSha, head, '--'], cwd),
-    git(['diff', '--numstat', '-z', '--find-renames', baseSha, head, '--'], cwd),
+    git(['diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z', '--find-renames', baseSha, head, '--'], cwd),
+    git(['diff', '--no-ext-diff', '--no-textconv', '--numstat', '-z', '--find-renames', baseSha, head, '--'], cwd),
   ]);
   return parseSnapshotChanges(status, stats);
+}
+
+export async function reviewCommentRanges(cwd: string, base: string, head: string, file: ReviewFile): Promise<{ start: number; end: number }[]> {
+  const paths = file.previousPath ? [file.previousPath, file.path] : [file.path];
+  const patch = await git(['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-textconv', '--find-renames', '--unified=3', base, head, '--', ...paths], cwd);
+  return [...patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)]
+    .map((match) => ({ start: Number(match[1]), count: match[2] === undefined ? 1 : Number(match[2]) }))
+    .filter((range) => range.count > 0)
+    .map((range) => ({ start: range.start, end: range.start + range.count - 1 }));
 }
 
 export async function fetchPrSnapshot(cwd: string, prUrl: string, number: number, baseRef: string): Promise<void> {

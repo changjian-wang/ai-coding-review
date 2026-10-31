@@ -153,6 +153,15 @@ describe('business decision contracts', () => {
     expect(() => restoreBusinessReview(run)).toThrow();
   });
 
+  it('does not drop a previously confirmed medium-severity defect merely because it was not labelled critical', () => {
+    const finding = parseBusinessVerification({ decisions: [decision('confirmed')] }, [candidate], evidence, baseline)[0];
+    finding.severity = 'medium';
+    const run = createBusinessRun(baseline, 'model');
+    run.findings = [finding];
+    expect(businessKnownCritical(run)).toHaveLength(1);
+    expect(businessKnownCritical(run)[0].detail).toContain(finding.impact);
+  });
+
   it('retains and assesses more than 80 previously known critical premises without silent omission', () => {
     const prior = Array.from({ length: 81 }, (_, index) => ({ id: `critical-${index}`, title: `Premise ${index}`, detail: 'Requires independent evidence.' }));
     const run = createBusinessRun(baseline, 'model', prior);

@@ -4,7 +4,7 @@ import type { ReviewSet } from '../scope/types';
 import type { ReviewSession } from './reviewSession';
 import type { PendingComment, PublicationAttempt, ReviewConclusion } from './reviewStore';
 import { businessHash } from './businessReview';
-import { ConclusionDraftDataError, type ConclusionVerdict } from './conclusionDraft';
+import { conclusionPublicationBody, ConclusionDraftDataError, type ConclusionVerdict } from './conclusionDraft';
 
 export interface ConclusionPublication {
   set: ReviewSet;
@@ -52,14 +52,17 @@ async function performConclusionPublication(
   };
   valid();
   const request: ConclusionPublication = {
-    set, cwd, verdict: original.verdict, body: original.body, comments: structuredClone(original.comments),
+    set, cwd, verdict: original.verdict, body: conclusionPublicationBody(original, m().reviewCenter.pendingComments),
+    comments: structuredClone(original.comments.filter((comment) => !comment.bodyOnly)),
   };
-  if (!await services.confirm(request)) return 'cancelled';
+  if (!await services.fresh()) throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
+  valid();
+  if (request.verdict === 'approve' && !await services.confirm(request)) return 'cancelled';
   if (!await services.fresh()) throw new ConclusionDraftDataError(m().reviewCenter.publicationChanged);
   valid();
   const receipt: ReviewConclusion = {
     businessRunId: session.businessReview?.id, draftId: original.id, draftRevision: original.revision,
-    bodyHash: businessHash(original.body), verdict: original.verdict,
+    bodyHash: businessHash(request.body), verdict: original.verdict,
     label: original.verdict === 'approve' ? m().conclusion.approve : original.verdict === 'request-changes' ? m().conclusion.requestChanges : m().conclusion.comment,
     target: /^pr-\d+$/.test(set.scopeId) ? 'pr' : 'local', submittedAt: Date.now(),
     prNumber: /^pr-(\d+)$/.test(set.scopeId) ? Number(set.scopeId.slice(3)) : undefined,

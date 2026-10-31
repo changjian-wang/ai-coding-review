@@ -26,6 +26,8 @@ export interface ReviewCenterServices {
   model(): Promise<void>;
   language(): Promise<void>;
   export(): Promise<void>;
+  copyDraft?(): Promise<void>;
+  saveDraft?(): Promise<void>;
   confirmReport(confirmed: boolean): Promise<void>;
   note(id: string): Promise<void>;
   fix(target: { path?: string; id: string; business: boolean }): Promise<void>;
@@ -164,6 +166,12 @@ export class ReviewCenterController {
       case 'model': await this.services.model(); break;
       case 'language': await this.services.language(); break;
       case 'export': await this.services.export(); break;
+      case 'copyDraft':
+        if (!this.services.copyDraft) throw new ConclusionDraftDataError();
+        await this.services.copyDraft(); break;
+      case 'saveDraft':
+        if (!this.services.saveDraft) throw new ConclusionDraftDataError();
+        await this.services.saveDraft(); break;
       case 'confirmReport':
         if (value !== 'true' && value !== 'false') throw new ConclusionDraftDataError();
         await this.services.confirmReport(value === 'true');

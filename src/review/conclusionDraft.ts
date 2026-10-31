@@ -23,13 +23,28 @@ export class ConclusionDraftDataError extends Error {
   constructor(message = m().reviewCenter.invalidDraft) { super(message); }
 }
 
+function withDraftComments(body: string, comments: readonly PendingComment[], heading: string): string {
+  if (!comments.length) return body;
+  return `${body.trimEnd()}\n\n## ${heading}\n\n${comments.map((comment) =>
+    `### \`${comment.path}:${comment.startLine}${comment.endLine > comment.startLine ? `-${comment.endLine}` : ''}\`\n\n${comment.body}`,
+  ).join('\n\n')}\n`;
+}
+
+export function conclusionDraftText(draft: ConclusionDraft, heading: string): string {
+  return withDraftComments(draft.body, draft.comments, heading);
+}
+
+export function conclusionPublicationBody(draft: ConclusionDraft, heading: string): string {
+  return withDraftComments(draft.body, draft.comments.filter((comment) => comment.bodyOnly), heading);
+}
+
 function publicRun(run: BusinessReviewRun): object {
   return {
     id: run.id, bindingKey: run.bindingKey, status: run.status,
     coverage: run.coverage, globalCompleted: run.globalCompleted, findings: run.findings,
     requirements: run.requirements, premises: run.premises, priorCritical: run.priorCritical,
     priorCriticalVerdicts: run.priorCriticalVerdicts, dependencies: run.dependencies,
-    limitations: run.limitations, errors: run.errors, dispositions: run.dispositions,
+    limitations: run.limitations, blockingLimitations: run.blockingLimitations, errors: run.errors, dispositions: run.dispositions,
   };
 }
 
@@ -72,6 +87,7 @@ export function restoreConclusionDraft(value: unknown): ConclusionDraft | undefi
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ConclusionDraftDataError();
     const comment = value as Record<string, unknown>;
     if (typeof comment.id !== 'string' || !comment.id || typeof comment.path !== 'string' || !comment.path
+      || comment.bodyOnly !== undefined && typeof comment.bodyOnly !== 'boolean'
       || typeof comment.body !== 'string' || !comment.body.trim() || !Number.isInteger(comment.startLine) || !Number.isInteger(comment.endLine)
       || Number(comment.startLine) < 1 || Number(comment.endLine) < Number(comment.startLine)
       || !['manual', 'finding'].includes(String(comment.source)) || typeof comment.createdAt !== 'number' || !Number.isFinite(comment.createdAt)) throw new ConclusionDraftDataError();

@@ -32,6 +32,15 @@ function modelFor(output: unknown) {
 }
 
 describe('real requirement model adapter', () => {
+  it('does not send explicit human additions through a model extraction step', async () => {
+    const draft = createRequirementsDraft();
+    addRequirementMaterial(draft, { kind: 'human', name: 'Human', location: 'User', format: 'text', text: 'Keep this exact wording.\r\n' });
+    const { model, sendRequest } = modelFor({});
+    const result = await analyzeRequirementUnderstanding(model, draft, { key: 'scope', description: 'repo' }, { isCancellationRequested: false } as vscode.CancellationToken, () => {});
+    expect(sendRequest).not.toHaveBeenCalled();
+    expect(result.requirements[0].text).toBe('Keep this exact wording.\r\n');
+    expect(draft.confirmation).toBeUndefined();
+  });
   it('calls the configured model with exact materials, a code scope, schema and deterministic review settings', async () => {
     const { draft, response } = fixture();
     const { model, sendRequest } = modelFor(response);

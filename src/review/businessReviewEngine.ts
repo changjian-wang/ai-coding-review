@@ -91,7 +91,10 @@ export async function runBusinessReview(
     work.then((value) => finish(() => resolve(value)), (error) => finish(() => reject(error)));
   });
   const update = async () => { current(); await services.update(structuredClone(run)); };
-  const limit = (reason: string) => { if (!run.limitations.includes(reason)) run.limitations.push(reason); };
+  const limit = (reason: string, blocking = false) => {
+    if (!run.limitations.includes(reason)) run.limitations.push(reason);
+    if (blocking && !(run.blockingLimitations ??= []).includes(reason)) run.blockingLimitations.push(reason);
+  };
   const fits = async (phase: BusinessModelPhase, payload: unknown) => {
     current();
     return JSON.stringify(payload).length <= BUSINESS_REVIEW_LIMITS.inputCharacters && await wait(services.fits(phase, payload));
@@ -267,7 +270,7 @@ export async function runBusinessReview(
         cause: item.detail, trigger: t.legacyUnverified, impact: item.detail, requirementIds: [], evidence,
       });
     }
-    if (legacy.length > BUSINESS_REVIEW_LIMITS.findings) limit(t.findingLimit);
+    if (legacy.length > BUSINESS_REVIEW_LIMITS.findings) limit(t.findingLimit, true);
     await update();
     const readable = roots.slice(0, BUSINESS_REVIEW_LIMITS.files).map((file) => file.path);
     const manifest = roots.slice(0, BUSINESS_REVIEW_LIMITS.files).map((file) => ({
@@ -321,7 +324,7 @@ export async function runBusinessReview(
       const before = Object.keys(run.dependencies).length;
       await fetchEvidence();
       if (Object.keys(run.dependencies).length === before) break;
-      if (pass === 1) limit(t.globalLimit);
+      if (pass === 1) limit(t.globalLimit, true);
     }
     const pending = [...run.candidates];
     while (pending.length) {
@@ -380,11 +383,11 @@ export async function runBusinessReview(
       if (businessHash(text) !== expected) throw new ReviewStop('stale', t.stale);
     }
     current();
-    run.status = run.errors.length || run.limitations.length || run.coverage.some((entry) => !coverageComplete(entry)) ? 'partial' : 'completed';
+    run.status = run.errors.length || run.blockingLimitations?.length || run.coverage.some((entry) => !coverageComplete(entry)) ? 'partial' : 'completed';
   } catch (error) {
     if (error instanceof ReviewStop) {
       run.status = error.reason === 'cancelled' ? 'cancelled' : error.reason === 'stale' ? 'stale' : 'partial';
-      if (error.reason === 'budget') limit(error.message);
+      if (error.reason === 'budget') limit(error.message, true);
       else run.errors.push(error.message);
     } else {
       run.status = 'failed';

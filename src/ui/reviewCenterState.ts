@@ -2,7 +2,7 @@ import { m, fmt } from '../i18n';
 import { findingContentSignature, isActionableFinding, type Finding } from '../ai/types';
 import { businessBindingKey, businessHash, businessBlockers, coverageComplete, type BusinessCitation, type BusinessFinding } from '../review/businessReview';
 import type { BusinessReviewStatus } from '../review/businessReview';
-import { ConclusionDraftDataError, type ConclusionDraft, type ConclusionVerdict } from '../review/conclusionDraft';
+import { conclusionDraftText, ConclusionDraftDataError, type ConclusionDraft, type ConclusionVerdict } from '../review/conclusionDraft';
 import { legacySelectionId, type ReviewWorkspaceView } from '../review/reviewWorkspace';
 import type { ReviewSession } from '../review/reviewSession';
 import type { RequirementItem } from '../review/requirements';
@@ -272,13 +272,15 @@ export function buildReviewCenterState(
       draft, error: draftError, stale: stale && !published, published,
       unknownAttempt: unknownAttempt ? { id: unknownAttempt.id, error: unknownAttempt.error } : undefined,
       previewCurrent: !draftError && !stale && session.conclusionPreviewCurrent,
-      previewHtml: draft?.previewKey ? renderRequirementMarkdown(draft.body) : undefined,
+      previewHtml: draft?.previewKey ? renderRequirementMarkdown(conclusionDraftText(draft, t.pendingComments)) : undefined,
       canApprove: !input.running && !input.analysisBusy && session.canSubmitConclusion('approve'),
       canComment: !input.running && !input.analysisBusy && session.canSubmitConclusion('comment'),
       canRequestChanges: !input.running && !input.analysisBusy && session.canSubmitConclusion('request-changes'),
       publishBusy: input.publishBusy,
       target: pr ? `${set?.repositoryIdentity ?? session.getRepoLabel()} · PR #${pr[1]}` : `${session.getRepoLabel()} · ${t.localTarget}`,
-      blockers: input.running || input.analysisBusy ? [b.incomplete] : run ? businessBlockers(run) : session.technicalGatePassed() ? [] : [b.incomplete],
+      blockers: input.running || input.analysisBusy ? [b.incomplete] : draft?.verdict === 'approve'
+        ? run ? businessBlockers(run) : session.technicalGatePassed() ? [] : [b.incomplete]
+        : session.canSubmitConclusion(draft?.verdict ?? 'comment') ? [] : [stale ? b.stale : b.incomplete],
       confirmed: run?.confirmed ?? false,
       openItems: findings.filter((row) => row.kind === 'finding'
         ? run?.findings.some((finding) => finding.id === row.id && finding.status !== 'dismissed')
@@ -299,7 +301,8 @@ export interface CenterAction {
   type: 'center';
   action: 'ready' | 'stage' | 'navigator' | 'select' | 'file' | 'reference' | 'inspector' | 'focus' | 'next'
     | 'run' | 'cancel' | 'model' | 'language' | 'export' | 'confirmReport' | 'note' | 'fix'
-    | 'generateDraft' | 'savePreview' | 'previewRendered' | 'publish' | 'appendFinding' | 'legacyAnalyze' | 'legacyGlobal' | 'checkPublication';
+    | 'generateDraft' | 'savePreview' | 'previewRendered' | 'publish' | 'appendFinding' | 'legacyAnalyze' | 'legacyGlobal' | 'checkPublication'
+    | 'copyDraft' | 'saveDraft';
   contextKey: string;
   id?: string;
   kind?: string;
