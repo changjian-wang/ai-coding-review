@@ -10,6 +10,7 @@ export interface DocumentRender {
   readingHtml?: string;
   /** Per-source-line highlighted HTML; index 0 is line 1. */
   sourceLines: string[];
+  raw: string[];
   /** Total number of source lines (drives coverage). */
   totalLines: number;
   /** Stable identity for the exact source text, used by the webview DOM cache. */
@@ -31,6 +32,22 @@ const md = new MarkdownIt({
     return '';
   },
 });
+
+const requirementMarkdown = new MarkdownIt({ html: false, linkify: true });
+const validateRequirementLink = requirementMarkdown.validateLink.bind(requirementMarkdown);
+requirementMarkdown.validateLink = (href) =>
+  /^(https?:|mailto:)/i.test(href) && validateRequirementLink(href);
+requirementMarkdown.renderer.rules.image = (tokens, index) => escapeHtml(tokens[index].content);
+requirementMarkdown.renderer.rules.link_open = (tokens, index, options, _env, renderer) => {
+  tokens[index].attrSet('target', '_blank');
+  tokens[index].attrSet('rel', 'noopener noreferrer');
+  tokens[index].attrSet('referrerpolicy', 'no-referrer');
+  return renderer.renderToken(tokens, index, options);
+};
+
+export function renderRequirementMarkdown(text: string): string {
+  return requirementMarkdown.render(text);
+}
 
 /** Maps VS Code languageIds / extensions to highlight.js language names. */
 const LANG_ALIAS: Record<string, string> = {
@@ -137,6 +154,7 @@ export function renderDocument(text: string, languageId: string, fileName: strin
   }
 
   return {
+    raw: rawLines,
     isMarkdown,
     readingHtml: isMarkdown ? renderMarkdownReading(text) : undefined,
     sourceLines: sourceLines.slice(0, rawLines.length),

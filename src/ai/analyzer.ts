@@ -23,13 +23,19 @@ import type {
   VerdictKind,
 } from './types';
 import { getOutputLanguage, languageDirective, type OutputLanguage } from './lang';
-import { m } from '../i18n';
+import { fmt, m } from '../i18n';
+import type { ReviewFile } from '../scope/types';
+import type { RequirementUnderstanding, ReviewWorkflowState } from '../review/reviewWorkflow';
+import {
+  businessReviewInstructions, parseBusinessReview, parseGlobalCandidateResults, parseRequirementUnderstanding,
+  requirementData, requirementReviewPrinciples, understandingRequest, validateGlobalReviewEvidence,
+} from './reviewRequirements';
 
 /** Raised when analysis cannot complete; message is user-facing. */
 export class AnalysisError extends Error {}
 
 /** The kind of LLM operation, used to bucket token usage by purpose. */
-type LlmOp = 'analyze' | 'verify' | 'global' | 'fix' | 'diff' | 'translate' | 'explain';
+type LlmOp = 'analyze' | 'verify' | 'global' | 'requirements' | 'fix' | 'diff' | 'translate' | 'explain';
 
 /** A single LLM call's estimated token usage. Estimated locally via `countTokens`. */
 export interface TokenUsage {
@@ -266,7 +272,8 @@ async function ask(
     const reproducible =
       options.op === 'analyze'
       || options.op === 'verify'
-      || options.op === 'global';
+      || options.op === 'global'
+      || options.op === 'requirements';
     const requestOptions: vscode.LanguageModelChatRequestOptions = reproducible
       ? { modelOptions: { temperature: 0 } }
       : {};
@@ -295,6 +302,24 @@ async function ask(
     })();
   }
   return out;
+}
+
+async function assertWorkflowInputBudget(model: vscode.LanguageModelChat, system: string, user: string): Promise<void> {
+  const tokens = await model.countTokens(`${languageDirective()}\n\n${system}`) + await model.countTokens(user);
+  const available = model.maxInputTokens - Math.min(4096, Math.floor(model.maxInputTokens / 4));
+  if (tokens > available) throw new AnalysisError(m().reviewCenter.inputTooLarge);
+}
+
+export async function analyzeRequirementSources(
+  model: vscode.LanguageModelChat,
+  workflow: ReviewWorkflowState,
+  token: vscode.CancellationToken,
+): Promise<RequirementUnderstanding> {
+  const request = understandingRequest(workflow, getOutputLanguage());
+  await assertWorkflowInputBudget(model, request.system, request.user);
+  const raw = await ask(model, request.system, request.user, token, { op: 'requirements' });
+  if (token.isCancellationRequested) throw new AnalysisError(m().reviewCenter.runState.cancelled);
+  return { ...parseRequirementUnderstanding(parseJson<unknown>(raw), workflow), modelId: model.id };
 }
 
 /** Translates arbitrary text to the active UI language, returning the plain result. */
@@ -552,12 +577,16 @@ export async function analyzeFile(
   model: vscode.LanguageModelChat,
   document: vscode.TextDocument,
   token: vscode.CancellationToken,
+  workflow?: ReviewWorkflowState,
 ): Promise<FileFindingCandidate[]> {
   const numbered = numberifyLines(document.getText());
-  const user = `文件路径：${document.uri.fsPath}\n语言：${document.languageId}\n以下每行以「行号<TAB>内容」给出：\n\n${numbered}`;
-  const raw = await ask(model, localizedPrompt(FILE_SYSTEM_PROMPT_ZH, FILE_SYSTEM_PROMPT_EN), user, token, { op: 'analyze' });
+  const user = `文件路径：${document.uri.fsPath}\n语言：${document.languageId}\n以下每行以「行号<TAB>内容」给出：\n\n${numbered}${workflow ? `\n\nreviewRequirements:\n${JSON.stringify(requirementData(workflow))}` : ''}`;
+  const system = localizedPrompt(FILE_SYSTEM_PROMPT_ZH, FILE_SYSTEM_PROMPT_EN) + (workflow ? requirementReviewPrinciples(getOutputLanguage()) : '');
+  if (workflow) await assertWorkflowInputBudget(model, system, user);
+  const raw = await ask(model, system, user, token, { op: 'analyze' });
   const parsed = parseJson<{ findings?: unknown[] }>(raw);
   const list = Array.isArray(parsed.findings) ? parsed.findings : [];
+  if (workflow && !Array.isArray(parsed.findings)) throw new AnalysisError(fmt(m().reviewCenter.invalidModelResponse, 'findings'));
   const lineCount = document.lineCount;
   return list.map((f, i) => {
     const o = f as Record<string, unknown>;
@@ -717,6 +746,7 @@ export function finalizeFileAnalysis(
   candidates: FileFindingCandidate[],
   verifications: CandidateVerification[],
   repositoryAware: boolean,
+  requireEvidence = false,
 ): FileAnalysisResult {
   const byCandidate = new Map(
     verifications.map((verification) => [verification.candidateId, verification] as const),
@@ -725,6 +755,13 @@ export function finalizeFileAnalysis(
   let dismissed = 0;
   let unresolved = 0;
   for (const candidate of candidates) {
+    if (requireEvidence && !repositoryAware && candidate.requiresRepoContext) {
+      unresolved++;
+      findings.push(toFinding(candidate, `f${findings.length}`, {
+        status: 'unresolved', rationale: m().reviewCenter.localContextDisabled, evidence: [], source: 'file',
+      }));
+      continue;
+    }
     if (!repositoryAware || !candidate.requiresRepoContext) {
       findings.push(toFinding(candidate, `f${findings.length}`));
       continue;
@@ -962,24 +999,30 @@ export async function analyzeRootedRepository(
   model: vscode.LanguageModelChat,
   context: RepositoryAnalysisContext,
   token: vscode.CancellationToken,
+  workflow?: ReviewWorkflowState,
 ): Promise<RootedFindingCandidate[]> {
+  const system = localizedPrompt(ROOTED_ANALYSIS_SYSTEM_PROMPT_ZH, ROOTED_ANALYSIS_SYSTEM_PROMPT_EN) + (workflow ? requirementReviewPrinciples(getOutputLanguage()) : '');
+  const user = JSON.stringify({ ...rootedContextPayload(context), ...(workflow ? { reviewRequirements: requirementData(workflow) } : {}) });
+  if (workflow) await assertWorkflowInputBudget(model, system, user);
   const raw = await ask(
     model,
-    localizedPrompt(ROOTED_ANALYSIS_SYSTEM_PROMPT_ZH, ROOTED_ANALYSIS_SYSTEM_PROMPT_EN),
-    JSON.stringify(rootedContextPayload(context)),
+    system,
+    user,
     token,
     { op: 'analyze' },
   );
   const parsed = parseJson<{ findings?: unknown[] }>(raw);
+  if (workflow && !Array.isArray(parsed.findings)) throw new AnalysisError(fmt(m().reviewCenter.invalidModelResponse, 'findings'));
   const evidenceById = new Map(
     context.snippets.map((snippet) => [snippet.id, snippet] as const),
   );
   const allowedFiles = new Set(context.files);
   const candidates: RootedFindingCandidate[] = [];
-  for (const item of (Array.isArray(parsed.findings) ? parsed.findings : []).slice(0, 20)) {
+  for (const item of (Array.isArray(parsed.findings) ? parsed.findings : []).slice(0, workflow ? undefined : 20)) {
     const o = item as Record<string, unknown>;
     const file = normaliseRepositoryPath(o.file);
     if (!allowedFiles.has(file)) {
+      if (workflow) throw new AnalysisError(fmt(m().reviewCenter.invalidModelResponse, file));
       continue;
     }
     const severity = normaliseSeverity(o.severity);
@@ -1002,6 +1045,7 @@ export async function analyzeRootedRepository(
       || !anchor
       || !anchorLocation
     ) {
+      if (workflow) throw new AnalysisError(fmt(m().reviewCenter.invalidModelResponse, `${file}: anchor / evidenceIds`));
       continue;
     }
     const lineCount = context.lineCounts[file] ?? 1;
@@ -1034,6 +1078,7 @@ export async function verifyRootedRepositoryFindings(
   candidates: RootedFindingCandidate[],
   token: vscode.CancellationToken,
   maxTokens = DEFAULT_REPOSITORY_CONTEXT_TOKEN_BUDGET,
+  workflow?: ReviewWorkflowState,
 ): Promise<CandidateVerification[]> {
   if (candidates.length === 0) {
     return [];
@@ -1042,6 +1087,7 @@ export async function verifyRootedRepositoryFindings(
   const budgetDropped: CandidateVerification[] = [];
   const buildUser = () => JSON.stringify({
     ...rootedContextPayload(context),
+    ...(workflow ? { reviewRequirements: requirementData(workflow) } : {}),
     candidates: activeCandidates.map((candidate) => ({
       candidateId: candidate.candidateId,
       file: candidate.file,
@@ -1059,7 +1105,7 @@ export async function verifyRootedRepositoryFindings(
     const system = localizedPrompt(
       ROOTED_VERIFY_SYSTEM_PROMPT_ZH,
       ROOTED_VERIFY_SYSTEM_PROMPT_EN,
-    );
+    ) + (workflow ? requirementReviewPrinciples(getOutputLanguage()) : '');
     const systemTokens = await model.countTokens(system);
     let inputTokens = systemTokens + (await model.countTokens(buildUser()));
     while (activeCandidates.length > 0 && inputTokens > maxTokens) {
@@ -1079,9 +1125,11 @@ export async function verifyRootedRepositoryFindings(
   if (activeCandidates.length === 0) {
     return budgetDropped;
   }
+  const system = localizedPrompt(ROOTED_VERIFY_SYSTEM_PROMPT_ZH, ROOTED_VERIFY_SYSTEM_PROMPT_EN) + (workflow ? requirementReviewPrinciples(getOutputLanguage()) : '');
+  if (workflow) await assertWorkflowInputBudget(model, system, buildUser());
   const raw = await ask(
     model,
-    localizedPrompt(ROOTED_VERIFY_SYSTEM_PROMPT_ZH, ROOTED_VERIFY_SYSTEM_PROMPT_EN),
+    system,
     buildUser(),
     token,
     { op: 'verify' },
@@ -1147,6 +1195,7 @@ export function finalizeRootedRepositoryAnalysis(
   context: RepositoryAnalysisContext,
   candidates: RootedFindingCandidate[],
   verifications: CandidateVerification[],
+  preserveUnconfirmed = false,
 ): RootedFileAnalysisResult {
   const verdicts = new Map(
     verifications.map((verification) => [verification.candidateId, verification] as const),
@@ -1154,16 +1203,17 @@ export function finalizeRootedRepositoryAnalysis(
   const findingsByFile: Record<string, Finding[]> = {};
   let dismissed = 0;
   let unresolved = 0;
+  let confirmed = 0;
   for (const candidate of candidates) {
     const verification = verdicts.get(candidate.candidateId);
     if (verification?.status === 'dismissed') {
       dismissed++;
-      continue;
-    }
-    if (verification?.status !== 'confirmed') {
+    } else if (verification?.status !== 'confirmed') {
       unresolved++;
-      continue;
+    } else {
+      confirmed++;
     }
+    if (!preserveUnconfirmed && verification?.status !== 'confirmed') continue;
     const fileFindings = (findingsByFile[candidate.file] ??= []);
     fileFindings.push({
       id: `f${fileFindings.length}`,
@@ -1177,9 +1227,9 @@ export function finalizeRootedRepositoryAnalysis(
       analysisRoot: context.rootPath,
       analysisRoots: [context.rootPath],
       verification: {
-        status: 'repo-confirmed',
-        rationale: verification.rationale,
-        evidence: verification.evidence,
+        status: verification?.status === 'confirmed' ? 'repo-confirmed' : verification?.status === 'dismissed' ? 'overturned' : 'unresolved',
+        rationale: verification?.rationale ?? m().analyzer.repoVerificationMissingResult,
+        evidence: verification?.evidence ?? [],
         source: 'file',
       },
     });
@@ -1188,10 +1238,7 @@ export function finalizeRootedRepositoryAnalysis(
     findingsByFile,
     summary: {
       candidates: candidates.length,
-      confirmed: Object.values(findingsByFile).reduce(
-        (total, findings) => total + findings.length,
-        0,
-      ),
+      confirmed,
       dismissed,
       unresolved,
       contextFiles: context.files.length,
@@ -1205,6 +1252,8 @@ export function finalizeRootedRepositoryAnalysis(
 export interface GlobalContextFile {
   path: string;
   findings: Finding[];
+  status?: ReviewFile['status'];
+  previousPath?: string;
   /** Full source text of the file, so the model can resolve cross-file facts. */
   content: string;
 }
@@ -1220,16 +1269,19 @@ export async function analyzeGlobal(
   model: vscode.LanguageModelChat,
   files: GlobalContextFile[],
   token: vscode.CancellationToken,
+  workflow?: ReviewWorkflowState,
 ): Promise<GlobalReport> {
   const perFileBudget = Math.max(
     1,
     Math.min(MAX_FILE_CHARS, Math.floor(MAX_TOTAL_CHARS / Math.max(1, files.length))),
   );
+  const visibleSources = new Map<string, string>();
+  const coverageLimits: string[] = [];
   const sections = files.map((f) => {
     const findingRefs = findingContentSignatures(f.findings);
     const findings = f.findings.length
       ? f.findings.map((x, index) =>
-          `  - findingRef=${findingRefs[index]} [${x.severity}${x.verification ? `/${x.verification.status}` : ''}] L${x.line} ${x.title} — ${x.detail.replace(/\s+/g, ' ').slice(0, 300)}`,
+          `  - findingRef=${findingRefs[index]}${workflow ? ` workflowRef=file:${f.path}#${findingRefs[index]}` : ''} [${x.severity}${x.verification ? `/${x.verification.status}` : ''}] L${x.line} ${x.title} — ${x.detail.replace(/\s+/g, ' ').slice(0, 300)}`,
         ).join('\n')
       : '  - （文件级未发现问题）';
 
@@ -1237,28 +1289,35 @@ export async function analyzeGlobal(
     let truncated = source.length > perFileBudget;
     if (truncated) {
       source = source.slice(0, perFileBudget);
+      coverageLimits.push(f.path);
     }
-
-    const numbered = source ? numberifyLines(source) : '（源码不可用）';
+    visibleSources.set(f.path, source);
+    const numbered = source || workflow ? numberifyLines(source) : '（源码不可用）';
     const note = truncated ? '\n…（源码因长度被截断）' : '';
-    return `文件：${f.path}\n文件级发现：\n${findings}\n源码（行号<TAB>内容）：\n${numbered}${note}`;
+    return `文件：${f.path}${workflow ? `\n状态：${f.status ?? 'present'}${f.status === 'deleted' ? '（源码为删除前的基线，检查删除对当前调用方和契约的影响，不把旧实现当当前代码）' : ''}` : ''}\n文件级发现：\n${findings}\n源码（行号<TAB>内容）：\n${numbered}${note}`;
   });
   const summary = sections.join('\n\n----\n\n');
-  const user = `审查集共 ${files.length} 个文件。请基于下面每个文件的真实源码与文件级发现，给出跨文件的全局逻辑分析。务必依据源码中可见的事实（DI 注册、调用关系、配置键、分层依赖）作出判断，不要臆测。\n\n${summary}`;
-  const raw = await ask(model, localizedPrompt(GLOBAL_SYSTEM_PROMPT_ZH, GLOBAL_SYSTEM_PROMPT_EN), user, token, { op: 'global' });
+  const user = `审查集共 ${files.length} 个文件。请基于下面每个文件的真实源码与文件级发现，给出跨文件的全局逻辑分析。务必依据源码中可见的事实（DI 注册、调用关系、配置键、分层依赖）作出判断，不要臆测。\n\n${summary}${workflow ? `\n\nreviewRequirements:\n${JSON.stringify(requirementData(workflow, true))}` : ''}`;
+  const system = localizedPrompt(GLOBAL_SYSTEM_PROMPT_ZH, GLOBAL_SYSTEM_PROMPT_EN)
+    + (workflow ? businessReviewInstructions(getOutputLanguage()) : '');
+  if (workflow) await assertWorkflowInputBudget(model, system, user);
+  const raw = await ask(model, system, user, token, { op: 'global' });
   const parsed = parseJson<{
     conclusion?: string;
     recommendation?: string;
     evidence?: unknown[];
     verdicts?: unknown[];
     fixSpots?: unknown[];
+    business?: unknown;
   }>(raw);
+  const verdictEvidence = workflow ? validateGlobalReviewEvidence(parsed, files, visibleSources) : [];
   const fixSpots: GlobalFixSpot[] = (Array.isArray(parsed.fixSpots) ? parsed.fixSpots : []).map(
     (f) => {
       const o = f as Record<string, unknown>;
       return {
         id: '',
         file: String(o.file ?? ''),
+        findingRef: typeof o.findingRef === 'string' && o.findingRef ? o.findingRef : undefined,
         line: Math.max(1, Number(o.line) || 1),
         anchor: typeof o.anchor === 'string' && o.anchor.trim() ? o.anchor : undefined,
         severity: normaliseSeverity(o.severity),
@@ -1273,7 +1332,7 @@ export async function analyzeGlobal(
     spot.id = fixSpotIds[index];
   });
   const verdicts: GlobalVerdict[] = (Array.isArray(parsed.verdicts) ? parsed.verdicts : []).map(
-    (v) => {
+    (v, index) => {
       const o = v as Record<string, unknown>;
       return {
         kind: normaliseVerdictKind(o.kind),
@@ -1284,15 +1343,93 @@ export async function analyzeGlobal(
         file: o.file ? String(o.file) : undefined,
         line: o.line ? Math.max(1, Number(o.line)) : undefined,
         findingRef: o.findingRef ? String(o.findingRef) : undefined,
+        ...(workflow ? { evidenceRefs: verdictEvidence[index] } : {}),
       } satisfies GlobalVerdict;
     },
   );
-  return {
+  const report: GlobalReport = {
     conclusion: String(parsed.conclusion ?? m().analyzer.noCrossFileIssues),
     recommendation: normaliseRecommendation(parsed.recommendation),
     evidence: (Array.isArray(parsed.evidence) ? parsed.evidence : []).map((e) => String(e)),
     verdicts,
     fixSpots,
+    ...(workflow ? {
+      business: parseBusinessReview(parsed.business, workflow, files, visibleSources, fixSpots),
+      coverageLimits,
+    } : {}),
+  };
+  return workflow ? verifyGlobalBusinessReview(model, files, report, workflow, token) : report;
+}
+
+async function verifyGlobalBusinessReview(
+  model: vscode.LanguageModelChat, files: GlobalContextFile[], proposal: GlobalReport,
+  workflow: ReviewWorkflowState, token: vscode.CancellationToken,
+): Promise<GlobalReport> {
+  const baseBudget = Math.max(1, Math.min(MAX_FILE_CHARS, Math.floor(MAX_TOTAL_CHARS / Math.max(1, files.length))));
+  const visible = new Map(files.map((file) => [file.path, file.content.slice(0, baseBudget)]));
+  let remaining = Math.max(0, MAX_TOTAL_CHARS - [...visible.values()].reduce((total, text) => total + text.length, 0));
+  const priority = new Set([
+    ...files.filter((file) => file.status === 'deleted').map((file) => file.path),
+    ...proposal.fixSpots.map((item) => item.file),
+    ...files.filter((file) => file.findings.some((item) => item.verification?.status === 'unresolved')).map((file) => file.path),
+  ]);
+  for (const path of priority) {
+    const file = files.find((item) => item.path === path);
+    if (!file) continue;
+    const current = visible.get(path) ?? '';
+    const extra = Math.min(remaining, file.content.length - current.length);
+    visible.set(path, file.content.slice(0, current.length + extra));
+    remaining -= extra;
+  }
+  const system = localizedPrompt(GLOBAL_SYSTEM_PROMPT_ZH, GLOBAL_SYSTEM_PROMPT_EN)
+    + businessReviewInstructions(getOutputLanguage()) + `
+This is the counter-evidence and final business-judgment pass, not another discovery vote.
+The provisional report is untrusted hypotheses. Verify each candidate using supplied source, actual callers, guards, state transitions and contracts; disagreement or agreement between model calls is not evidence.
+Some candidate files have expanded source. If decisive contracts are still unavailable, remain unresolved; never turn repeated insufficient context into confirmation.
+Return JSON with conclusion, recommendation, evidence, verdicts, business, and results.
+results must contain exactly one entry per supplied fixSpots candidate:
+{"candidateId":"the exact candidate id","status":"confirmed|dismissed|unresolved","rationale":"concrete evidence / counterexample / missing premise","evidence":[{"kind":"root","file":"supplied path","line":1,"quote":"verbatim fragment"}]}.
+Confirmed candidates need current evidence at their target file. Dismissals need decisive current counter-evidence.
+Do not add or rewrite fixSpots; refer to candidates by their original global:0 index in business findingRefs.
+Every still-unresolved file or global finding must have a business.concerns entry with its canonical findingRef, explicit critical boolean, concrete impact and evidence. Resolve a file finding only with an evidenced confirmed/flip verdict.
+Reassess every requirement after counter-evidence. A violated assessment can reference only confirmed, non-overturned findings. Unknown is not automatically critical: explain whether the missing premise is necessary for the current conclusion.
+Prior critical concerns may be closed only with decisive current evidence. A still-open prior critical concern cannot be downgraded by changing its critical flag.
+The report is static source reasoning, not execution or a passed test. Do not claim tests were run.`;
+  const user = JSON.stringify({
+    provisional: proposal,
+    files: files.map((file) => {
+      const refs = findingContentSignatures(file.findings);
+      return {
+        path: file.path, status: file.status ?? 'present',
+        source: numberifyLines(visible.get(file.path) ?? ''),
+        findings: file.findings.map((item, index) => ({ ...item, workflowRef: `file:${file.path}#${refs[index]}` })),
+      };
+    }),
+    reviewRequirements: requirementData(workflow, true),
+  });
+  await assertWorkflowInputBudget(model, system, user);
+  const parsed = parseJson<{
+    conclusion: string; recommendation: string; evidence: string[];
+    verdicts: unknown[]; results: unknown; business: unknown;
+  }>(await ask(model, system, user, token, { op: 'verify' }));
+  const proofs = validateGlobalReviewEvidence({ ...parsed, fixSpots: proposal.fixSpots }, files, visible);
+  const spots = parseGlobalCandidateResults(parsed.results, proposal.fixSpots, visible);
+  const verdicts: GlobalVerdict[] = parsed.verdicts.map((item, index) => {
+    const value = item as Record<string, unknown>;
+    return {
+      kind: normaliseVerdictKind(value.kind), title: String(value.title), after: String(value.after),
+      before: typeof value.before === 'string' ? value.before : '', file: String(value.file),
+      findingRef: typeof value.findingRef === 'string' ? value.findingRef : undefined,
+      evidence: typeof value.evidence === 'string' ? value.evidence : undefined,
+      evidenceRefs: proofs[index],
+    };
+  });
+  return {
+    conclusion: parsed.conclusion, recommendation: normaliseRecommendation(parsed.recommendation),
+    evidence: parsed.evidence, verdicts, fixSpots: spots,
+    business: parseBusinessReview(parsed.business, workflow, files, visible, spots, verdicts, true),
+    coverageLimits: files.filter((file) => (visible.get(file.path)?.length ?? 0) < file.content.length).map((file) => file.path),
+    fullSourceFiles: files.filter((file) => visible.get(file.path)?.length === file.content.length).map((file) => file.path),
   };
 }
 
@@ -1372,6 +1509,7 @@ export async function generateFixProposals(
   finding: { title: string; detail: string; suggestion?: string; line: number; endLine?: number; anchor?: string },
   token: vscode.CancellationToken,
   userContext?: string,
+  workflow?: ReviewWorkflowState,
 ): Promise<FixProposal[]> {
   const numbered = numberifyLines(fileContent);
   const range = finding.endLine && finding.endLine > finding.line
@@ -1394,7 +1532,11 @@ ${supplement}${anchorBlock}源码（每行以「行号<TAB>内容」给出）：
 ${numbered}
 
 请按上述 JSON 结构给出修复方案。`;
-  const raw = await ask(model, localizedPrompt(FIX_PROPOSALS_SYSTEM_PROMPT_ZH, FIX_PROPOSALS_SYSTEM_PROMPT_EN), user, token, { op: 'fix' });
+  const system = localizedPrompt(FIX_PROPOSALS_SYSTEM_PROMPT_ZH, FIX_PROPOSALS_SYSTEM_PROMPT_EN)
+    + (workflow ? `${requirementReviewPrinciples(getOutputLanguage())}\nFix-panel supplements do not amend the confirmed requirement baseline. Explain incompatible directions; editing code does not prove requirement fulfillment.` : '');
+  const input = user + (workflow ? `\nreviewRequirements:\n${JSON.stringify(requirementData(workflow))}` : '');
+  if (workflow) await assertWorkflowInputBudget(model, system, input);
+  const raw = await ask(model, system, input, token, { op: 'fix' });
   const parsed = parseJson<{ proposals?: unknown[] }>(raw);
   const list = Array.isArray(parsed.proposals) ? parsed.proposals : [];
   const out: FixProposal[] = [];

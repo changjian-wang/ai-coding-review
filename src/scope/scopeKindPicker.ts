@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { esc, nonce as makeNonce } from '../ui/html';
+import { esc, nonce as makeNonce, scriptJson } from '../ui/html';
+import { m } from '../i18n';
 
 /** One selectable scope-kind row. */
 export interface ScopeKindOption {
@@ -44,8 +45,10 @@ export function pickScopeKind(opts: ScopeKindPickerOptions): Promise<string | un
     };
 
     panel.webview.onDidReceiveMessage((msg: { type?: string; id?: unknown }) => {
-      if (msg?.type === 'pick' && typeof msg.id === 'string') {
+      if (msg?.type === 'pick' && typeof msg.id === 'string' && opts.options.some((option) => option.id === msg.id)) {
         finish(msg.id);
+      } else if (msg?.type === 'pick') {
+        void vscode.window.showWarningMessage(m().reviewCenter.invalidAction);
       } else if (msg?.type === 'cancel') {
         finish(undefined);
       }
@@ -65,7 +68,7 @@ export function pickScopeKind(opts: ScopeKindPickerOptions): Promise<string | un
 function renderHtml(opts: ScopeKindPickerOptions): string {
   const nonce = makeNonce();
   const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
-  const data = JSON.stringify(opts.options);
+  const data = scriptJson(opts.options);
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

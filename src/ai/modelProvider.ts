@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { PickedModel } from './modelPicker';
+import { m } from '../i18n';
 
 const MEMENTO_KEY = 'codereview.pickedModel.v1';
 
@@ -55,16 +56,13 @@ export class ModelProvider {
         return this.picked.model;
       }
       // Rebind a persisted pick to a live model handle by id.
-      try {
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        const match = models.find((m) => m.id === this.picked!.id);
-        if (match) {
-          this.picked = { ...this.picked, model: match };
-          return match;
-        }
-      } catch {
-        // fall through to Auto
+      const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+      const match = models.find((model) => model.id === this.picked?.id);
+      if (match) {
+        this.picked = { ...this.picked, model: match };
+        return match;
       }
+      throw new Error(m().model.unavailable(this.picked.label));
     }
     const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
     return models[0];

@@ -191,7 +191,7 @@ export function resetVscodeMock(): void {
 }
 
 export const workspace = {
-  textDocuments: [],
+  textDocuments: [] as { uri: { fsPath: string; scheme: string }; isDirty: boolean; getText(): string }[],
   getConfiguration: () => ({
     get: <T>(section: string, defaultValue: T): T =>
       (section === 'language' ? vscodeMockState.language : defaultValue) as T,
@@ -300,11 +300,19 @@ export class Uri {
 }
 
 export class CancellationTokenSource {
-  readonly token = { isCancellationRequested: false };
+  private readonly callbacks = new Set<(event: unknown) => unknown>();
+  readonly token = {
+    isCancellationRequested: false,
+    onCancellationRequested: (callback: (event: unknown) => unknown): Disposable => {
+      this.callbacks.add(callback);
+      return { dispose: () => this.callbacks.delete(callback) };
+    },
+  };
 
   cancel(): void {
     this.token.isCancellationRequested = true;
+    for (const callback of this.callbacks) callback(undefined);
   }
 
-  dispose(): void {}
+  dispose(): void { this.callbacks.clear(); }
 }

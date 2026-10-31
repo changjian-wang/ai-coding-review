@@ -90,7 +90,7 @@ function providerLocations(
   });
 }
 
-const defaultServices: RepositoryEvidenceServices = {
+export const defaultRepositoryEvidenceServices: RepositoryEvidenceServices = {
   definitions: async (uri, position) => providerLocations(
     await vscode.commands.executeCommand<readonly (vscode.Location | vscode.LocationLink)[]>(
       'vscode.executeDefinitionProvider',
@@ -111,6 +111,7 @@ const defaultServices: RepositoryEvidenceServices = {
     vscode.Uri.joinPath(vscode.Uri.file(cwd), ...relativePath.split('/')),
   now: () => Date.now(),
 };
+const defaultServices = defaultRepositoryEvidenceServices;
 
 function simpleSymbol(symbol: string): string {
   const parts = symbol.trim().replace(/\(\s*\)$/, '').split(/[.:#/\\]/);
@@ -628,13 +629,18 @@ function numberedText(text: string, startLine = 1): string {
     .join('\n');
 }
 
-function contentFingerprint(text: string): string {
+export function contentFingerprint(text: string): string {
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index++) {
     hash ^= text.charCodeAt(index);
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(36);
+}
+
+export function rootContextComplete(context: RepositoryAnalysisContext, source: string): boolean {
+  const expected = source.split(/\r?\n/).map((line, index) => `${index + 1}\t${line}`).join('\n');
+  return context.snippets.some((snippet) => snippet.file === context.rootPath && snippet.kind === 'root' && snippet.content === expected);
 }
 
 function sampleRootText(text: string, charLimit: number): string {

@@ -58,6 +58,7 @@ export interface FixProposalRequest {
   onUndone?: () => void;
   /** Revalidates that the finding is still actionable immediately before writing. */
   canApply?: () => boolean;
+  validateBeforeWrite?: (undo: boolean) => Promise<void>;
 }
 
 interface ProposalView {
@@ -628,7 +629,7 @@ export class FixProposalPanel {
       ...(e.startLine ? { startLine: e.startLine } : {}),
       ...(e.endLine ? { endLine: e.endLine } : {}),
     }));
-    const ok = await this.applyEdits(reversed);
+    const ok = await this.applyEdits(reversed, true);
     if (!ok) {
       void vscode.window.showWarningMessage(m().fixPanel.undoRace);
       return;
@@ -661,7 +662,12 @@ export class FixProposalPanel {
    * must resolve via {@link resolveEditAt} (line-anchored verify, else strict
    * unique content match), or nothing is applied — never a fuzzy guess.
    */
-  private async applyEdits(edits: FixEdit[]): Promise<boolean> {
+  private async applyEdits(edits: FixEdit[], undo = false): Promise<boolean> {
+    try { await this.request.validateBeforeWrite?.(undo); }
+    catch (error) {
+      void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
+      return false;
+    }
     const doc = await vscode.workspace.openTextDocument(this.request.fileUri);
     const text = doc.getText();
     const edit = new vscode.WorkspaceEdit();
@@ -681,6 +687,7 @@ export class FixProposalPanel {
       });
       edit.replace(this.request.fileUri, new vscode.Range(start, end), r.replacement);
     }
+    if (!undo && this.request.canApply && !this.request.canApply()) return false;
     this.request.onWillChangeFile?.();
     try {
       const ok = await vscode.workspace.applyEdit(edit);

@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { m } from '../i18n';
+import { fmt, m } from '../i18n';
 import type { PullRequest, PrSummary } from './types';
 
 const pexec = promisify(execFile);
@@ -33,7 +33,7 @@ export function setGhTokenResolver(fn: GhTokenResolver): void {
   tokenResolver = fn;
 }
 
-async function runGh(args: string[], cwd: string): Promise<string> {
+async function runGh(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
   let env: NodeJS.ProcessEnv | undefined;
   if (tokenResolver) {
     const token = await tokenResolver(cwd).catch(() => undefined);
@@ -42,7 +42,7 @@ async function runGh(args: string[], cwd: string): Promise<string> {
     }
   }
   try {
-    const { stdout } = await pexec('gh', args, { cwd, env, maxBuffer: MAX_BUFFER, timeout: GH_TIMEOUT_MS });
+    const { stdout } = await pexec('gh', args, { cwd, env, maxBuffer: MAX_BUFFER, timeout: GH_TIMEOUT_MS, signal });
     return stdout;
   } catch (err) {
     const e = err as { stderr?: string; message?: string; killed?: boolean; signal?: string };
@@ -52,6 +52,25 @@ async function runGh(args: string[], cwd: string): Promise<string> {
     const msg = (e.stderr || e.message || String(err)).trim();
     throw new GhError(msg);
   }
+}
+
+export async function readGithubRequirement(
+  cwd: string,
+  owner: string,
+  repository: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{ title: string; body: string }> {
+  if (!/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1) {
+    throw new GhError(m().reviewCenter.unsupportedLink);
+  }
+  const raw = await runGh(['api', `repos/${owner}/${repository}/issues/${number}`], cwd, signal);
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== 'object' || !('title' in value) || typeof value.title !== 'string'
+    || !('body' in value) || (value.body !== null && typeof value.body !== 'string')) {
+    throw new GhError(fmt(m().reviewCenter.sourceReadFailed, `${owner}/${repository}#${number}`));
+  }
+  return { title: value.title, body: value.body ?? '' };
 }
 
 /** Throws GhError if the GitHub CLI is not installed / not on PATH. */
@@ -291,6 +310,7 @@ export async function submitPrReviewWithComments(
   verdict: 'approve' | 'request-changes' | 'comment',
   body: string,
   comments: { path: string; startLine: number; endLine: number; body: string }[],
+  expectedRepository?: string,
 ): Promise<void> {
   const repoJson = await runGh(['repo', 'view', '--json', 'owner,name'], cwd);
   let repo: { owner: { login: string }; name: string };
@@ -300,6 +320,7 @@ export async function submitPrReviewWithComments(
     throw new GhError(m().gh.repoViewParseFailed);
   }
   const slug = `${repo.owner.login}/${repo.name}`;
+  if (expectedRepository && slug !== expectedRepository) throw new GhError(m().reviewCenter.errors.staleResults);
   const event =
     verdict === 'approve' ? 'APPROVE' : verdict === 'request-changes' ? 'REQUEST_CHANGES' : 'COMMENT';
   const payload = {

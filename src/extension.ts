@@ -5,7 +5,16 @@ import {
   ReviewSession,
   type ReviewInvalidation,
 } from './review/reviewSession';
-import { WorkspaceStateReviewStore, type Annotation } from './review/reviewStore';
+import { WorkspaceStateReviewStore, type Annotation, type ReviewConclusion } from './review/reviewStore';
+import { ReviewCoordinator, type WorkflowFileResult } from './review/reviewCoordinator';
+import {
+  contentSignature, currentRequirements, includeReviewRequirement, materialText, requirementsConfirmed,
+  reviseReviewRequirement, workflowResultKey, WorkflowError, type ReviewVerdict, type ReviewWorkflowState,
+} from './review/reviewWorkflow';
+import { decodeRequirementSource } from './review/requirementSources';
+import { isBinaryReviewPath, repositoryEvidenceStamp, safeRepositoryUri } from './review/reviewSourceAccess';
+import * as nodePath from 'node:path';
+import { homedir } from 'node:os';
 import { pickModel, listModels, type PickedModel } from './ai/modelPicker';
 import { ModelProvider } from './ai/modelProvider';
 import {
@@ -41,29 +50,41 @@ import {
   type PickedScope,
   type PreferredScopeKind,
 } from './scope/scopePicker';
-import { FileSystemScope, PrByNumberScope } from './scope/scopes';
-import { currentBranch, headSha, listBranches, readFileAtRef, switchBranchTo } from './scope/gitClient';
+import { BranchComparisonScope, BranchSnapshotScope, FileSystemScope, PrByNumberScope } from './scope/scopes';
+import { currentBranch, decodeReviewText, findReviewReferenceFiles, headSha, listBranches, readFileAtRef, readReviewFileAtRef, reviewCommentRanges, switchBranchTo } from './scope/gitClient';
 import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
-import { submitPrReview, submitPrReviewWithComments } from './gh/ghClient';
+import { getPrByNumber, submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
-import { buildReviewReportMarkdown, type ReportData } from './ui/reviewReport';
+import { buildReviewReportMarkdown, composeReviewReport, type ReportData } from './ui/reviewReport';
 import { WorkbenchPanel, withWorkbenchProgress, type WorkbenchProgressReporter, type WorkbenchState, type WorkbenchFile, type FindingDispositionKind } from './ui/workbenchPanel';
-import { DocumentPanel, type DocDiffLine, type DocModel } from './ui/documentPanel';
+import { DocumentPanel, sourceRenderPlan, type DocDiffLine, type DocModel } from './ui/documentPanel';
+import type { CenterDocument, CenterFinding, ReviewCenterMessage, ReviewCenterState } from './ui/reviewCenter';
 import { FixProposalPanel } from './ui/fixProposalPanel';
-import { renderDocument, type DocumentRender } from './ui/documentRenderer';
+import { renderDocument, renderRequirementMarkdown, type DocumentRender } from './ui/documentRenderer';
 import { transientInfo, transientWarning } from './ui/toast';
 import {
   registerIgnoreReasonPasteCommand,
   showIgnoreReasonInput,
 } from './ui/ignoreReasonInput';
-import { m, onLanguageChange, resolveLanguage, type Language } from './i18n';
+import { fmt, m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 import { buildFullFileDiff } from './review/fullFileDiff';
 import {
   collectRelatedRepositoryContext,
+  contentFingerprint,
+  defaultRepositoryEvidenceServices,
+  rootContextComplete,
+  RELATED_CONTEXT_LIMITS,
   validateRepositoryAnalysisContext,
 } from './review/repositoryEvidence';
 
 let session: ReviewSession;
+let reviewCoordinator: ReviewCoordinator;
+let centerDocument: CenterDocument | undefined;
+let centerDocumentLoading = false;
+let centerSubmitting = false;
+let centerEpoch = 0;
+let centerStateCache: ReviewCenterState | undefined;
+let centerStateKey = '';
 const models = new ModelProvider();
 let workbenchSelected: string | undefined;
 /** Current git branch label for the active review, shown in the workbench HUD. */
@@ -117,6 +138,28 @@ const manualReloadTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function reviewEditKey(uri: vscode.Uri): string {
   return uri.fsPath.toLowerCase();
+}
+
+function canChangeReview(): boolean {
+  if (!centerSubmitting && !scopePickInFlight) return true;
+  centerNotice(centerSubmitting ? m().reviewCenter.submitting : m().reviewCenter.loadingTarget, true);
+  return false;
+}
+
+function annotationOwner(path: string): () => boolean {
+  const snapshot = session.snapshot;
+  const lifecycle = session.reviewLifecycleVersion;
+  const revision = docRenderCache.get(path)?.revision;
+  return () => lifecycle === session.reviewLifecycleVersion && snapshot === session.snapshot && revision === docRenderCache.get(path)?.revision;
+}
+
+function findingOwner(path: string, id: string): () => boolean {
+  const lifecycle = session.reviewLifecycleVersion;
+  const run = session.workflow?.run.id;
+  const finding = session.findings(path).find((item) => item.id === id);
+  return () => lifecycle === session.reviewLifecycleVersion && session.workflow?.run.id === run
+    && session.findings(path).find((item) => item.id === id) === finding
+    && (!session.workflow || session.workflowResultsCurrent);
 }
 
 function beginInternalReviewEdit(uri: vscode.Uri): void {
@@ -208,6 +251,7 @@ function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void
     return;
   }
   const rel = session.relPathInRepo(event.document.uri);
+  if (rel && activeDocTranslation?.path === rel) activeDocTranslation.cts.cancel();
   const inFlightDependency = !!rel && [...inFlightAnalysisDependencies.values()]
     .some((dependencies) => dependencies.has(rel));
   if (
@@ -224,6 +268,7 @@ function handleReviewDocumentChange(event: vscode.TextDocumentChangeEvent): void
     cts.cancel();
   }
   globalAnalysisCts?.cancel();
+  reviewCoordinator?.interruptReview();
   const invalidation = session.invalidateAfterFileChange(rel);
   reflectReviewInvalidation(invalidation, rel, true);
   if (!session.hasReviewFile(rel)) {
@@ -255,7 +300,7 @@ function fixKey(rel: string, findingId: string): string {
   const findingRef = index >= 0
     ? findingContentSignatures(findings)[index]
     : findingId;
-  const repository = hashString(
+  const repository = session.workflow?.repositoryKey ?? hashString(
     (session.getCwd() ?? session.getRepoName()).replaceAll('\\', '/').toLowerCase(),
   );
   return `${repository}::${rel}::${findingRef}`;
@@ -274,6 +319,7 @@ function getAppliedFix(
   if (current) {
     return current;
   }
+  if (session.workflow) return undefined;
   const legacyKey = legacyFixKey(rel, findingId);
   const legacy = appliedFixes.get(legacyKey);
   if (legacy) {
@@ -316,6 +362,7 @@ type PersistedScope =
   | { kind: 'folder'; cwd: string }
   | { kind: 'preferred'; cwd: string }
   | { kind: 'files'; cwd: string; relPaths: string[] }
+  | { kind: 'branch'; cwd: string; baseRef?: string }
   | { kind: 'pr'; cwd: string; number: number; reviewSet?: ReviewSet };
 /** Workspace memento bound in activate(); records the last review folder for restore. */
 let workspaceMemento: vscode.Memento | undefined;
@@ -808,6 +855,18 @@ export function activate(context: vscode.ExtensionContext): void {
   const repo = workspaceFolderName() ?? 'unknown';
   const store = new WorkspaceStateReviewStore(context.workspaceState);
   session = new ReviewSession(store, repo);
+  reviewCoordinator = new ReviewCoordinator(session, {
+    model: () => models.resolve(),
+    repositoryStamp: (token) => repositoryEvidenceStamp(requireReviewCwd(), requireReviewSet().headSha, token),
+    validateHashes: validateWorkflowHashes,
+    analyzeFile: analyzeWorkflowFile,
+    analyzeGlobal: analyzeWorkflowGlobal,
+    applyGlobal: applyWorkflowGlobal,
+    showSource: (path) => { if (!centerDocument || centerDocument.path === path) void openFileInPanel(path); },
+    changed: () => { centerEpoch++; WorkbenchPanel.refreshNow(); },
+    notice: centerNotice,
+    errorText: workflowErrorText,
+  });
   WorkbenchPanel.init(context.extensionUri);
 
   // Accumulate estimated LLM token usage onto the active review and refresh the
@@ -843,6 +902,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     session,
+    reviewCoordinator,
     vscode.commands.registerCommand('codereview.startReview', startReview),
     vscode.commands.registerCommand('codereview.openOrStart', openOrStartReview),
     vscode.commands.registerCommand('codereview.openInNewWindow', openInNewWindow),
@@ -1115,10 +1175,27 @@ async function loadPreferredReviewWithProgress(
 }
 
 async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<void> {
+  if (centerSubmitting) throw new Error(m().reviewCenter.submitting);
+  reviewCoordinator.resetScope();
+  closeScopeBoundPanels();
+  openFileGeneration++;
+  workbenchSelected = undefined;
+  centerDocument = undefined;
+  centerDocumentLoading = false;
+  activeDocTranslation?.cts.cancel();
+  docRenderCache.clear();
+  docDiffCache.clear();
+  baseTextCache.clear();
+  baseRenderCache.clear();
+  centerEpoch++;
   await session.start(reviewSet, cwd);
+  await session.enableWorkflow();
   await refreshBranchLabel();
   closeScopeBoundPanels();
   workbenchSelected = undefined;
+  centerDocument = undefined;
+  centerDocumentLoading = false;
+  centerEpoch++;
   docRenderCache.clear();
   docDiffCache.clear();
   baseTextCache.clear();
@@ -1139,6 +1216,8 @@ function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): stri
 }
 
 async function startReview(kind?: string): Promise<void> {
+  if (!canChangeReview()) return;
+  if (reviewCoordinator.editing) { centerNotice(m().reviewCenter.unsavedEdit, true); return; }
   const defaultCwd = preferredDefaultCwd ?? workspaceFolderPath();
   if (!defaultCwd) {
     void vscode.window.showErrorMessage(m().review.noGitWorkspace);
@@ -1149,11 +1228,17 @@ async function startReview(kind?: string): Promise<void> {
     return;
   }
   scopePickInFlight = true;
+  centerEpoch++;
+  WorkbenchPanel.refreshNow();
   let picked: PickedScope | undefined;
   try {
     picked = await pickScope(defaultCwd, WorkbenchPanel.viewColumn, kind);
   } finally {
-    scopePickInFlight = false;
+    if (!picked) {
+      scopePickInFlight = false;
+      centerEpoch++;
+      WorkbenchPanel.refreshNow();
+    }
   }
   if (!picked) {
     return;
@@ -1164,17 +1249,7 @@ async function startReview(kind?: string): Promise<void> {
     async () => {
       try {
         const reviewSet = await source.load(cwd);
-        await session.start(reviewSet, cwd);
-        await refreshBranchLabel();
-        closeScopeBoundPanels();
-        workbenchSelected = undefined;
-        docRenderCache.clear();
-        docDiffCache.clear();
-        baseTextCache.clear();
-        baseRenderCache.clear();
-        rehydrateAppliedFixes();
-        WorkbenchPanel.resetFolders();
-        layoutAppliedForCurrentReview = false;
+        await activateReviewSet(reviewSet, cwd);
         // Persist the exact scope so an extension/host restart can rebuild this
         // same selection (and hit its saved snapshot), not just the whole folder.
         persistScope(source, reviewSet, cwd);
@@ -1186,7 +1261,11 @@ async function startReview(kind?: string): Promise<void> {
         void vscode.window.showErrorMessage(m().review.error(message));
       }
     },
-  );
+  ).finally(() => {
+    scopePickInFlight = false;
+    centerEpoch++;
+    WorkbenchPanel.refreshNow();
+  });
 }
 
 /**
@@ -1200,7 +1279,9 @@ function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): v
   void workspaceMemento?.update(LAST_REVIEW_FOLDER_KEY, cwd);
   const prNumber = Number.parseInt(reviewSet.scopeId.match(/^pr-(\d+)$/)?.[1] ?? '', 10);
   const descriptor: PersistedScope =
-    source instanceof FileSystemScope
+    source instanceof BranchComparisonScope || source instanceof BranchSnapshotScope
+      ? { kind: 'branch', cwd, baseRef: source instanceof BranchComparisonScope ? source.baseRef : undefined }
+      : source instanceof FileSystemScope
       ? { kind: 'files', cwd, relPaths: reviewSet.files.map((f) => f.path) }
       : Number.isFinite(prNumber)
         ? { kind: 'pr', cwd, number: prNumber, reviewSet }
@@ -1209,8 +1290,9 @@ function persistScope(source: ReviewScope, reviewSet: ReviewSet, cwd: string): v
 }
 
 async function selectModel(): Promise<void> {
+  if (!canChangeReview()) return;
   const choice = await pickModel();
-  if (choice) {
+  if (choice && canChangeReview()) {
     models.set(choice);
     WorkbenchPanel.refreshIfOpen();
     transientInfo(m().model.switched(choice.label));
@@ -1247,6 +1329,7 @@ async function openDynMenu(kind: string): Promise<void> {
 
 /** Applies an inline model/branch choice dispatched from the workbench webview. */
 async function applyDynMenu(kind: string, id: string): Promise<void> {
+  if (!canChangeReview()) return;
   if (kind === 'model') {
     const choice = dynModelCache.get(id);
     if (choice) {
@@ -1284,6 +1367,7 @@ async function applyDynMenu(kind: string, id: string): Promise<void> {
  */
 /** Applies a language id chosen from the inline workbench menu. */
 async function applyLanguage(id: string): Promise<void> {
+  if (!canChangeReview()) return;
   const cur = vscode.workspace.getConfiguration('codereview').get<string>('language', 'en');
   if (id === cur) {
     return;
@@ -1377,6 +1461,7 @@ async function switchBranch(): Promise<void> {
  */
 /** Switches the review to the given workspace-folder cwd (from the inline menu). */
 async function switchProjectTo(cwd: string): Promise<void> {
+  if (!canChangeReview()) return;
   if (cwd === session.getCwd()) {
     return;
   }
@@ -1423,6 +1508,7 @@ async function switchProject(): Promise<void> {
 /** Builds the action callbacks the workbench webview dispatches to. */
 function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
   return {
+    center: (message) => { void handleReviewCenter(message).catch((error: unknown) => centerNotice(workflowErrorText(error), true)); },
     open: (path) => void openFileInPanel(path),
     openFocus: (path) => void (async () => { await openFileInPanel(path); DocumentPanel.focus(); })(),
     focusDoc: () => DocumentPanel.focus(),
@@ -1496,6 +1582,13 @@ async function restoreLastScope(
   progress?: WorkbenchProgressReporter,
 ): Promise<void> {
   const descriptor = workspaceMemento?.get<PersistedScope>(LAST_SCOPE_KEY);
+  if (descriptor?.kind === 'branch') {
+    try {
+      const source = descriptor.baseRef ? new BranchComparisonScope(descriptor.baseRef) : new BranchSnapshotScope();
+      await activateReviewSet(await source.load(descriptor.cwd), descriptor.cwd);
+    } catch (error) { reportError(error); }
+    return;
+  }
   if (descriptor?.kind === 'pr' || (descriptor?.kind === 'files' && descriptor.relPaths.length > 0)) {
     try {
       progress?.report(m().workbench.loadingSavedScope, 'restore');
@@ -1504,7 +1597,7 @@ async function restoreLastScope(
         const currentHead = descriptor.reviewSet
           ? await headSha(descriptor.cwd).catch(() => undefined)
           : undefined;
-        reviewSet = descriptor.reviewSet && currentHead === descriptor.reviewSet.headSha
+        reviewSet = descriptor.reviewSet?.prUrl && currentHead === descriptor.reviewSet.headSha
           ? descriptor.reviewSet
           : await new PrByNumberScope(descriptor.number).load(descriptor.cwd);
       } else {
@@ -1589,6 +1682,7 @@ function buildWorkbenchFile(file: ReviewFile): WorkbenchFile {
   const fileState = session.fileState(file.path);
   return {
     path: file.path,
+    context: file.context,
     name: file.path.split('/').pop() ?? file.path,
     dir: file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '',
     seen,
@@ -1602,6 +1696,435 @@ function buildWorkbenchFile(file: ReviewFile): WorkbenchFile {
     active: workbenchSelected === file.path,
     analyzing: analyzingPaths.has(file.path),
   };
+}
+
+function requireReviewSet(): ReviewSet {
+  if (!session.reviewSet) throw new WorkflowError('noReview');
+  return session.reviewSet;
+}
+
+function requireReviewCwd(): string {
+  const cwd = activeCwd();
+  if (!cwd) throw new WorkflowError('noReview');
+  return cwd;
+}
+
+function workflowErrorText(error: unknown): string {
+  if (error instanceof WorkflowError) {
+    return `${m().reviewCenter.errors[error.code]}${error.detail ? ` ${error.detail}` : ''}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function centerNotice(message: string, error = false): void {
+  if (!WorkbenchPanel.flashNotice(message, error ? 'error' : 'warn')) {
+    if (error) void vscode.window.showErrorMessage(message);
+    else transientInfo(message);
+  }
+}
+
+function workflowResultsCurrent(): boolean {
+  return session.workflowResultsCurrent;
+}
+
+function workflowFindingCurrent(path: string, finding: Finding): boolean {
+  return session.workflowFindingCurrent(path, finding);
+}
+
+function centerFindings(): CenterFinding[] {
+  const items: CenterFinding[] = [];
+  for (const file of requireReviewSet().files) {
+    const raw = session.findings(file.path);
+    const ids = findingContentSignatures(raw);
+    const localized = localizeFindingsNow(file.path, raw, resolveLanguage());
+    raw.forEach((finding, index) => {
+      const disposition = session.findingDisposition(file.path, finding.id);
+      const ref = `file:${file.path}#${ids[index]}`;
+      if (session.workflow?.run.business?.concerns.some((item) => item.findingRef === ref)) return;
+      items.push({
+        ...localized[index], path: file.path, ref, current: workflowFindingCurrent(file.path, finding),
+        disposition: disposition?.kind, dispositionReason: disposition?.reason,
+        applied: !!getAppliedFix(file.path, finding.id),
+      });
+    });
+  }
+  const report = session.globalReport;
+  if (report) {
+    const localized = localizeGlobalReportNow(report, resolveLanguage());
+    for (const spot of report.fixSpots) {
+      const disposition = session.globalFixDisposition(spot.id, spot.file, spot.line, spot.anchor);
+      items.push({
+        ...(localized.fixSpots.find((item) => item.id === spot.id) ?? spot),
+        path: spot.file, ref: `global:${spot.id}`, global: true,
+        current: workflowResultsCurrent() && !!session.workflow?.run.globalComplete,
+        disposition: disposition?.kind, dispositionReason: disposition?.reason,
+        applied: !!getAppliedFix(spot.file, spot.id),
+      });
+    }
+  }
+  return items.sort((a, b) => Number(b.current) - Number(a.current));
+}
+
+function centerReportBase(): string {
+  const workflow = session.workflow;
+  if (!workflow) throw new WorkflowError('noReview');
+  const set = requireReviewSet();
+  const current = workflowResultsCurrent();
+  const snapshot = structuredClone(workflow);
+  if (!current && snapshot.run.business) {
+    snapshot.run.business.requirements = [];
+    snapshot.run.business.chains = [];
+  }
+  const roots = new Set(set.files.filter((file) => !file.context).map((file) => file.path));
+  for (const path of workflow.run.completed) roots.add(path);
+  const coverage = session.totalCoverage();
+  const data: ReportData = {
+    workflow: snapshot, headSha: set.headSha, baseSha: set.comparison?.baseSha,
+    repo: session.getRepoName(), scopeLabel: set.label,
+    generatedAt: workflow.run.completedAt ?? workflow.run.startedAt ?? session.snapshot?.updatedAt ?? Date.now(),
+    coverage: { ...coverage, filesReady: current ? workflow.run.completed.length : 0, filesTotal: roots.size },
+    files: set.files.map((file) => ({
+      path: file.path,
+      findings: session.findings(file.path).filter((finding) => workflowFindingCurrent(file.path, finding)),
+      disposition: (id) => session.findingDisposition(file.path, id),
+      annotations: session.annotations(file.path),
+    })),
+    globalReport: current && workflow.run.globalComplete ? session.globalReport : undefined,
+    globalDisposition: (spot) => session.globalFixDisposition(spot.id, spot.file, spot.line, spot.anchor),
+  };
+  return buildReviewReportMarkdown(data, m().report, m().reviewCenter);
+}
+
+function centerCommentPreview(): string {
+  const comments = session.pendingComments.length ? session.pendingComments : session.conclusion?.inlineComments ?? [];
+  if (!comments.length) return '';
+  return `## ${m().reviewCenter.pendingComments}\n\n${comments.map((comment) =>
+    `### \`${comment.path}:${comment.startLine}${comment.endLine > comment.startLine ? `-${comment.endLine}` : ''}\`\n\n${comment.body}`,
+  ).join('\n\n')}`;
+}
+
+function centerPreview(notes: string): string {
+  return composeReviewReport(centerReportBase(), notes, m().reviewCenter.notes, centerCommentPreview());
+}
+
+function centerSubmissionSignature(verdict: ReviewVerdict, notes: string): string {
+  const comments = session.pendingComments.length ? session.pendingComments : session.conclusion?.inlineComments ?? [];
+  return contentSignature(JSON.stringify({
+    verdict, headSha: requireReviewSet().headSha, runId: session.workflow?.run.id,
+    body: composeReviewReport(centerReportBase(), notes, m().reviewCenter.notes),
+    comments: comments.map(({ path, startLine, endLine, body }) => ({ path, startLine, endLine, body })),
+  }));
+}
+
+function buildReviewCenterState(): ReviewCenterState {
+  const workflow = session.workflow;
+  if (!workflow) throw new WorkflowError('noReview');
+  const key = `${session.reviewContentVersion}:${centerEpoch}:${reviewCoordinator.version}:${resolveLanguage()}`;
+  if (centerStateCache && key === centerStateKey) return { ...centerStateCache, document: centerDocument };
+  const blockerText = (verdict: ReviewVerdict) => session.workflowBlockers(verdict).map((item) =>
+    `${m().reviewCenter.errors[item.code]}${item.detail ? ` ${item.detail}` : ''}`,
+  );
+  const extra = centerSubmitting ? [m().reviewCenter.submitting] : reviewCoordinator.editing ? [m().reviewCenter.unsavedEdit] : [];
+  const state: ReviewCenterState = {
+    version: ++centerEpoch, headSha: requireReviewSet().headSha, baseSha: requireReviewSet().comparison?.baseSha,
+    prNumber: /^pr-(\d+)$/.test(requireReviewSet().scopeId) ? Number(requireReviewSet().scopeId.slice(3)) : undefined,
+    workflow: {
+      ...workflow,
+      materials: workflow.materials.map((material) => ({ ...material, snapshots: [] })),
+      run: { ...workflow.run, hashes: {}, results: {} },
+    }, findings: centerFindings(),
+    requirementHtml: Object.fromEntries(workflow.understanding.requirements.map((item) => [item.id, renderRequirementMarkdown(item.text)])),
+    reportBase: centerReportBase(), commentPreview: centerCommentPreview(),
+    blockers: {
+      approve: [...blockerText('approve'), ...extra],
+      'request-changes': [...blockerText('request-changes'), ...extra],
+      comment: [...blockerText('comment'), ...extra],
+    },
+    current: workflowResultsCurrent(), requirementsConfirmed: requirementsConfirmed(workflow),
+    busy: centerDocumentLoading || reviewCoordinator.busy || centerSubmitting || scopePickInFlight,
+    submitting: centerSubmitting, progress: centerSubmitting ? m().reviewCenter.submitting : reviewCoordinator.progress,
+    loadingScope: scopePickInFlight,
+    document: centerDocument,
+  };
+  centerStateKey = `${session.reviewContentVersion}:${centerEpoch}:${reviewCoordinator.version}:${resolveLanguage()}`;
+  centerStateCache = state;
+  return state;
+}
+
+async function readWorkflowEvidenceText(path: string): Promise<string> {
+  const cwd = requireReviewCwd();
+  const set = requireReviewSet();
+  const file = session.reviewFile(path);
+  if (file?.status === 'deleted') {
+    if (!set.comparison) throw new WorkflowError('missingSource', path);
+    return readReviewFileAtRef(cwd, set.comparison.baseSha, file.previousPath ?? path);
+  }
+  if (isBinaryReviewPath(path)) throw new Error(m().reviewCenter.binaryExcluded);
+  if (set.headSha !== 'live') {
+    const absolute = nodePath.resolve(cwd, path);
+    if (!path || nodePath.isAbsolute(path) || !nodePath.relative(cwd, absolute) || nodePath.relative(cwd, absolute).startsWith('..')) {
+      throw new Error(m().reviewCenter.outsideRepository);
+    }
+    return readReviewFileAtRef(cwd, set.headSha, path);
+  }
+  const uri = await safeRepositoryUri(cwd, path);
+  const open = vscode.workspace.textDocuments.find((item) => item.uri.fsPath === uri.fsPath);
+  if (open) return open.getText();
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  return decodeReviewText(bytes);
+}
+
+async function validateWorkflowHashes(hashes: Readonly<Record<string, string>>): Promise<boolean> {
+  for (const [path, expected] of Object.entries(hashes)) {
+    if (contentFingerprint(await readWorkflowEvidenceText(path)) !== expected) return false;
+  }
+  return true;
+}
+
+async function analyzeWorkflowFile(
+  path: string, model: vscode.LanguageModelChat, workflow: ReviewWorkflowState, token: vscode.CancellationToken,
+): Promise<WorkflowFileResult> {
+  if (isBinaryReviewPath(path)) return { kind: 'excluded', reason: m().reviewCenter.binaryExcluded };
+  const source = await readWorkflowEvidenceText(path);
+  if (isDeletedReviewFile(path)) {
+    const stem = nodePath.basename(path).replace(/\.[^.]+$/, '');
+    const terms = [path, nodePath.basename(path), stem];
+    const references = await findReviewReferenceFiles(requireReviewCwd(), requireReviewSet().headSha, terms);
+    const allowed = new Set(await defaultRepositoryEvidenceServices.listReviewablePaths(requireReviewCwd()));
+    const candidates = references.filter((file) => allowed.has(file) && file !== path);
+    const hashes = { [path]: contentFingerprint(source) };
+    for (const file of candidates.slice(0, RELATED_CONTEXT_LIMITS.files - 1)) {
+      if (token.isCancellationRequested) throw new WorkflowError('staleResult');
+      hashes[file] = contentFingerprint(await readWorkflowEvidenceText(file));
+    }
+    return {
+      kind: 'deleted', hashes,
+      limitations: [m().reviewCenter.deletionReferenceBoundary, ...(candidates.length >= RELATED_CONTEXT_LIMITS.files ? [m().analysis.contextBudgetReached(m().analysis.contextLimitReason.files)] : [])],
+    };
+  }
+  const result = await analyzeByPath(path, { model, workflow, token });
+  if (!result) throw new WorkflowError('staleResult');
+  return result;
+}
+
+async function analyzeWorkflowGlobal(
+  model: vscode.LanguageModelChat, workflow: ReviewWorkflowState, token: vscode.CancellationToken,
+): Promise<GlobalReport> {
+  const paths = new Set([
+    ...requireReviewSet().files.filter((file) => !isBinaryReviewPath(file.path) && !workflow.run.excluded.some((item) => item.path === file.path)).map((file) => file.path),
+    ...Object.keys(workflow.run.hashes),
+  ]);
+  const context: GlobalContextFile[] = [];
+  const hashes: Record<string, string> = {};
+  for (const path of paths) {
+    if (token.isCancellationRequested) throw new WorkflowError('staleResult');
+    const content = await readWorkflowEvidenceText(path);
+    const hash = contentFingerprint(content);
+    if (workflow.run.hashes[path] && workflow.run.hashes[path] !== hash) throw new WorkflowError('staleResult', path);
+    hashes[path] = hash;
+    context.push({
+      path, content, status: session.reviewFile(path)?.status,
+      previousPath: session.reviewFile(path)?.previousPath,
+      findings: session.findings(path).filter((finding) => workflowFindingCurrent(path, finding)),
+    });
+  }
+  const report = await analyzeGlobal(model, context, token, workflow);
+  if (token.isCancellationRequested || session.workflow?.run.id !== workflow.run.id) throw new WorkflowError('staleResult');
+  if (!await validateWorkflowHashes(hashes)) throw new WorkflowError('staleResult');
+  await session.updateWorkflow((state) => { Object.assign(state.run.hashes, hashes); });
+  return report;
+}
+
+async function applyWorkflowGlobal(report: GlobalReport): Promise<void> {
+  session.addContextReviewFiles(report.fixSpots.map((spot) => spot.file));
+  migrateAppliedGlobalFixes(session.globalReport, report);
+  session.setGlobalReport(report);
+  const paths = session.reconcileGlobalVerdicts(report);
+  await Promise.all(paths.map((path) => refreshDocPanel(path)));
+}
+
+async function openCenterSource(path: string, evidenceOnly = false): Promise<void> {
+  const workflow = session.workflow;
+  if (!workflow || (!session.hasReviewFile(path) && !(evidenceOnly && path in workflow.run.hashes))) {
+    throw new WorkflowError('invalidReference', path);
+  }
+  if (isBinaryReviewPath(path)) { centerNotice(m().reviewCenter.binaryExcluded); return; }
+  const scope = workflow.scopeKey;
+  const generation = ++openFileGeneration;
+  const previous = workbenchSelected;
+  if (previous !== path) {
+    fixProposalOpenGeneration++;
+    FixProposalPanel.closeIfOpen();
+    activeDocTranslation?.cts.cancel();
+    centerDocument = undefined;
+  }
+  workbenchSelected = path;
+  centerDocumentLoading = true;
+  centerEpoch++;
+  WorkbenchPanel.refreshIfOpen(previous);
+  WorkbenchPanel.refreshIfOpen(path);
+  try {
+    const text = await readWorkflowEvidenceText(path);
+    if (generation !== openFileGeneration || session.workflow?.scopeKey !== scope) return;
+    const render = renderFor(path, text);
+    const diff = evidenceOnly ? undefined : await buildDocDiff(path, text);
+    if (generation !== openFileGeneration || session.workflow?.scopeKey !== scope) return;
+    if (diff) docDiffCache.set(path, diff);
+    const anchors = await computeFindingAnchors(path, text);
+    if (generation !== openFileGeneration || session.workflow?.scopeKey !== scope) return;
+    if (session.hasReviewFile(path)) session.setTotalLines(path, render.totalLines);
+    const model = buildDocModel(path, render, anchors, diff);
+    centerDocument = {
+      ...model, evidenceOnly, deleted: isDeletedReviewFile(path),
+      renderPlan: sourceRenderPlan(diff?.length ?? model.sourceLines.length, model.sourceLines.length),
+      annotationHtml: Object.fromEntries(model.annotations.map((annotation) => [annotation.id, renderRequirementMarkdown(annotation.content)])),
+    };
+    if (session.workflow.stage !== 'review') await session.updateWorkflow((state) => { state.stage = 'review'; }, false);
+  } finally {
+    if (generation === openFileGeneration) {
+      centerDocumentLoading = false;
+      centerEpoch++;
+      WorkbenchPanel.refreshNow();
+    }
+  }
+}
+
+async function handleReviewCenter(message: ReviewCenterMessage): Promise<void> {
+  const workflow = session.workflow;
+  if (!workflow || message.scopeKey !== workflow.scopeKey || message.runId !== workflow.run.id) throw new WorkflowError('staleResult');
+  if (centerSubmitting && !['ready', 'seen', 'read-source', 'client-error'].includes(message.action)) throw new Error(m().reviewCenter.submitting);
+  switch (message.action) {
+    case 'ready':
+      reviewCoordinator.setEditor(message.editing);
+      WorkbenchPanel.refreshNow();
+      return;
+    case 'editing': reviewCoordinator.setEditor(message.id); return;
+    case 'client-error': throw new Error(message.message);
+    case 'seen':
+      if (docRenderCache.get(message.path)?.revision === message.revision && session.hasReviewFile(message.path)) session.markSeen(message.path, message.lines);
+      return;
+    case 'stage': await session.updateWorkflow((state) => { state.stage = message.stage; }, false); return;
+    case 'text': await reviewCoordinator.putText(message.label, message.text, message.human); return;
+    case 'link': await reviewCoordinator.putLink(message.url); return;
+    case 'remove-source': await reviewCoordinator.removeSource(message.id); return;
+    case 'understand': await reviewCoordinator.understand(); return;
+    case 'cancel': await reviewCoordinator.cancel(); return;
+    case 'add-file': {
+      reviewCoordinator.assertInputsAvailable();
+      const scope = workflow.scopeKey;
+      const lifecycle = session.reviewLifecycleVersion;
+      const files = await vscode.window.showOpenDialog({
+        canSelectMany: false, filters: { 'Markdown / TXT': ['md', 'markdown', 'txt'] }, title: m().reviewCenter.addFile,
+      });
+      if (!files?.[0]) return;
+      const file = files[0];
+      const stat = await vscode.workspace.fs.stat(file);
+      if (stat.size > 256_000) throw new WorkflowError('materialTooLarge');
+      const text = decodeRequirementSource(file.fsPath, await vscode.workspace.fs.readFile(file));
+      if (lifecycle !== session.reviewLifecycleVersion || session.workflow?.scopeKey !== scope) throw new WorkflowError('staleResult');
+      await reviewCoordinator.putText(nodePath.basename(file.fsPath), text, false, file.fsPath, 'file');
+      return;
+    }
+    case 'read-source': {
+      const material = workflow.materials.find((item) => item.id === message.id);
+      if (!material) throw new WorkflowError('missingSource');
+      const text = materialText(material, message.version);
+      WorkbenchPanel.postCenter({
+        scopeKey: workflow.scopeKey, type: 'center-source', id: material.id, version: message.version,
+        title: fmt(m().reviewCenter.sourceSnapshot, material.label, message.version), html: renderRequirementMarkdown(text), text,
+      });
+      return;
+    }
+    case 'revise':
+      reviewCoordinator.assertInputsAvailable();
+      if (workflow.revision !== message.revision) throw new WorkflowError('staleResult');
+      await session.updateWorkflow((state) => reviseReviewRequirement(state, message.id, message.title, message.text));
+      if (session.workflow?.scopeKey !== message.scopeKey || session.workflow.run.id !== message.runId) throw new WorkflowError('staleResult');
+      reviewCoordinator.setEditor('');
+      return;
+    case 'include':
+      reviewCoordinator.assertInputsAvailable();
+      reviewCoordinator.assertNoDraft();
+      if (workflow.revision !== message.revision) throw new WorkflowError('staleResult');
+      await session.updateWorkflow((state) => includeReviewRequirement(state, message.id, message.included, message.reason));
+      return;
+    case 'run': await reviewCoordinator.run(message.confirmed, message.resume, message.revision); return;
+    case 'verdict':
+      if (workflow.verdict !== message.verdict) await session.updateWorkflow((state) => { state.verdict = message.verdict; });
+      return;
+    case 'notes':
+      if (workflow.notes !== message.text) await session.updateWorkflow((state) => { state.notes = message.text; }, workflow.notes.trim() !== message.text.trim());
+      return;
+    case 'copy': case 'save-report': {
+      if (message.notes.length > 64_000 || message.preview !== centerPreview(message.notes)) throw new WorkflowError('confirmationChanged');
+      if (message.action === 'copy') {
+        try {
+          await vscode.env.clipboard.writeText(message.preview);
+          centerNotice(m().reviewCenter.copied);
+        } catch (error) {
+          centerNotice(workflowErrorText(error), true);
+          WorkbenchPanel.postCenter({ scopeKey: workflow.scopeKey, type: 'center-copy-fallback', text: message.preview });
+        }
+      } else {
+        const file = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(nodePath.join(homedir(), 'Downloads', `review-${session.getRepoName()}-${requireReviewSet().headSha.slice(0, 8)}.md`)),
+          filters: { Markdown: ['md'] }, title: m().reviewCenter.download,
+        });
+        if (file) { await vscode.workspace.fs.writeFile(file, Buffer.from(message.preview)); centerNotice(m().reviewCenter.saved); }
+      }
+      return;
+    }
+    case 'submit': await submitCenterConclusion(message.verdict, message.notes, message.preview); return;
+    case 'fix': case 'undo-fix': case 'dispose': {
+      reviewCoordinator.assertInputsAvailable();
+      const finding = centerFindings().find((item) => item.path === message.path && item.id === message.id && item.ref === message.ref && !!item.global === message.global);
+      if (message.action === 'undo-fix') {
+        if (!finding?.applied) throw new WorkflowError('invalidReference');
+        if (await revertAppliedFix(message.path, message.id)) {
+          if (message.global) session.setGlobalFixDisposition(message.id, message.path, finding.line, finding.anchor, null);
+          else session.setFindingDisposition(message.path, message.id, null);
+          await refreshDocPanel(message.path);
+        }
+        return;
+      }
+      if (!finding?.current || !isActionableFinding(finding)) throw new WorkflowError('staleResults');
+      await reviewCoordinator.validateCurrentResults();
+      if (session.workflow?.scopeKey !== message.scopeKey || session.workflow.run.id !== message.runId) throw new WorkflowError('staleResult');
+      if (message.action === 'fix') {
+        if (message.global) await openGlobalFix(message.id, message.path, finding.line);
+        else await viewFixProposal(message.path, message.id);
+      } else if (message.global) await disposeGlobalFix(message.id, message.path, finding.line, message.kind);
+      else await disposeFinding(message.path, message.id, message.kind);
+      return;
+    }
+    case 'evidence':
+      await openCenterSource(message.path, true);
+      if (centerDocument?.path === message.path) WorkbenchPanel.postCenter({
+        scopeKey: workflow.scopeKey, type: 'center-reveal', path: message.path, revision: centerDocument.revision, line: message.line,
+      });
+      return;
+    case 'open-document':
+      if (!centerDocument || centerDocument.path !== message.path || centerDocument.evidenceOnly) throw new Error(m().reviewCenter.invalidAction);
+      DocumentPanel.show({ ...centerDocument, findings: [] }, docActions());
+      return;
+    case 'remove-annotation':
+      if (!session.hasReviewFile(message.path)) throw new WorkflowError('invalidReference');
+      session.removeAnnotation(message.path, message.id);
+      await refreshDocPanel(message.path);
+      return;
+    case 'document-action': {
+      const source = centerDocument;
+      if (!source || source.path !== message.path || source.revision !== message.revision || source.evidenceOnly || source.deleted) throw new WorkflowError('staleResult');
+      if (message.command === 'translateWhole') { await translateWholeDoc(message.path); return; }
+      const selected = source.raw.slice(message.start - 1, message.end).join('\n');
+      if (message.start < 1 || message.end < message.start || message.end > source.raw.length || !message.text.trim() || !selected.includes(message.text)) throw new WorkflowError('invalidReference');
+      if (message.command === 'translate') await annotateWithTranslation(message.path, message.start, message.end, message.text);
+      else if (message.command === 'explain') await annotateWithExplanation(message.path, message.start, message.end, message.text);
+      else if (message.command === 'note') await annotateWithNote(message.path, message.start, message.end, message.text);
+      else await addPrComment(message.path, message.start, message.end, message.text);
+      return;
+    }
+  }
 }
 
 function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState {
@@ -1641,7 +2164,7 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
       })
     : [];
 
-  return {
+  const state: WorkbenchState = {
     structureVersion,
     label: reviewSet?.label ?? m().review.notStarted,
     files: workbenchFilesCache,
@@ -1672,8 +2195,9 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
           byOp: session.tokenUsage.byOp,
         }
       : undefined,
-    conclusion: session.conclusion
+    conclusion: session.conclusion && (!session.workflow || session.conclusion.bodySignature === centerSubmissionSignature(session.conclusion.verdict, session.workflow.notes))
       ? {
+          verdict: session.conclusion.verdict,
           label: session.conclusion.label,
           target: session.conclusion.target,
           prNumber: session.conclusion.prNumber,
@@ -1681,10 +2205,17 @@ function buildWorkbenchState(changedPaths?: ReadonlySet<string>): WorkbenchState
         }
       : undefined,
   };
+  if (session.workflow) state.center = buildReviewCenterState();
+  return state;
 }
 
 /** Opens a review file in the document webview beside the workbench. */
 async function openFileInPanel(relPath: string): Promise<void> {
+  if (session.workflow) {
+    try { await openCenterSource(relPath); }
+    catch (error) { centerNotice(workflowErrorText(error), true); }
+    return;
+  }
   if (!ensureReviewPath(relPath, m().actions.open)) {
     return;
   }
@@ -1833,7 +2364,9 @@ async function buildDocDiff(
   if (file.status !== 'added') {
     const cacheKey = `${comparison.baseSha}:${basePath}`;
     if (!baseTextCache.has(cacheKey)) {
-      const loaded = await readFileAtRef(cwd, comparison.baseSha, basePath);
+      const loaded = session.workflow
+        ? await readReviewFileAtRef(cwd, comparison.baseSha, basePath)
+        : await readFileAtRef(cwd, comparison.baseSha, basePath);
       baseTextCache.set(cacheKey, loaded ?? null);
     }
     baseText = baseTextCache.get(cacheKey) ?? undefined;
@@ -1874,7 +2407,7 @@ function buildDocModel(
   diffLines?: DocDiffLine[],
 ): DocModel {
   const state = session.fileState(relPath);
-  const rawLines = render.isMarkdown ? deHighlight(render.sourceLines) : [];
+  const rawLines = render.raw;
   const lang = resolveLanguage();
   const findings = localizeFindingsNow(relPath, session.findings(relPath), lang);
   const annotations = localizeAnnotationsNow(relPath, session.annotations(relPath), lang);
@@ -1927,7 +2460,7 @@ function buildDocModel(
       content: a.content,
     })),
     analyzing: analyzingPaths.has(relPath),
-    translationHtml: workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY)?.[relPath],
+    translationHtml: workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY)?.[docTranslationKey(relPath, render.raw.join('\n'))],
   };
 }
 
@@ -2039,28 +2572,31 @@ function locateSnippetLines(
   return undefined;
 }
 
-/** Recovers raw source lines by stripping highlight markup. */
-function deHighlight(lines: string[]): string[] {
-  return lines.map((l) =>
-    l
-      .replace(/<[^>]+>/g, '')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&amp;/g, '&'),
-  );
-}
-
 /** Pushes an updated model into the document panel if it shows this file. */
 async function refreshDocPanel(relPath: string): Promise<void> {
+  if (session.workflow && centerDocument?.path === relPath) {
+    const render = docRenderCache.get(relPath);
+    if (render) {
+      const anchors = await computeFindingAnchors(relPath);
+      if (centerDocument?.path === relPath) {
+        const model = buildDocModel(relPath, render, anchors, docDiffCache.get(relPath));
+        centerDocument = {
+          ...centerDocument, ...model,
+          annotationHtml: Object.fromEntries(model.annotations.map((annotation) => [annotation.id, renderRequirementMarkdown(annotation.content)])),
+        };
+        centerEpoch++;
+        WorkbenchPanel.refreshNow();
+      }
+    }
+  }
   const render = docRenderCache.get(relPath);
   if (render && DocumentPanel.currentPath === relPath) {
     const anchors = await computeFindingAnchors(relPath);
     if (DocumentPanel.currentPath !== relPath) {
       return;
     }
-    DocumentPanel.update(buildDocModel(relPath, render, anchors, docDiffCache.get(relPath)));
+    const model = buildDocModel(relPath, render, anchors, docDiffCache.get(relPath));
+    DocumentPanel.update(session.workflow ? { ...model, findings: [] } : model);
     void ensureDocLocalized(relPath);
   }
 }
@@ -2071,6 +2607,11 @@ async function refreshDocPanel(relPath: string): Promise<void> {
  * (e.g. a Copilot fix was applied).
  */
 async function reloadDocPanel(relPath: string): Promise<void> {
+  if (session.workflow && centerDocument?.path === relPath) {
+    docRenderCache.delete(relPath);
+    docDiffCache.delete(relPath);
+    await openCenterSource(relPath, centerDocument.evidenceOnly);
+  }
   if (!isReviewPath(relPath)) {
     docRenderCache.delete(relPath);
     docDiffCache.delete(relPath);
@@ -2117,7 +2658,7 @@ async function revertAppliedFix(rel: string, findingId: string): Promise<boolean
   if (!cwd) {
     return false;
   }
-  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+  const fileUri = session.workflow ? await safeRepositoryUri(cwd, rel) : vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   try {
     const doc = await vscode.workspace.openTextDocument(fileUri);
     const text = doc.getText();
@@ -2151,10 +2692,10 @@ function docActions() {
   return {
     seen: (path: string, lines: number[]) => session.markSeen(path, lines),
     translate: (path: string, startLine: number, endLine: number, text: string) =>
-      void annotateWithTranslation(path, startLine, endLine, text),
-    translateWhole: (path: string) => void translateWholeDoc(path),
+      void annotateWithTranslation(path, startLine, endLine, text).catch(reportError),
+    translateWhole: (path: string) => void translateWholeDoc(path).catch(reportError),
     explain: (path: string, startLine: number, endLine: number, text: string) =>
-      void annotateWithExplanation(path, startLine, endLine, text),
+      void annotateWithExplanation(path, startLine, endLine, text).catch(reportError),
     note: (path: string, startLine: number, endLine: number, text: string) =>
       void annotateWithNote(path, startLine, endLine, text),
     comment: (path: string, startLine: number, endLine: number, text: string) =>
@@ -2195,12 +2736,21 @@ function newAnnotationId(): string {
  * comment is not posted immediately; it is accumulated and submitted together
  * with the conclusion. Only available while reviewing a PR.
  */
+async function canPostInlineComment(path: string, start: number, end: number): Promise<boolean> {
+  const set = requireReviewSet();
+  const file = session.reviewFile(path);
+  if (!file || file.context || file.status === 'deleted' || !set.comparison) return false;
+  const ranges = await reviewCommentRanges(requireReviewCwd(), set.comparison.baseSha, set.headSha, file);
+  return ranges.some((range) => start >= range.start && end <= range.end);
+}
+
 async function addPrComment(
   relPath: string,
   startLine: number,
   endLine: number,
   selectedText: string,
 ): Promise<void> {
+  const current = annotationOwner(relPath);
   if (!session.reviewSet) {
     transientWarning(m().review.notStartedWarn);
     return;
@@ -2268,6 +2818,14 @@ async function addPrComment(
   if (!body) {
     return;
   }
+  if (!current()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
+  const inline = !session.workflow || await canPostInlineComment(relPath, startLine, endLine);
+  if (!current()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
+  if (!inline) {
+    recordLocalCommentNote(relPath, { line: startLine, endLine, anchor: selectedText, title: m().reviewCenter.reviewComment, detail: body });
+    centerNotice(m().reviewCenter.commentInBody);
+    return;
+  }
   session.addPendingComment({
     id: `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     path: relPath,
@@ -2283,6 +2841,10 @@ async function addPrComment(
 /** Persisted cache of whole-document translations for the side-by-side view (path → translated reading HTML). */
 const DOC_TR_KEY = 'codereview.docTranslation.v3';
 
+function docTranslationKey(path: string, text: string): string {
+  return session.workflow ? `${session.workflow.repositoryKey}:${path}:${contentSignature(text.replace(/\r\n/g, '\n'))}` : path;
+}
+
 /**
  * Translates a whole Markdown document once and renders it to reading HTML for
  * the RIGHT column of the side-by-side bilingual view. The original (left column)
@@ -2290,26 +2852,25 @@ const DOC_TR_KEY = 'codereview.docTranslation.v3';
  * alignment — the whole doc is translated as one Markdown document.
  */
 async function translateWholeDoc(path: string): Promise<void> {
-  const model = await models.resolve();
-  if (!model) {
-    DocumentPanel.flashNotice(path, m().model.noModel, 'error');
-    return;
-  }
+  const current = annotationOwner(path);
+  const text = await readReviewFileText(path);
+  if (!current()) throw new WorkflowError('staleResult');
+  const key = docTranslationKey(path, text);
   const store = workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY) ?? {};
-  if (store[path]) {
-    DocumentPanel.postWholeTranslation(path, store[path], true);
+  if (store[key]) {
+    DocumentPanel.postWholeTranslation(path, store[key], true);
+    await refreshDocPanel(path);
     return;
   }
   // De-dupe: a translation for THIS file is already running (e.g. the reviewer
   // toggled reading/source repeatedly before it finished). Don't start another.
-  if (activeDocTranslation?.path === path) {
+  if (activeDocTranslation?.path === path && !activeDocTranslation.cts.token.isCancellationRequested) {
     return;
   }
   // Switching files: cancel the previous file's in-flight translation so stale
   // translations don't pile up and compete for the model.
   activeDocTranslation?.cts.cancel();
   activeDocTranslation?.cts.dispose();
-  const text = await readReviewFileText(path);
   if (!text.trim()) {
     activeDocTranslation = undefined;
     return;
@@ -2317,9 +2878,12 @@ async function translateWholeDoc(path: string): Promise<void> {
   const cts = new vscode.CancellationTokenSource();
   activeDocTranslation = { path, cts };
   try {
+    const model = await models.resolve();
+    if (!model) throw new AnalysisError(m().model.noModel);
+    if (!current() || cts.token.isCancellationRequested) return;
     let lastPost = 0;
     const translated = await translateMarkdown(model, text, cts.token, (acc) => {
-      if (cts.token.isCancellationRequested) {
+      if (cts.token.isCancellationRequested || !current()) {
         return;
       }
       // Stream the accumulating translation to the right column (throttled).
@@ -2329,16 +2893,18 @@ async function translateWholeDoc(path: string): Promise<void> {
         DocumentPanel.postWholeTranslation(path, acc, false);
       }
     });
-    if (cts.token.isCancellationRequested) {
+    if (cts.token.isCancellationRequested || !current()) {
       return;
     }
     const html = renderDocument(translated, 'markdown', path.split('/').pop() ?? path).readingHtml ?? '';
-    store[path] = html;
-    void workspaceMemento?.update(DOC_TR_KEY, store);
+    store[key] = html;
+    await workspaceMemento?.update(DOC_TR_KEY, store);
     DocumentPanel.postWholeTranslation(path, html, true);
+    await refreshDocPanel(path);
   } catch (err) {
     if (!cts.token.isCancellationRequested) {
       DocumentPanel.flashNotice(path, String((err as Error)?.message ?? err), 'error');
+      centerNotice(workflowErrorText(err), true);
     }
   } finally {
     if (activeDocTranslation?.cts === cts) {
@@ -2356,6 +2922,7 @@ async function annotateWithTranslation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const current = annotationOwner(path);
   // Reuse an existing translation for the same selection (see explanation note).
   const existing = findAnnotation(path, 'translate', text, startLine);
   if (existing) {
@@ -2378,6 +2945,7 @@ async function annotateWithTranslation(
     async (_p, token) => {
       try {
         const content = await translateSelection(model, text, token);
+        if (!current()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
         const annotation: Annotation = {
           id: newAnnotationId(),
           kind: 'translate',
@@ -2454,6 +3022,7 @@ async function annotateWithExplanation(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const current = annotationOwner(path);
   // Reuse an existing explanation for the same selection instead of calling the
   // model again (which would append a second, differently-worded card). The
   // result is persisted, so the saved one is what the user asked to "explain".
@@ -2478,6 +3047,7 @@ async function annotateWithExplanation(
     async (_p, token) => {
       try {
         const content = await explainCode(model, text, token);
+        if (!current()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
         const annotation: Annotation = {
           id: newAnnotationId(),
           kind: 'explain',
@@ -2505,6 +3075,7 @@ async function annotateWithNote(
   endLine: number,
   text: string,
 ): Promise<void> {
+  const current = annotationOwner(path);
   const note = await vscode.window.showInputBox({
     title: m().annotation.addTitle,
     prompt: startLine > 0 ? m().annotation.linePrompt(startLine, endLine) : m().annotation.selectionPrompt,
@@ -2513,6 +3084,7 @@ async function annotateWithNote(
   if (!note) {
     return;
   }
+  if (!current()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
   const annotation: Annotation = {
     id: newAnnotationId(),
     kind: 'note',
@@ -2531,6 +3103,10 @@ async function annotateWithNote(
  * (which includes unsaved edits) over the on-disk copy.
  */
 async function readReviewFileText(relPath: string, strict = false): Promise<string> {
+  if (session.workflow) {
+    if (!session.hasReviewFile(relPath)) throw new WorkflowError('invalidReference', relPath);
+    return readWorkflowEvidenceText(relPath);
+  }
   if (!ensureReviewPath(relPath, m().actions.read)) {
     return '';
   }
@@ -2566,7 +3142,16 @@ async function analyzeCurrentFile(): Promise<void> {
 }
 
 /** Analyzes a specific review file by its relative path. */
-async function analyzeByPath(rel: string): Promise<void> {
+async function analyzeByPath(
+  rel: string,
+  options?: { model: vscode.LanguageModelChat; workflow: ReviewWorkflowState; token: vscode.CancellationToken },
+): Promise<WorkflowFileResult | undefined> {
+  if (centerSubmitting) { centerNotice(m().reviewCenter.submitting, true); return; }
+  if (session.workflow && !options) {
+    try { await reviewCoordinator.run(false, true, session.workflow.revision, new Set([rel])); }
+    catch (error) { centerNotice(workflowErrorText(error), true); }
+    return;
+  }
   if (!ensureReviewPath(rel, m().actions.analyze)) {
     return;
   }
@@ -2574,7 +3159,7 @@ async function analyzeByPath(rel: string): Promise<void> {
     transientInfo(m().analysis.deletedFileHandled(rel));
     return;
   }
-  if (analyzingPaths.has(rel)) {
+  if (analyzingPaths.has(rel) && !fileAnalysisCts.get(rel)?.token.isCancellationRequested) {
     transientInfo(m().analysis.inProgress(rel));
     return;
   }
@@ -2586,7 +3171,7 @@ async function analyzeByPath(rel: string): Promise<void> {
   if (!reviewSet) {
     return;
   }
-  const model = await models.resolve();
+  const model = options?.model ?? await models.resolve();
   if (session.reviewSet !== reviewSet || activeCwd() !== cwd) {
     return;
   }
@@ -2599,9 +3184,11 @@ async function analyzeByPath(rel: string): Promise<void> {
 
   let document: vscode.TextDocument;
   try {
-    const uri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+    const uri = options ? await safeRepositoryUri(cwd, rel) : vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
     document = await vscode.workspace.openTextDocument(uri);
-  } catch {
+    if (options && document.getText() !== await readWorkflowEvidenceText(rel)) throw new Error(m().reviewCenter.snapshotMismatch);
+  } catch (error) {
+    if (options) throw error;
     if (!DocumentPanel.flashNotice(rel, m().analysis.cannotOpen(rel), 'error')) {
       void vscode.window.showWarningMessage(m().analysis.cannotOpen(rel));
     }
@@ -2617,6 +3204,8 @@ async function analyzeByPath(rel: string): Promise<void> {
   const documentVersion = document.version;
   analyzingPaths.add(rel);
   const cts = new vscode.CancellationTokenSource();
+  const cancellation = options?.token.onCancellationRequested(() => cts.cancel());
+  if (options?.token.isCancellationRequested) cts.cancel();
   fileAnalysisCts.set(rel, cts);
   WorkbenchPanel.refreshIfOpen(rel);
   // Progress + result feedback lives in the document view (current window), not a
@@ -2624,6 +3213,8 @@ async function analyzeByPath(rel: string): Promise<void> {
   // The 「基于此文件分析」 button shows an indeterminate progress bar via setAnalyzing.
   DocumentPanel.setAnalyzing(rel, true);
   let ok = false;
+  let hashes: Record<string, string> = {};
+  let complete = true;
   try {
     const repositoryAware =
       vscode.workspace
@@ -2631,7 +3222,9 @@ async function analyzeByPath(rel: string): Promise<void> {
         .get<'auto' | 'off'>('repositoryAwareAnalysis', 'auto') !== 'off';
     const stillCurrent = () =>
       !cts.token.isCancellationRequested
-      && session.reviewSet === reviewSet
+      && (options
+        ? session.workflow?.scopeKey === options.workflow.scopeKey && session.workflow?.run.id === options.workflow.run.id
+        : session.reviewSet === reviewSet)
       && activeCwd() === cwd
       && document.version === documentVersion
       && fileAnalysisCts.get(rel) === cts;
@@ -2639,13 +3232,17 @@ async function analyzeByPath(rel: string): Promise<void> {
     let affectedFiles: string[];
     if (repositoryAware) {
       DocumentPanel.setAnalysisStage(rel, m().analysis.buildingRelatedContext);
+      const services = options ? {
+        ...defaultRepositoryEvidenceServices,
+        readText: (uri: vscode.Uri) => readWorkflowEvidenceText(nodePath.relative(cwd, uri.fsPath).replaceAll('\\', '/')),
+      } : defaultRepositoryEvidenceServices;
       let context = await collectRelatedRepositoryContext({
         cwd,
         sourcePath: rel,
         sourceDocument: document,
         preferredPaths: reviewSet?.files.map((file) => file.path),
         token: cts.token,
-      });
+      }, services);
       if (!stillCurrent()) {
         return;
       }
@@ -2666,11 +3263,13 @@ async function analyzeByPath(rel: string): Promise<void> {
       }
       inFlightAnalysisDependencies.set(rel, new Set(context.files));
       DocumentPanel.setAnalysisStage(rel, m().analysis.findingRelatedBugs);
-      const candidates = await analyzeRootedRepository(model, context, cts.token);
+      complete = rootContextComplete(context, document.getText());
+      hashes = context.fileHashes;
+      const candidates = await analyzeRootedRepository(model, context, cts.token, options?.workflow);
       if (!stillCurrent()) {
         return;
       }
-      if (!await validateRepositoryAnalysisContext(context, cwd, cts.token)) {
+      if (!await validateRepositoryAnalysisContext(context, cwd, cts.token, services)) {
         throw new AnalysisError(m().analysis.relatedCodeChanged);
       }
       if (!stillCurrent()) {
@@ -2688,6 +3287,7 @@ async function analyzeByPath(rel: string): Promise<void> {
             'repositoryContextTokenBudget',
             DEFAULT_REPOSITORY_CONTEXT_TOKEN_BUDGET,
           ),
+        options?.workflow,
       );
       if (!stillCurrent()) {
         return;
@@ -2696,6 +3296,7 @@ async function analyzeByPath(rel: string): Promise<void> {
         context,
         candidates,
         verifications,
+        !!options,
       );
       const invalidatesGlobal = !!session.globalReport;
       const update = session.setRootedFindings(
@@ -2714,11 +3315,12 @@ async function analyzeByPath(rel: string): Promise<void> {
       summary = result.summary;
     } else {
       DocumentPanel.setAnalysisStage(rel, m().analysis.analyzingCurrentFile);
-      const candidates = await analyzeFile(model, document, cts.token);
+      hashes = { [rel]: contentFingerprint(document.getText()) };
+      const candidates = await analyzeFile(model, document, cts.token, options?.workflow);
       if (!stillCurrent()) {
         return;
       }
-      const result = finalizeFileAnalysis(candidates, [], false);
+      const result = finalizeFileAnalysis(candidates, [], false, !!options);
       const invalidatesGlobal = !!session.globalReport;
       const update = session.setRootedFindings(
         rel,
@@ -2745,6 +3347,8 @@ async function analyzeByPath(rel: string): Promise<void> {
     }
     await Promise.all(affectedFiles.map((file) => refreshDocPanel(file)));
     ok = true;
+    session.setTotalLines(rel, document.lineCount);
+    if (options) return { kind: 'analyzed', hashes, summary, complete };
     DocumentPanel.flashNotice(
       rel,
       repositoryAware
@@ -2769,12 +3373,14 @@ async function analyzeByPath(rel: string): Promise<void> {
       7000,
     );
   } catch (err) {
+    if (options) throw err;
     const message =
       err instanceof AnalysisError ? err.message : String((err as Error)?.message ?? err);
     if (!DocumentPanel.flashNotice(rel, m().review.error(message), 'error')) {
       reportError(err);
     }
   } finally {
+    cancellation?.dispose();
     if (fileAnalysisCts.get(rel) === cts) {
       fileAnalysisCts.delete(rel);
       inFlightAnalysisDependencies.delete(rel);
@@ -2784,6 +3390,7 @@ async function analyzeByPath(rel: string): Promise<void> {
     }
     cts.dispose();
   }
+  return undefined;
 }
 
 /**
@@ -2792,12 +3399,22 @@ async function analyzeByPath(rel: string): Promise<void> {
  * `fixed`. This does NOT itself change the disposition — it's a pure entry point
  * shared by the "Copilot 修复" button and the clickable finding header.
  */
+function fixWriteValidator(cwd: string, path: string, lifecycle: number): (undo: boolean) => Promise<void> {
+  return async (undo) => {
+    if (session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
+    await safeRepositoryUri(cwd, path);
+    if (!undo && session.workflow) await reviewCoordinator.validateCurrentResults();
+    if (session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
+  };
+}
+
 async function openFixProposal(
   rel: string,
   finding: Finding,
   options?: { cacheOnly?: boolean },
 ): Promise<void> {
   const openGeneration = ++fixProposalOpenGeneration;
+  const lifecycle = session.reviewLifecycleVersion;
   const cwd = activeCwd();
   if (!cwd) {
     return;
@@ -2814,9 +3431,10 @@ async function openFixProposal(
   if (openGeneration !== fixProposalOpenGeneration) {
     return;
   }
-  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
+  const fileUri = session.workflow ? await safeRepositoryUri(cwd, rel) : vscode.Uri.joinPath(vscode.Uri.file(cwd), rel);
   FixProposalPanel.show({
     rel,
+    validateBeforeWrite: fixWriteValidator(cwd, rel, lifecycle),
     localizationScope: { kind: 'file', rel },
     cacheKey: fixProposalCacheKey(rel, finding),
     fileUri,
@@ -2837,6 +3455,7 @@ async function openFixProposal(
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();
+      if (token.isCancellationRequested || session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
       if (!model) {
         const prompt = composeFixPrompt(finding);
         try {
@@ -2847,6 +3466,7 @@ async function openFixProposal(
         throw new Error(m().fix.noModelClipboard);
       }
       const content = await readReviewFileText(rel);
+      if (token.isCancellationRequested || session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
       return generateFixProposals(
         model,
         rel,
@@ -2861,6 +3481,7 @@ async function openFixProposal(
         },
         token,
         userContext,
+        session.workflow,
       );
     },
     onApplied: (edit) => {
@@ -2888,7 +3509,7 @@ async function openFixProposal(
     },
     canApply: () => {
       const current = session.findings(rel).find((item) => item.id === findingId);
-      return !!current && isActionableFinding(current);
+      return !!current && isActionableFinding(current) && (!session.workflow || (session.workflow.run.status !== 'running' && workflowFindingCurrent(rel, current)));
     },
     onUndone: () => {
       deleteAppliedFixKeys(appliedFixKey, legacyAppliedFixKey);
@@ -2950,6 +3571,7 @@ async function viewFixProposal(
  * and persists the result so the gate can advance.
  */
 async function disposeFinding(rel: string, findingId: string, kind: FindingDispositionKind): Promise<void> {
+  const currentFinding = findingOwner(rel, findingId);
   const reviewSet = session.reviewSet;
   if (!reviewSet) {
     return;
@@ -3006,6 +3628,13 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
   } else if (kind === 'commented') {
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
     const body = composeCommentBody(displayFinding);
+    const inline = !session.workflow || await canPostInlineComment(rel, liveRange?.startLine ?? finding.line, liveRange?.stopLine ?? finding.endLine ?? finding.line);
+    if (!currentFinding()) throw new WorkflowError('staleResult');
+    if (prMatch && !inline) {
+      session.setFindingDisposition(rel, findingId, { kind: 'commented', ref: 'report-body', reason: m().reviewCenter.commentInBody, at: Date.now() });
+      centerNotice(m().reviewCenter.commentInBody);
+      return;
+    }
     if (prMatch) {
       // Accumulate into the pending review (posted together on conclusion),
       // instead of firing an immediate standalone comment.
@@ -3043,6 +3672,7 @@ async function disposeFinding(rel: string, findingId: string, kind: FindingDispo
     if (!reason) {
       return;
     }
+    if (!currentFinding()) { centerNotice(m().reviewCenter.changedDuringReview, true); return; }
     session.setFindingDisposition(rel, findingId, {
       kind: 'ignored',
       reason: reason.trim(),
@@ -3083,7 +3713,9 @@ function fixProposalCacheKey(rel: string, finding: Finding): string {
   // a different scope/headSha) still hits the cached proposal instead of
   // regenerating. The finding hash already shifts when the file's content moves
   // the finding, so a genuinely stale proposal misses on its own.
-  const repoPart = session.getRepoName() || 'no-repo';
+  const repoPart = session.workflow
+    ? `${session.workflow.repositoryKey}:${workflowResultKey(session.workflow)}:${session.workflow.run.repositoryStamp ?? ''}`
+    : session.getRepoName() || 'no-repo';
   const findingPart = [
     finding.id,
     finding.line,
@@ -3129,6 +3761,12 @@ function recordLocalCommentNote(
 }
 
 async function runGlobalAnalysis(): Promise<void> {
+  if (!canChangeReview()) return;
+  if (session.workflow) {
+    try { await reviewCoordinator.run(false, true, session.workflow.revision); }
+    catch (error) { centerNotice(workflowErrorText(error), true); }
+    return;
+  }
   const reviewSet = session.reviewSet;
   if (!reviewSet) {
     WorkbenchPanel.setGlobalProgress(false);
@@ -3253,6 +3891,10 @@ async function switchToFileReview(): Promise<void> {
 }
 
 function showGlobalReport(): void {
+  if (session.workflow) {
+    void submitConclusion().catch(reportError);
+    return;
+  }
   const report = session.globalReport;
   if (!report) {
     transientInfo(m().global.noReport);
@@ -3316,6 +3958,7 @@ function globalFixAnchor(spotId: string): string | undefined {
  */
 async function openGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
   const openGeneration = ++fixProposalOpenGeneration;
+  const lifecycle = session.reviewLifecycleVersion;
   if (!ensureReviewPath(file, m().actions.analyze)) {
     return;
   }
@@ -3344,7 +3987,7 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   if (openGeneration !== fixProposalOpenGeneration) {
     return;
   }
-  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
+  const fileUri = session.workflow ? await safeRepositoryUri(cwd, file) : vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
   const appliedFixKey = fixKey(file, spotId);
   const legacyAppliedFixKey = legacyFixKey(file, spotId);
   const findingLike: Finding = {
@@ -3359,8 +4002,9 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
   };
   FixProposalPanel.show({
     rel: file,
+    validateBeforeWrite: fixWriteValidator(cwd, file, lifecycle),
     localizationScope: { kind: 'global' },
-    cacheKey: `global::${session.getRepoName()}::${file}::${hashString(spotId + spot.title + spot.detail)}`,
+    cacheKey: `global::${session.workflow ? `${session.workflow.repositoryKey}:${workflowResultKey(session.workflow)}:${session.workflow.run.repositoryStamp ?? ''}` : session.getRepoName()}::${file}::${hashString(spotId + spot.title + spot.detail)}`,
     fileUri,
     finding: {
       id: spotId,
@@ -3383,11 +4027,13 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
     },
     generate: async (token, userContext) => {
       const model = await models.resolve();
+      if (token.isCancellationRequested || session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
       if (!model) {
         throw new Error(m().fix.noModelClipboard);
       }
       const content = await readReviewFileText(file);
-      return generateFixProposals(model, file, content, findingLike, token, userContext);
+      if (token.isCancellationRequested || session.reviewLifecycleVersion !== lifecycle) throw new WorkflowError('staleResult');
+      return generateFixProposals(model, file, content, findingLike, token, userContext, session.workflow);
     },
     onApplied: (edit) => {
       setAppliedFix(appliedFixKey, edit);
@@ -3420,7 +4066,8 @@ async function openGlobalFix(spotId: string, file: string, _line: number): Promi
         await locateInFile(file, spot.line, spot.endLine, spotId, spot.anchor);
       })();
     },
-    canApply: () => !!session.globalReport?.fixSpots.some((item) => item.id === spotId),
+    canApply: () => !!session.globalReport?.fixSpots.some((item) => item.id === spotId && isActionableFinding(item))
+      && (!session.workflow || (session.workflow.run.status !== 'running' && workflowResultsCurrent() && session.workflow.run.globalComplete)),
   });
 }
 
@@ -3437,6 +4084,8 @@ async function disposeGlobalFix(
   _line: number,
   kind: 'commented' | 'ignored',
 ): Promise<void> {
+  const lifecycle = session.reviewLifecycleVersion;
+  const runId = session.workflow?.run.id;
   const reviewSet = session.reviewSet;
   if (!reviewSet) {
     return;
@@ -3475,6 +4124,13 @@ async function disposeGlobalFix(
   if (kind === 'commented') {
     const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
     const body = composeCommentBody(findingLike);
+    const inline = !session.workflow || await canPostInlineComment(file, liveRange.startLine, liveRange.stopLine);
+    if (lifecycle !== session.reviewLifecycleVersion || runId !== session.workflow?.run.id) throw new WorkflowError('staleResult');
+    if (prMatch && !inline) {
+      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, { kind: 'commented', ref: 'report-body', reason: m().reviewCenter.commentInBody, at: Date.now() });
+      centerNotice(m().reviewCenter.commentInBody);
+      return;
+    }
     if (prMatch) {
       // Accumulate into the pending review, posted together on conclusion.
       const commentId = `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3885,96 +4541,98 @@ function jumpToNextUnseenCurrent(): void {
 }
 
 async function submitConclusion(): Promise<void> {
-  if (!session.reviewSet) {
+  if (!session.workflow || !session.reviewSet) {
     transientWarning(m().review.notStartedWarn);
     return;
   }
-  if (!session.gatePassed()) {
-    const c = session.totalCoverage();
-    const reasons: string[] = [];
-    if (c.filesReady < c.filesTotal) {
-      reasons.push(m().conclusion.gateFilesUnready(c.filesTotal - c.filesReady));
-    }
-    if (!session.globalConfirmed) {
-      reasons.push(m().conclusion.gateGlobalUnconfirmed);
-    }
-    void vscode.window.showWarningMessage(m().conclusion.gateFailed(reasons.join(m().common.listSep)));
-    return;
-  }
+  await session.updateWorkflow((state) => { state.stage = 'conclusion'; }, false);
+  await openWorkbench();
+}
 
-  const choice = await vscode.window.showQuickPick(
-    [
-      { label: `$(check) ${m().conclusion.approve}`, value: 'approve' as const },
-      { label: `$(request-changes) ${m().conclusion.requestChanges}`, value: 'changes' as const },
-      { label: `$(comment) ${m().conclusion.comment}`, value: 'comment' as const },
-    ],
-    { title: m().conclusion.submitTitle, placeHolder: m().conclusion.submitPlaceholder },
-  );
-  if (!choice) {
-    return;
-  }
-
-  const cleanLabel = choice.label.replace(/\$\([^)]+\)\s*/, '');
-  const conclusionVerdict =
-    choice.value === 'approve' ? 'approve' : choice.value === 'changes' ? 'request-changes' : 'comment';
-  const prMatch = session.reviewSet.scopeId.match(/^pr-(\d+)$/);
-  if (prMatch) {
-    const prNumber = Number(prMatch[1]);
-    const confirm = await vscode.window.showWarningMessage(
-      m().conclusion.confirmPr(prNumber, cleanLabel),
-      { modal: true },
-      m().conclusion.submitToGitHub,
-    );
-    if (confirm !== m().conclusion.submitToGitHub) {
+async function submitCenterConclusion(verdict: ReviewVerdict, notes: string, preview: string): Promise<void> {
+  if (centerSubmitting) throw new Error(m().reviewCenter.submitting);
+  if (scopePickInFlight) throw new WorkflowError('running');
+  reviewCoordinator.assertInputsAvailable();
+  reviewCoordinator.assertNoDraft();
+  const workflow = session.workflow;
+  const snapshot = session.snapshot;
+  if (!workflow || !snapshot) throw new WorkflowError('noReview');
+  if (notes.length > 64_000 || verdict !== workflow.verdict || preview !== centerPreview(notes)) throw new WorkflowError('confirmationChanged');
+  const blockers = session.workflowBlockers(verdict);
+  if (blockers.length) throw new WorkflowError(blockers[0].code, blockers[0].detail);
+  const set = requireReviewSet();
+  const cwd = requireReviewCwd();
+  const frozenBody = composeReviewReport(centerReportBase(), notes, m().reviewCenter.notes);
+  const bodySignature = centerSubmissionSignature(verdict, notes);
+  const alreadyRecorded = snapshot.conclusion?.verdict === verdict && snapshot.conclusion.bodySignature === bodySignature;
+  const pr = /^pr-(\d+)$/.exec(set.scopeId);
+  const prNumber = pr ? Number(pr[1]) : undefined;
+  const pending = structuredClone(session.pendingComments.length ? session.pendingComments : session.conclusion?.inlineComments ?? []);
+  const current = () => session.snapshot === snapshot && session.workflow?.run.id === workflow.run.id
+    && !reviewCoordinator.editing && !session.workflowBlockers(verdict).length && centerPreview(notes) === preview;
+  const validate = async () => {
+    if (!current()) throw new WorkflowError('confirmationChanged');
+    await reviewCoordinator.validateCurrentResults();
+    if (prNumber !== undefined) {
+      const remote = await getPrByNumber(cwd, prNumber);
+      if (!set.prUrl || remote.headRefOid !== set.headSha || remote.url !== set.prUrl) throw new WorkflowError('staleResults');
+    }
+    if (!current()) throw new WorkflowError('confirmationChanged');
+  };
+  centerSubmitting = true;
+  centerEpoch++;
+  WorkbenchPanel.refreshNow();
+  let published = false;
+  let attemptedPublish = false;
+  let publishedBody = '';
+  try {
+    if (workflow.notes !== notes) await session.updateWorkflow((state) => { state.notes = notes; }, workflow.notes.trim() !== notes.trim());
+    await validate();
+    await session.flushWorkflowEvidence();
+    if (alreadyRecorded) {
+      centerNotice(fmt(m().reviewCenter.recorded, verdict === 'approve' ? m().reviewCenter.approve : verdict === 'comment' ? m().reviewCenter.comment : m().reviewCenter.requestChanges));
       return;
     }
-    const cwd = activeCwd();
-    if (!cwd) {
-      return;
+    if (verdict === 'approve') {
+      const approved = await vscode.window.showWarningMessage(
+        `${fmt(m().reviewCenter.confirmApprovalBody, set.label, set.headSha === 'live' ? m().reviewCenter.workspaceSnapshot : set.headSha, currentRequirements(workflow).length ? workflow.baseline?.version ?? 0 : m().reviewCenter.technical)}\n\n${prNumber === undefined ? m().reviewCenter.localApprovalBody : fmt(m().reviewCenter.prApprovalBody, prNumber)}`,
+        { modal: true }, m().reviewCenter.confirmApprove,
+      );
+      if (approved !== m().reviewCenter.confirmApprove) return;
     }
-    const c = session.totalCoverage();
-    const body = m().conclusion.prBody(c.filesReady, c.filesTotal);
-    const pending = session.pendingComments;
-    try {
-      if (pending.length > 0) {
-        await submitPrReviewWithComments(
-          cwd,
-          prNumber,
-          session.reviewSet.headSha,
-          conclusionVerdict,
-          body,
-          pending.map((pc) => ({
-            path: pc.path,
-            startLine: pc.startLine,
-            endLine: pc.endLine,
-            body: pc.body,
-          })),
-        );
-        session.clearPendingComments();
-      } else {
-        await submitPrReview(cwd, prNumber, conclusionVerdict, body);
-      }
-      session.setConclusion({
-        verdict: conclusionVerdict,
-        label: cleanLabel,
-        target: 'pr',
-        prNumber,
-        submittedAt: Date.now(),
-      });
-      transientInfo(m().conclusion.postedToPr(prNumber, cleanLabel));
-    } catch (err) {
-      reportError(err);
+    await validate();
+    if (prNumber !== undefined) {
+      const body = frozenBody;
+      publishedBody = frozenBody;
+      const repository = set.prUrl ? new URL(set.prUrl).pathname.split('/').slice(1, 3).join('/') : undefined;
+      attemptedPublish = true;
+      await submitPrReviewWithComments(cwd, prNumber, set.headSha, verdict, body, pending, repository);
+      published = true;
     }
-    return;
+    let valid = current();
+    if (published && valid) {
+      try { await validate(); }
+      catch (error) { valid = false; centerNotice(workflowErrorText(error), true); }
+    }
+    const conclusion: ReviewConclusion = {
+      verdict, label: verdict === 'approve' ? m().reviewCenter.approve : verdict === 'comment' ? m().reviewCenter.comment : m().reviewCenter.requestChanges,
+      target: prNumber === undefined ? 'local' : 'pr', prNumber, submittedAt: Date.now(),
+      headSha: set.headSha, baselineVersion: workflow.baseline?.version, bodySignature,
+      repositoryStamp: workflow.run.repositoryStamp, resultKey: workflow.run.key,
+      runId: workflow.run.id,
+      body: publishedBody || frozenBody, inlineComments: pending,
+    };
+    if (published) snapshot.pendingComments = snapshot.pendingComments?.filter((item) => !pending.some((sent) => sent.id === item.id));
+    await session.recordWorkflowConclusion(conclusion, snapshot, valid);
+    centerNotice(valid ? fmt(published ? m().reviewCenter.submitted : m().reviewCenter.recorded, conclusion.label) : m().reviewCenter.oldSnapshotSubmitted);
+  } catch (error) {
+    centerNotice(published ? `${m().reviewCenter.postedButNotSaved}\n${m().review.saveFailed(workflowErrorText(error))}`
+      : `${workflowErrorText(error)}${attemptedPublish ? `\n${m().reviewCenter.submissionUncertain}` : ''}`, true);
+  } finally {
+    centerSubmitting = false;
+    centerEpoch++;
+    WorkbenchPanel.refreshNow();
   }
-
-  session.setConclusion({
-    verdict: conclusionVerdict,
-    label: cleanLabel,
-    target: 'local',
-    submittedAt: Date.now(),
-  });
-  transientInfo(m().conclusion.recordedLocal(cleanLabel));
 }
 
 /**

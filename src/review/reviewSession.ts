@@ -15,6 +15,11 @@ import {
 import type { TokenUsage } from '../ai/analyzer';
 import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, ReviewConclusion, FindingDisposition, PendingComment, TokenAccount } from './reviewStore';
 import { isBlankFileState } from './reviewStore';
+import {
+  contentSignature, createReviewWorkflow, invalidateWorkflow, restoreReviewWorkflow,
+  workflowGate, workflowResultKey, workflowScopeKey, WorkflowError,
+  type ReviewWorkflowState, type ReviewVerdict,
+} from './reviewWorkflow';
 
 export interface ReviewSessionChange {
   filePath?: string;
@@ -44,6 +49,11 @@ export class ReviewSession {
   private reviewFilesByPath = new Map<string, ReviewFile>();
   private deletedPaths = new Set<string>();
   private structureVersion = 0;
+  private contentVersion = 0;
+  private lifecycleVersion = 0;
+  private readonly fileReportSignatures = new Map<string, string>();
+  private storageRepo?: string;
+  private previousWorkflow?: ReviewWorkflowState;
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
@@ -70,12 +80,41 @@ export class ReviewSession {
     return this.repoName ?? this.defaultRepo;
   }
 
+  get reviewContentVersion(): number {
+    return this.contentVersion;
+  }
+
+  get reviewLifecycleVersion(): number {
+    return this.lifecycleVersion;
+  }
+
+  get workflow(): ReviewWorkflowState | undefined {
+    return this.snapshot?.workflow;
+  }
+
+  get workflowResultsCurrent(): boolean {
+    const state = this.workflow;
+    return !!state && state.run.key === workflowResultKey(state) && state.run.status !== 'stale';
+  }
+
+  workflowFindingCurrent(file: string, finding: Finding): boolean {
+    const roots = findingAnalysisRoots(finding);
+    const completed = this.workflow?.run.completed ?? [];
+    return this.workflowResultsCurrent && (roots.length ? roots.some((root) => completed.includes(root)) : completed.includes(file));
+  }
+
+  private getStorageRepoName(): string {
+    return this.storageRepo ?? this.getRepoName();
+  }
+
   /** Loads or initialises review progress for the given review set. */
   async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
+    const generation = ++this.lifecycleVersion;
+    const previousWorkflow = this.workflow ? structuredClone(this.workflow) : undefined;
     await this.flushPendingFilePersists();
-    this.cwd = cwd;
-    this.repoName = cwd ? path.basename(cwd) : this.defaultRepo;
-    const repo = this.repoName;
+    const repoName = cwd ? path.basename(cwd) : this.defaultRepo;
+    const repositoryKey = contentSignature(cwd ?? this.defaultRepo);
+    const repo = cwd ? `${repoName}~${repositoryKey.slice(0, 12)}` : repoName;
     const key: ReviewKey = {
       repo,
       scopeId: reviewSet.scopeId,
@@ -87,13 +126,34 @@ export class ReviewSession {
     // now lives in its own per-file store so it follows the file across scope
     // re-selections instead of vanishing when the scope id changes.
     let scopeSnap = await this.store.load(key);
+    let sourceRepo = repo;
     if (!scopeSnap && reviewSet.headSha === 'live' && this.store.findLatestForScope) {
       const legacy = await this.store.findLatestForScope(repo, reviewSet.scopeId);
       if (legacy) {
         scopeSnap = { ...legacy, headSha: 'live' };
       }
     }
+    if (!scopeSnap && this.store.findLatestForScope) {
+      const previous = await this.store.findLatestForScope(repo, reviewSet.scopeId);
+      if (previous?.workflow?.repositoryKey === repositoryKey) {
+        scopeSnap = {
+          repo, scopeId: reviewSet.scopeId, headSha: reviewSet.headSha, perFile: {}, globalDone: false,
+          workflow: previous.workflow, legacyConclusion: previous.conclusion ?? previous.legacyConclusion,
+          dispositionHistory: previous.dispositionHistory, submissions: previous.submissions, updatedAt: Date.now(),
+        };
+      }
+    }
+    if (!scopeSnap && cwd) {
+      const legacyKey = { ...key, repo: repoName };
+      const legacy = await this.store.load(legacyKey)
+        ?? (reviewSet.headSha === 'live' ? await this.store.findLatestForScope?.(repoName, reviewSet.scopeId) : undefined);
+      if (legacy && (!legacy.repositoryKey || legacy.repositoryKey === repositoryKey)) {
+        scopeSnap = { ...legacy, repo, headSha: reviewSet.headSha };
+        sourceRepo = repoName;
+      }
+    }
 
+    if (scopeSnap?.workflow && scopeSnap.workflow.schema !== 1) throw new WorkflowError('unsupportedWorkflow');
     const originalPaths = new Set(reviewSet.files.map((file) => file.path));
     const contextFiles = [...new Set(
       (scopeSnap?.contextFiles ?? [])
@@ -109,27 +169,23 @@ export class ReviewSession {
       ...reviewSet.files,
       ...contextFiles.map((filePath) => ({ path: filePath, context: true })),
     ];
-    this.reviewSet = { ...reviewSet, files: effectiveFiles };
-    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
-    this.deletedPaths = new Set(
-      effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
-    );
-    this.structureVersion++;
+    const reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
 
     // Keep state sparse: untouched files do not allocate promises or empty
     // PerFileState objects. Existing progress is loaded in one key scan.
     const perFile: Record<string, PerFileState> = {};
     const toMigrate: string[] = [];
-    const activePaths = new Set(this.reviewFilesByPath.keys());
-    const stored = await this.loadStoredFileStates(repo, activePaths);
+    const activePaths = new Set(reviewFilesByPath.keys());
+    const stored = await this.loadStoredFileStates(sourceRepo, activePaths);
     for (const [filePath, state] of stored) {
       if (!isBlankFileState(state)) {
         perFile[filePath] = normaliseFileState(state);
+        if (sourceRepo !== repo) toMigrate.push(filePath);
       }
     }
 
     const legacyIndex = this.store.buildLegacyFileIndex
-      ? await this.store.buildLegacyFileIndex(repo)
+      ? await this.store.buildLegacyFileIndex(sourceRepo)
       : new Map<string, PerFileState>();
     for (const [filePath, state] of Object.entries(scopeSnap?.perFile ?? {})) {
       if (!legacyIndex.has(filePath)) {
@@ -147,8 +203,24 @@ export class ReviewSession {
       }
     }
 
+    if (generation !== this.lifecycleVersion) throw new WorkflowError('staleResult');
+    this.previousWorkflow = previousWorkflow;
+    this.cwd = cwd;
+    this.repoName = repoName;
+    this.storageRepo = repo;
+    this.reviewSet = { ...reviewSet, files: effectiveFiles };
+    this.reviewFilesByPath = reviewFilesByPath;
+    this.deletedPaths = new Set(effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path));
+    this.structureVersion++;
     this.snapshot = {
       repo,
+      repositoryKey,
+      workflow: scopeSnap?.workflow,
+      legacyConclusion: scopeSnap?.legacyConclusion,
+      dispositionKey: scopeSnap?.dispositionKey,
+      dispositionHistory: scopeSnap?.dispositionHistory,
+      fileStateSignatures: scopeSnap?.fileStateSignatures,
+      submissions: scopeSnap?.submissions,
       scopeId: reviewSet.scopeId,
       headSha: reviewSet.headSha,
       perFile,
@@ -162,10 +234,195 @@ export class ReviewSession {
       tokenUsage: scopeSnap?.tokenUsage,
       updatedAt: Date.now(),
     };
+    this.fileReportSignatures.clear();
+    for (const [file, state] of Object.entries(perFile)) this.fileReportSignatures.set(file, this.fileReportSignature(state));
+    this.contentVersion++;
     // Surface the panel immediately; persist migrated/initial state in the
     // background so a large review set doesn't block opening.
     this._onDidChange.fire({ structureChanged: true });
     void this.persistInBackground(repo, toMigrate);
+  }
+
+  async enableWorkflow(): Promise<ReviewWorkflowState> {
+    if (!this.snapshot || !this.reviewSet) throw new WorkflowError('noReview');
+    const repositoryKey = contentSignature(this.getCwd() ?? this.defaultRepo);
+    const scopeKey = workflowScopeKey(this.reviewSet, this.getCwd() ?? this.defaultRepo);
+    const previous = this.previousWorkflow;
+    const saved = previous?.repositoryKey === repositoryKey && previous.scopeKey !== scopeKey
+      ? previous : this.snapshot.workflow;
+    const workflow = saved
+      ? restoreReviewWorkflow(saved, scopeKey, repositoryKey)
+      : createReviewWorkflow(scopeKey, repositoryKey);
+    if (workflow.run.completed.length && (
+      (workflow.run.status === 'completed' && !this.snapshot.globalReport)
+      || workflow.run.completed.some((file) => !this.deletedPaths.has(file) && !this.fileState(file)?.analyzed)
+      || !this.snapshot.fileStateSignatures
+      || Object.entries(this.snapshot.fileStateSignatures ?? {}).some(([file, signature]) =>
+        !this.snapshot?.perFile[file] || this.fileStateSignature(this.snapshot.perFile[file]) !== signature,
+      )
+    )) {
+      invalidateWorkflow(workflow);
+      this.snapshot.dispositionKey = undefined;
+      workflow.interrupted = true;
+    }
+    if (!this.snapshot.workflow || workflow.run.status !== 'completed') {
+      this.snapshot.legacyConclusion ??= this.snapshot.conclusion;
+      this.snapshot.conclusion = undefined;
+    }
+    this.snapshot.workflow = workflow;
+    this.previousWorkflow = undefined;
+    this.contentVersion++;
+    await this.persistScopeMeta();
+    this._onDidChange.fire({});
+    return workflow;
+  }
+
+  async updateWorkflow(
+    update: (workflow: ReviewWorkflowState) => void,
+    invalidateConclusion = true,
+  ): Promise<void> {
+    const snapshot = this.snapshot;
+    if (!snapshot?.workflow) throw new WorkflowError('noReview');
+    const previous = snapshot.workflow;
+    const conclusion = snapshot.conclusion;
+    const next = structuredClone(previous);
+    update(next);
+    snapshot.workflow = next;
+    if (invalidateConclusion) snapshot.conclusion = undefined;
+    this.contentVersion++;
+    this._onDidChange.fire({});
+    try {
+      await this.persistScopeMeta();
+    } catch (error) {
+      if (this.snapshot === snapshot && snapshot.workflow === next) {
+        snapshot.workflow = previous;
+        snapshot.conclusion = conclusion;
+        this.contentVersion++;
+        this._onDidChange.fire({});
+      }
+
+      throw error;
+    }
+  }
+
+  async prepareWorkflowDispositions(key: string): Promise<void> {
+    const snapshot = this.snapshot;
+    if (!snapshot?.workflow || snapshot.dispositionKey === key) return;
+    const files: Record<string, { findings: Finding[]; dispositions: Record<string, FindingDisposition> }> = {};
+    for (const [file, state] of Object.entries(snapshot.perFile)) {
+      if (Object.keys(state.dispositions ?? {}).length) files[file] = {
+        findings: structuredClone(state.findings), dispositions: structuredClone(state.dispositions ?? {}),
+      };
+      state.dispositions = {};
+      state.confirmedFindings = [];
+    }
+    if (Object.keys(files).length || Object.keys(snapshot.globalFixDispositions ?? {}).length) {
+      (snapshot.dispositionHistory ??= []).push({
+        key: snapshot.dispositionKey, at: Date.now(), files,
+        global: { findings: structuredClone(snapshot.globalReport?.fixSpots ?? []), dispositions: structuredClone(snapshot.globalFixDispositions ?? {}) },
+      });
+    }
+    snapshot.globalFixDispositions = {};
+    snapshot.conclusion = undefined;
+    await this.flushWorkflowEvidence();
+    snapshot.dispositionKey = key;
+    await this.persistScopeMeta(snapshot);
+    this.contentVersion++;
+    this._onDidChange.fire({});
+  }
+
+  private fileStateSignature(state: PerFileState): string {
+    return contentSignature(JSON.stringify([state.analyzed, state.findings, state.dispositions ?? {}, state.analysisSummary]));
+  }
+
+  private fileReportSignature(state?: PerFileState): string {
+    return contentSignature(JSON.stringify([state?.findings ?? [], state?.dispositions ?? {}, state?.annotations ?? []]));
+  }
+
+  async flushWorkflowEvidence(): Promise<void> {
+    const snapshot = this.snapshot;
+    if (!snapshot?.workflow) throw new WorkflowError('noReview');
+    const signatures: Record<string, string> = {};
+    for (const [file, state] of Object.entries(snapshot.perFile)) {
+      if (this.store.saveFile) await this.store.saveFile(snapshot.repo, file, state);
+      if (state.analyzed || state.findings.length || Object.keys(state.dispositions ?? {}).length) signatures[file] = this.fileStateSignature(state);
+    }
+    if (snapshot !== this.snapshot) throw new WorkflowError('staleResult');
+    for (const [file, state] of Object.entries(snapshot.perFile)) this.fileReportSignatures.set(file, this.fileReportSignature(state));
+    snapshot.fileStateSignatures = signatures;
+    await this.persistScopeMeta(snapshot);
+  }
+
+  async recordWorkflowConclusion(conclusion: ReviewConclusion, snapshot: ReviewSnapshot, current: boolean): Promise<void> {
+    if (this.snapshot === snapshot && current) {
+      if (this.workflowBlockers(conclusion.verdict).length) throw new WorkflowError('incomplete');
+      snapshot.conclusion = conclusion;
+    } else {
+      snapshot.legacyConclusion = conclusion;
+    }
+    (snapshot.submissions ??= []).push(conclusion);
+    snapshot.updatedAt = Date.now();
+    this.contentVersion++;
+    await this.store.save({ ...snapshot, perFile: {} });
+    if (this.snapshot === snapshot) this._onDidChange.fire({});
+  }
+
+  knownWorkflowFindings(): NonNullable<ReviewWorkflowState['run']['priorFindings']> {
+    const known = new Map((this.workflow?.run.priorFindings ?? [])
+      .filter((item) => this.workflow?.run.business?.priorFindings?.find((result) => result.id === item.id)?.status !== 'dismissed')
+      .map((item) => [item.id, item]));
+    for (const file of this.reviewSet?.files ?? []) {
+      const findings = this.findings(file.path);
+      const refs = findingContentSignatures(findings);
+      findings.forEach((finding, index) => {
+        if (isActionableFinding(finding) && finding.severity !== 'suggestion') {
+          const id = `file:${file.path}#${refs[index]}~${contentSignature(finding.detail).slice(0, 12)}`;
+          known.set(id, { id, path: file.path, finding: structuredClone(finding) });
+        }
+      });
+    }
+    for (const finding of this.globalReport?.fixSpots ?? []) {
+      if (isActionableFinding(finding) && finding.severity !== 'suggestion') {
+        const id = `global:${finding.id}~${contentSignature(finding.detail).slice(0, 12)}`;
+        known.set(id, { id, path: finding.file, finding: structuredClone(finding) });
+      }
+    }
+    return [...known.values()];
+  }
+
+  private archiveDroppedDispositions(file: string, state: PerFileState, next: Record<string, FindingDisposition>): void {
+    if (!this.workflow || !this.snapshot) return;
+    const retained = new Set(Object.values(next));
+    const dispositions = Object.fromEntries(Object.entries(state.dispositions ?? {}).filter(([, value]) => !retained.has(value)));
+    if (!Object.keys(dispositions).length) return;
+    (this.snapshot.dispositionHistory ??= []).push({
+      key: this.snapshot.dispositionKey, at: Date.now(),
+      files: { [file]: { findings: structuredClone(state.findings), dispositions: structuredClone(dispositions) } },
+      global: { findings: [], dispositions: {} },
+    });
+  }
+
+  workflowBlockers(verdict: ReviewVerdict) {
+    if (!this.workflow) throw new WorkflowError('noReview');
+    let unhandled = 0;
+    const handledRefs = new Set<string>();
+    for (const [file, state] of Object.entries(this.snapshot?.perFile ?? {})) {
+      if (!this.hasReviewFile(file)) continue;
+      unhandled += state.findings.filter((finding) => this.workflowFindingCurrent(file, finding) && finding.severity !== 'suggestion' && isActionableFinding(finding) && !state.dispositions?.[finding.id]).length;
+      const refs = findingContentSignatures(state.findings);
+      state.findings.forEach((finding, index) => {
+        if (this.workflowFindingCurrent(file, finding) && state.dispositions?.[finding.id]) handledRefs.add(`file:${file}#${refs[index]}`);
+      });
+    }
+    for (const spot of this.snapshot?.globalReport?.fixSpots ?? []) {
+      if (!this.workflowResultsCurrent || !this.workflow.run.globalComplete) continue;
+      if (this.globalFixDisposition(spot.id, spot.file, spot.line, spot.anchor)) handledRefs.add(`global:${spot.id}`);
+      if (!this.resolveFixSpotFinding(spot.file, spot.line, spot.anchor, spot.findingRef)
+        && spot.severity !== 'suggestion' && isActionableFinding(spot)
+        && !this.globalFixDisposition(spot.id, spot.file, spot.line, spot.anchor)) unhandled++;
+    }
+    const gate = workflowGate(this.workflow, unhandled, handledRefs);
+    return verdict === 'approve' ? gate.approve : gate.feedback;
   }
 
   /**
@@ -174,19 +431,20 @@ export class ReviewSession {
    * opens immediately.
    */
   private async persistInBackground(repo: string, migratedPaths: string[]): Promise<void> {
-    if (!this.snapshot) {
+    const snapshot = this.snapshot;
+    if (!snapshot) {
       return;
     }
     try {
       if (this.store.saveFile) {
         for (const p of migratedPaths) {
-          const s = this.snapshot.perFile[p];
+          const s = snapshot.perFile[p];
           if (s) {
             await this.store.saveFile(repo, p, s);
           }
         }
       }
-      await this.persistScopeMeta();
+      await this.persistScopeMeta(snapshot);
     } catch {
       // Non-fatal: progress stays in memory and re-persists on the next change.
     }
@@ -466,7 +724,9 @@ export class ReviewSession {
         analysisRoots: [path],
       })),
       s.dispositions ?? {},
+      !!this.workflow,
     );
+    this.archiveDroppedDispositions(path, s, keyed.dispositions);
     const invalidatedFiles = this.invalidateGlobalAnalysis();
     s.findings = keyed.findings;
     s.analysisSummary = analysisSummary;
@@ -576,7 +836,9 @@ export class ReviewSession {
         state.findings,
         retained,
         state.dispositions ?? {},
+        !!this.workflow,
       );
+      this.archiveDroppedDispositions(filePath, state, keyed.dispositions);
       state.findings = keyed.findings;
       state.dispositions = keyed.dispositions;
       state.confirmedFindings = [];
@@ -604,6 +866,12 @@ export class ReviewSession {
   invalidateAfterFileChange(path: string): ReviewInvalidation {
     if (!this.snapshot) {
       return { changed: false, affectedFiles: [], removedFiles: [] };
+    }
+    if (this.workflow) {
+      invalidateWorkflow(this.workflow);
+      this.snapshot.conclusion = undefined;
+      this.persistScope();
+      return { changed: true, affectedFiles: [path], removedFiles: [] };
     }
     const roots = new Set<string>([path]);
     for (const [root, dependencies] of Object.entries(
@@ -649,6 +917,7 @@ export class ReviewSession {
           state.findings,
           nextFindings,
           state.dispositions ?? {},
+          !!this.workflow,
         );
         state.findings = keyed.findings;
         state.dispositions = keyed.dispositions;
@@ -675,6 +944,11 @@ export class ReviewSession {
     changed ||= hadGlobalAnalysis;
     const removedFiles = this.pruneOrphanedContextFiles(path);
     const removed = new Set(removedFiles);
+    if ((changed || removed.size > 0) && this.workflow) {
+      invalidateWorkflow(this.workflow);
+      this.snapshot.conclusion = undefined;
+      this.contentVersion++;
+    }
     for (const filePath of removedFiles) {
       affected.add(filePath);
     }
@@ -734,7 +1008,7 @@ export class ReviewSession {
       this.deletedPaths.delete(filePath);
       delete this.snapshot.perFile[filePath];
       if (this.store.clearFile) {
-        void this.store.clearFile(this.getRepoName(), filePath).catch((err) => {
+        void this.store.clearFile(this.getStorageRepoName(), filePath).catch((err) => {
           console.warn('[codereview] failed to clear orphaned context file state:', err);
         });
       }
@@ -749,6 +1023,10 @@ export class ReviewSession {
   private invalidateGlobalAnalysis(): string[] {
     if (!this.snapshot) {
       return [];
+    }
+    if (this.workflow && this.workflow.run.status !== 'running') {
+      invalidateWorkflow(this.workflow);
+      this.snapshot.conclusion = undefined;
     }
     const changedFiles: string[] = [];
     for (const [file, state] of Object.entries(this.snapshot.perFile)) {
@@ -815,6 +1093,7 @@ export class ReviewSession {
     } else {
       s.dispositions[findingId] = { ...disposition, at: disposition.at || Date.now() };
     }
+    if (this.snapshot?.workflow) this.snapshot.conclusion = undefined;
     this.persistFile(path);
     return true;
   }
@@ -859,6 +1138,7 @@ export class ReviewSession {
     const next = s.annotations.filter((a) => a.id !== id);
     if (next.length !== s.annotations.length) {
       s.annotations = next;
+      this.clearCommentDispositionReference(id);
       this.persistFile(path);
     }
   }
@@ -894,6 +1174,7 @@ export class ReviewSession {
       const previousSpots = previousReport?.fixSpots ?? [];
       const previousStableIds = globalFixSpotSignatures(previousSpots);
       for (const spot of report.fixSpots) {
+        if (this.workflow && previousSpots.find((item) => item.id === spot.id)?.detail !== spot.detail) continue;
         const direct = previousDispositions[spot.id];
         if (direct) {
           nextDispositions[spot.id] = direct;
@@ -906,6 +1187,14 @@ export class ReviewSession {
         }
       }
       this.snapshot.globalReport = report;
+      if (this.workflow) {
+        const retained = new Set(Object.values(nextDispositions));
+        const discarded = Object.fromEntries(Object.entries(previousDispositions).filter(([, value]) => !retained.has(value)));
+        if (Object.keys(discarded).length) (this.snapshot.dispositionHistory ??= []).push({
+          key: this.snapshot.dispositionKey, at: Date.now(), files: {},
+          global: { findings: structuredClone(previousSpots), dispositions: structuredClone(discarded) },
+        });
+      }
       this.snapshot.globalDone = false;
       this.snapshot.globalFixDispositions =
         Object.keys(nextDispositions).length > 0 ? nextDispositions : undefined;
@@ -964,13 +1253,11 @@ export class ReviewSession {
       finding.verification = {
         status,
         rationale: verdict.after,
-        evidence: finding.verification?.evidence ?? [],
+        evidence: verdict.evidenceRefs ?? finding.verification?.evidence ?? [],
         source: 'global',
         prior: finding.verification
           ? {
-              status: finding.verification.status === 'unresolved'
-                ? 'unresolved'
-                : 'repo-confirmed',
+              status: finding.verification.status,
               rationale: finding.verification.rationale,
               evidence: finding.verification.evidence,
             }
@@ -997,7 +1284,11 @@ export class ReviewSession {
    * fix reuse — and stay in sync with — the file-level disposition (design Y).
    * Returns undefined for pure cross-file discoveries (design X applies).
    */
-  resolveFixSpotFinding(file: string, line: number, anchor?: string): Finding | undefined {
+  resolveFixSpotFinding(file: string, line: number, anchor?: string, findingRef?: string): Finding | undefined {
+    if (this.workflow) {
+      const finding = findingRef ? this.findingByContentRef(file, findingRef) : undefined;
+      return finding && isActionableFinding(finding) && this.workflowFindingCurrent(file, finding) ? finding : undefined;
+    }
     const findings = this.findings(file);
     if (anchor && anchor.trim()) {
       const byAnchor = findings.filter(
@@ -1033,7 +1324,8 @@ export class ReviewSession {
     line: number,
     anchor?: string,
   ): FindingDisposition | undefined {
-    const finding = this.resolveFixSpotFinding(file, line, anchor);
+    const spot = this.snapshot?.globalReport?.fixSpots.find((item) => item.id === spotId);
+    const finding = this.resolveFixSpotFinding(file, line, anchor, spot?.findingRef);
     if (finding) {
       return this.findingDisposition(file, finding.id);
     }
@@ -1051,7 +1343,8 @@ export class ReviewSession {
     anchor: string | undefined,
     disposition: FindingDisposition | null,
   ): void {
-    const finding = this.resolveFixSpotFinding(file, line, anchor);
+    const spot = this.snapshot?.globalReport?.fixSpots.find((item) => item.id === spotId);
+    const finding = this.resolveFixSpotFinding(file, line, anchor, spot?.findingRef);
     if (finding) {
       this.setFindingDisposition(file, finding.id, disposition);
       return;
@@ -1065,6 +1358,7 @@ export class ReviewSession {
     } else {
       delete store[spotId];
     }
+    if (this.workflow) this.snapshot.conclusion = undefined;
     this.persistScope();
   }
 
@@ -1083,6 +1377,7 @@ export class ReviewSession {
   /** Records the reviewer's final verdict so it survives reloads. */
   setConclusion(conclusion: ReviewConclusion): void {
     if (this.snapshot) {
+      if (this.workflow && this.workflowBlockers(conclusion.verdict).length) throw new WorkflowError('incomplete');
       this.snapshot.conclusion = conclusion;
       this.persistScope();
     }
@@ -1103,7 +1398,23 @@ export class ReviewSession {
       return;
     }
     (this.snapshot.pendingComments ??= []).push(comment);
+    if (this.workflow) this.snapshot.conclusion = undefined;
     this.persistScope();
+  }
+
+  private clearCommentDispositionReference(ref: string): void {
+    if (!this.workflow || !this.snapshot) return;
+    for (const [file, state] of Object.entries(this.snapshot.perFile)) {
+      const next = Object.fromEntries(Object.entries(state.dispositions ?? {}).filter(([, value]) => value.kind !== 'commented' || value.ref !== ref));
+      if (Object.keys(next).length !== Object.keys(state.dispositions ?? {}).length) {
+        this.archiveDroppedDispositions(file, state, next);
+        state.dispositions = next;
+        this.persistFile(file);
+      }
+    }
+    for (const [id, disposition] of Object.entries(this.snapshot.globalFixDispositions ?? {})) {
+      if (disposition.kind === 'commented' && disposition.ref === ref) delete this.snapshot.globalFixDispositions?.[id];
+    }
   }
 
   /** Removes a pending comment by id. */
@@ -1114,6 +1425,8 @@ export class ReviewSession {
     const next = this.snapshot.pendingComments.filter((c) => c.id !== id);
     if (next.length !== this.snapshot.pendingComments.length) {
       this.snapshot.pendingComments = next;
+      this.clearCommentDispositionReference(id);
+      if (this.workflow) this.snapshot.conclusion = undefined;
       this.persistScope();
     }
   }
@@ -1189,6 +1502,7 @@ export class ReviewSession {
 
   /** Gate passes only when every file is ready and global analysis is confirmed. */
   gatePassed(): boolean {
+    if (this.workflow) return this.workflowBlockers('approve').length === 0;
     return this.allFilesReady() && !!this.snapshot?.globalDone;
   }
 
@@ -1196,7 +1510,7 @@ export class ReviewSession {
     if (!this.snapshot) {
       return;
     }
-    const repo = this.getRepoName();
+    const repo = this.getStorageRepoName();
     try {
       // Per-file progress → per-file storage (the source of truth). The scope
       // snapshot keeps only scope-level data; writing every file here too would
@@ -1225,6 +1539,15 @@ export class ReviewSession {
     if (!this.snapshot) {
       return;
     }
+    if (delayMs === 0) this.contentVersion++;
+    if (this.workflow && delayMs === 0) {
+      const state = this.snapshot.perFile[filePath];
+      if (state) state.workflowVersion = 1;
+      const signature = this.fileReportSignature(state);
+      if (signature !== (this.fileReportSignatures.get(filePath) ?? this.fileReportSignature())) this.snapshot.conclusion = undefined;
+      this.fileReportSignatures.set(filePath, signature);
+      if (state) (this.snapshot.fileStateSignatures ??= {})[filePath] = this.fileStateSignature(state);
+    }
     const pending = this.pendingFilePersists.get(filePath);
     if (pending) {
       clearTimeout(pending);
@@ -1242,18 +1565,19 @@ export class ReviewSession {
   }
 
   private async persistFileNow(filePath: string): Promise<void> {
-    if (!this.snapshot) {
+    const snapshot = this.snapshot;
+    if (!snapshot) {
       return;
     }
-    const repo = this.getRepoName();
-    const state = this.snapshot.perFile[filePath];
+    const repo = snapshot.repo;
+    const state = snapshot.perFile[filePath];
     try {
       if (state && this.store.saveFile) {
         await this.store.saveFile(repo, filePath, state);
       }
-      await this.persistScopeMeta();
-    } catch {
-      // Non-fatal; stays in memory and re-persists on the next change.
+      await this.persistScopeMeta(snapshot);
+    } catch (error) {
+      void vscode.window.showWarningMessage(m().review.saveFailed(error instanceof Error ? error.message : String(error)));
     }
   }
 
@@ -1268,17 +1592,21 @@ export class ReviewSession {
 
   /** Saves the scope-level snapshot (global report / conclusion / token usage),
    * with the bulky perFile map stripped — per-file storage owns that. */
-  private async persistScopeMeta(): Promise<void> {
-    if (!this.snapshot) {
+  private async persistScopeMeta(snapshot = this.snapshot): Promise<void> {
+    if (!snapshot) {
       return;
     }
-    this.snapshot.updatedAt = Date.now();
-    await this.store.save({ ...this.snapshot, perFile: {} });
+    snapshot.updatedAt = Date.now();
+    await this.store.save({ ...snapshot, perFile: this.store.saveFile ? {} : snapshot.perFile });
   }
 
   /** Fire-and-forget scope-meta persist for scope-level mutations (no per-file rewrite). */
   private persistScope(): void {
-    void this.persistScopeMeta().catch(() => {/* non-fatal */});
+    this.contentVersion++;
+    void this.persistScopeMeta().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showWarningMessage(m().review.saveFailed(message));
+    });
     this._onDidChange.fire({});
   }
 
@@ -1324,7 +1652,7 @@ function mergeFindingVerification(
     }
   }
   return {
-    ...incoming,
+    ...(current.status === 'repo-confirmed' && incoming.status === 'unresolved' ? current : incoming),
     evidence,
   };
 }
@@ -1333,20 +1661,21 @@ function rekeyFindings(
   previous: Finding[],
   next: Finding[],
   previousDispositions: Record<string, FindingDisposition>,
+  strict = false,
 ): { findings: Finding[]; dispositions: Record<string, FindingDisposition> } {
   const bySignature = new Map<string, FindingDisposition>();
   const previousSignatures = findingContentSignatures(previous);
   for (let index = 0; index < previous.length; index++) {
     const disposition = previousDispositions[previous[index].id];
     if (disposition) {
-      bySignature.set(previousSignatures[index], disposition);
+      bySignature.set(`${previousSignatures[index]}${strict ? `\0${previous[index].detail}` : ''}`, disposition);
     }
   }
   const findings = next.map((finding, index) => ({ ...finding, id: `f${index}` }));
   const dispositions: Record<string, FindingDisposition> = {};
   const nextSignatures = findingContentSignatures(findings);
   for (let index = 0; index < findings.length; index++) {
-    const disposition = bySignature.get(nextSignatures[index]);
+    const disposition = bySignature.get(`${nextSignatures[index]}${strict ? `\0${findings[index].detail}` : ''}`);
     if (disposition) {
       dispositions[findings[index].id] = disposition;
     }
@@ -1361,6 +1690,7 @@ function rekeyFindings(
  */
 function normaliseFileState(s: PerFileState | undefined): PerFileState {
   const out: PerFileState = {
+    workflowVersion: s?.workflowVersion,
     seenLines: Array.isArray(s?.seenLines) ? [...s!.seenLines] : [],
     totalLines: s?.totalLines ?? 0,
     analyzed: s?.analyzed ?? false,
@@ -1369,7 +1699,7 @@ function normaliseFileState(s: PerFileState | undefined): PerFileState {
     // confirmed bugs, so drop those legacy non-findings during migration.
     findings: Array.isArray(s?.findings)
       ? s!.findings
-          .filter((finding) => finding.verification?.status !== 'unresolved')
+          .filter((finding) => s?.workflowVersion === 1 || finding.verification?.status !== 'unresolved')
           .map((finding) => ({ ...finding }))
       : [],
     analysisSummary: s?.analysisSummary

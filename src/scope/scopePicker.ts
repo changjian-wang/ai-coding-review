@@ -5,6 +5,8 @@ import {
   FileSystemScope,
   PrScope,
   PrByNumberScope,
+  BranchComparisonScope,
+  BranchSnapshotScope,
 } from './scopes';
 import { pickScopeTree } from './scopePickerPanel';
 import { pickPr } from './prPickerPanel';
@@ -16,7 +18,7 @@ import type { ReviewScope, ReviewSet } from './types';
 import type { PrSummary } from '../gh/types';
 import { m } from '../i18n';
 import { transientWarning } from '../ui/toast';
-import { currentBranch, listWorkingFiles } from './gitClient';
+import { currentBranch, detectBaseBranch, listComparisonRefs, listWorkingFiles } from './gitClient';
 
 /** Result of {@link pickScope}: the chosen scope plus the workspace-folder cwd it should run against. */
 export interface PickedScope {
@@ -127,9 +129,25 @@ export async function pickScope(
         description: 'gh pr list',
         detail: m().scope.pickPrListDetail,
       },
+      { id: 'branchDiff', label: m().scope.pickBranchDiff, detail: m().scope.pickBranchDiffDetail },
+      { id: 'branchFull', label: m().scope.pickBranchFull, detail: m().scope.pickBranchFullDetail },
     ],
   });
   switch (kind) {
+    case 'branchFull':
+      return { cwd: defaultCwd, scope: new BranchSnapshotScope() };
+    case 'branchDiff': {
+      const refs = await listComparisonRefs(defaultCwd);
+      let preferred: string | undefined;
+      try { preferred = await detectBaseBranch(defaultCwd); }
+      catch (error) { console.warn('[codereview] No automatic comparison base; requesting an explicit choice:', error); }
+      refs.sort((a, b) => Number(b === preferred) - Number(a === preferred) || a.localeCompare(b));
+      const base = await pickScopeKind({
+        title: m().scope.pickBase, heading: m().scope.pickBase, viewColumn,
+        options: refs.map((id) => ({ id, label: id, description: id === preferred ? m().scope.defaultBase : undefined })),
+      });
+      return base ? { cwd: defaultCwd, scope: new BranchComparisonScope(base) } : undefined;
+    }
     case 'files':
       return buildFileSystemScope();
     case 'currentPr':

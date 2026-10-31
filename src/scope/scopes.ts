@@ -47,6 +47,7 @@ async function prReviewSet(cwd: string, pr: PullRequest): Promise<ReviewSet> {
   }
 
   return {
+    prUrl: pr.url,
     scopeId: `pr-${pr.number}`,
     label: `PR #${pr.number} · ${pr.title}`,
     headSha: pr.headRefOid,
@@ -105,5 +106,31 @@ export class FileSystemScope implements ReviewScope {
       headSha: 'live',
       files,
     };
+  }
+
+}
+
+export class BranchComparisonScope implements ReviewScope {
+  constructor(readonly baseRef: string) { }
+
+  async load(cwd: string): Promise<ReviewSet> {
+    const [head, baseTip, branch] = await Promise.all([
+      git.headSha(cwd), git.resolveCommitRef(cwd, this.baseRef), git.currentBranch(cwd),
+    ]);
+    const baseSha = await git.mergeBase(cwd, baseTip, head);
+    const files = await git.comparisonReviewFiles(cwd, baseSha, head);
+    if (!files.length) throw new Error(m().scope.noBranchChanges);
+    return {
+      scopeId: `branch-diff-${this.baseRef}`, label: m().scope.branchChanges(branch, this.baseRef, files.length),
+      headSha: head, comparison: { baseSha, headSha: head }, files,
+    };
+  }
+}
+
+export class BranchSnapshotScope implements ReviewScope {
+  async load(cwd: string): Promise<ReviewSet> {
+    const [head, branch] = await Promise.all([git.headSha(cwd), git.currentBranch(cwd)]);
+    const files = (await git.listFilesAtRef(cwd, head)).map((path) => ({ path }));
+    return { scopeId: 'branch-full-snapshot', label: m().scope.branchSnapshot(branch, files.length), headSha: head, files };
   }
 }

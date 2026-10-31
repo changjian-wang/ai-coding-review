@@ -26,6 +26,7 @@ export interface ReviewComparison {
  * itself (the whole file's logic); the scope only decides WHICH files are in.
  */
 export interface ReviewSet {
+  prUrl?: string;
   /** Stable id for this scope; part of the persistence key. */
   scopeId: string;
   /** Human label shown in the UI, e.g. "PR #42" or "选定的源码 (3)". */

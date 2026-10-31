@@ -1,5 +1,6 @@
 import type * as vscode from 'vscode';
 import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
+import type { ReviewWorkflowState } from './reviewWorkflow';
 
 /** A persisted reviewer annotation: a translation, an explanation, or a free-form note. */
 export interface Annotation {
@@ -17,6 +18,7 @@ export interface Annotation {
 
 /** Per-file review progress. */
 export interface PerFileState {
+  workflowVersion?: 1;
   /** Line numbers (1-based) that have been scrolled into view. */
   seenLines: number[];
   /** Total reviewable lines, set once the file is opened. */
@@ -47,6 +49,14 @@ export interface FindingDisposition {
 
 /** The reviewer's final verdict for a review, persisted once submitted. */
 export interface ReviewConclusion {
+  repositoryStamp?: string;
+  resultKey?: string;
+  runId?: string;
+  headSha?: string;
+  baselineVersion?: number;
+  bodySignature?: string;
+  body?: string;
+  inlineComments?: PendingComment[];
   /** Machine-readable verdict. */
   verdict: 'approve' | 'request-changes' | 'comment';
   /** Human-readable label shown in the UI. */
@@ -80,7 +90,19 @@ export interface PendingComment {
 
 /** A complete, persistable snapshot of one review. */
 export interface ReviewSnapshot {
+  dispositionKey?: string;
+  dispositionHistory?: {
+    key?: string;
+    at: number;
+    files: Record<string, { findings: Finding[]; dispositions: Record<string, FindingDisposition> }>;
+    global: { findings: Finding[]; dispositions: Record<string, FindingDisposition> };
+  }[];
+  fileStateSignatures?: Record<string, string>;
+  submissions?: ReviewConclusion[];
   repo: string;
+  repositoryKey?: string;
+  workflow?: ReviewWorkflowState;
+  legacyConclusion?: ReviewConclusion;
   /** Stable id of the review scope (selected files / PR / branch / working tree). */
   scopeId: string;
   /** HEAD SHA this progress is bound to, or "live" when not pinned to a commit. */

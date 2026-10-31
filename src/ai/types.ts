@@ -1,3 +1,5 @@
+import type { BusinessReview } from '../review/reviewWorkflow';
+
 /** Severity of a review finding, aligned with the prototype's vocabulary. */
 export type FindingSeverity = 'bug' | 'conditional' | 'suggestion';
 
@@ -34,7 +36,7 @@ export interface FindingEvidenceRef {
 }
 
 export interface FileFindingVerification {
-  status: 'repo-confirmed' | 'unresolved';
+  status: 'repo-confirmed' | 'unresolved' | 'overturned';
   rationale: string;
   evidence: FindingEvidenceRef[];
 }
@@ -226,6 +228,7 @@ export function findingContentSignatures(findings: readonly Finding[]): string[]
 export interface GlobalFixSpot extends Finding {
   /** Repository-relative file path this fix lands in. */
   file: string;
+  findingRef?: string;
 }
 
 function globalFixSpotIdentityBase(
@@ -308,6 +311,7 @@ export interface GlobalVerdict {
   line?: number;
   /** Stable content signature of the file-level finding being confirmed/flipped. */
   findingRef?: string;
+  evidenceRefs?: FindingEvidenceRef[];
 }
 
 /** Recommended overall outcome from the global analysis. */
@@ -315,6 +319,9 @@ export type GlobalRecommendation = 'approve' | 'request_changes' | 'comment';
 
 /** Cross-file analysis report shown in the (single) rich webview. */
 export interface GlobalReport {
+  fullSourceFiles?: string[];
+  business?: BusinessReview;
+  coverageLimits?: string[];
   /** One-paragraph cross-file conclusion. */
   conclusion: string;
   /** Recommended outcome that the decision panel headlines. */

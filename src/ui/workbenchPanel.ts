@@ -2,11 +2,16 @@ import * as vscode from 'vscode';
 import type { FindingEvidenceRef, FindingSeverity } from '../ai/types';
 import { esc, escAttr, nonce as makeNonce } from './html';
 import { m, fmt, resolveLanguage, type Messages } from '../i18n';
+import {
+  isReviewCenterMessage, renderReviewCenter,
+  type CenterDocument, type ReviewCenterMessage, type ReviewCenterOutgoing, type ReviewCenterState, type ReviewCenterUpdate,
+} from './reviewCenter';
 
 export type FindingDispositionKind = 'fixed' | 'commented' | 'ignored';
 
 /** A file row in the workbench sidebar. */
 export interface WorkbenchFile {
+  context?: boolean;
   path: string;
   name: string;
   dir: string;
@@ -40,6 +45,7 @@ export interface WorkbenchFinding {
 
 /** Serializable snapshot the webview renders. */
 export interface WorkbenchState {
+  center?: ReviewCenterState;
   /** Changes only when the review file set is replaced. */
   structureVersion: number;
   label: string;
@@ -62,6 +68,7 @@ export interface WorkbenchState {
   /** Estimated LLM token usage for this review (approximate, not billed). */
   tokenUsage?: WorkbenchTokenUsage;
   conclusion?: {
+    verdict?: 'approve' | 'request-changes' | 'comment';
     label: string;
     target: 'pr' | 'local';
     prNumber?: number;
@@ -80,6 +87,7 @@ export interface WorkbenchTokenUsage {
 
 /** Actions the workbench can trigger in the extension host. */
 export interface WorkbenchActions {
+  center?(message: ReviewCenterMessage): void;
   open(path: string): void;
   /** Opens a file AND moves keyboard focus into the document view. */
   openFocus(path: string): void;
@@ -160,7 +168,8 @@ type WorkbenchStateProvider = (
   changedPaths?: ReadonlySet<string>,
 ) => WorkbenchState;
 
-type InboundMessage =
+export type InboundMessage =
+  | ReviewCenterMessage
   | { type: 'select'; path: string }
   | { type: 'openFocus'; path: string }
   | { type: 'focusDoc' }
@@ -182,6 +191,33 @@ type InboundMessage =
   | { type: 'openDynMenu'; kind: string }
   | { type: 'applyDynMenu'; kind: string; id: string }
   | { type: 'toggleFolder'; path: string };
+
+export function isWorkbenchMessage(value: unknown): value is InboundMessage {
+  if (isReviewCenterMessage(value)) return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !('type' in value)) return false;
+  switch (value.type) {
+    case 'select': case 'openFocus': case 'toggleFolder':
+      return 'path' in value && typeof value.path === 'string';
+    case 'focusDoc': case 'global': case 'cancelGlobal': case 'showGlobal': case 'exportReport':
+    case 'submit': case 'pickModel': case 'pickLanguage': case 'pickBranch': case 'pickProject': case 'pickScope':
+      return true;
+    case 'dispose':
+      return 'path' in value && typeof value.path === 'string' && 'id' in value && typeof value.id === 'string'
+        && 'kind' in value && (value.kind === 'fixed' || value.kind === 'commented' || value.kind === 'ignored');
+    case 'locate':
+      return 'path' in value && typeof value.path === 'string' && 'line' in value
+        && typeof value.line === 'number' && Number.isInteger(value.line) && value.line > 0;
+    case 'pickScopeKind': case 'openDynMenu':
+      return 'kind' in value && typeof value.kind === 'string';
+    case 'pickProjectCwd':
+      return 'cwd' in value && typeof value.cwd === 'string';
+    case 'pickLanguageId':
+      return 'id' in value && (value.id === 'en' || value.id === 'zh-CN' || value.id === 'auto');
+    case 'applyDynMenu':
+      return 'kind' in value && typeof value.kind === 'string' && 'id' in value && typeof value.id === 'string';
+    default: return false;
+  }
+}
 
 /**
  * The Review Workbench: a full webview panel that renders the prototype-style
@@ -213,6 +249,10 @@ export class WorkbenchPanel {
   private readonly fileIndexByPath = new Map<string, number>();
   private readonly folderAncestorsByFile = new Map<string, string[]>();
   private readonly folderMetrics = new Map<string, FolderMetric>();
+  private centerMode = false;
+  private lastCenterVersion = -1;
+  private lastCenterDocument?: CenterDocument;
+  private lastCenterStructure = -1;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -222,7 +262,10 @@ export class WorkbenchPanel {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
-      (msg: InboundMessage) => this.handle(msg),
+      (msg: unknown) => {
+        if (isWorkbenchMessage(msg)) this.handle(msg);
+        else void vscode.window.showWarningMessage(m().reviewCenter.invalidAction);
+      },
       null,
       this.disposables,
     );
@@ -337,6 +380,14 @@ export class WorkbenchPanel {
     WorkbenchPanel.current?.scheduleRefresh(filePath);
   }
 
+  static refreshNow(): void {
+    WorkbenchPanel.current?.refresh();
+  }
+
+  static postCenter(message: ReviewCenterOutgoing): void {
+    void WorkbenchPanel.current?.panel.webview.postMessage(message);
+  }
+
   /** Reveals the workbench and moves keyboard focus into its file tree. */
   static focusTree(): void {
     const inst = WorkbenchPanel.current;
@@ -436,7 +487,18 @@ export class WorkbenchPanel {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
+    const pending = new Set([...this.pendingChangedPaths, ...(changedPaths ?? [])]);
+    this.pendingChangedPaths.clear();
+    changedPaths = pending.size ? pending : changedPaths;
     const state = this.getState(changedPaths);
+    if (state.center) {
+      this.refreshCenter(state, changedPaths);
+      return;
+    }
+    if (this.centerMode) {
+      this.centerMode = false;
+      this.rendered = false;
+    }
     const sig = String(state.structureVersion);
     // Hot path: while the file set is unchanged (the common case during a
     // review — only progress / findings / selection change), patch the live
@@ -467,13 +529,56 @@ export class WorkbenchPanel {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
-    const state = this.getState();
+    const pending = new Set(this.pendingChangedPaths);
+    this.pendingChangedPaths.clear();
+    const state = this.getState(pending);
+    if (state.center) {
+      this.rendered = false;
+      this.refreshCenter(state);
+      return;
+    }
     const root = compactTree(buildTree(state.files));
     this.indexStructure(state, root);
     this.lastStructureSig = String(state.structureVersion);
     this.rendered = true;
     this.lastSnapshot = snapshotFor(state, root);
     this.panel.webview.html = this.render(state, root);
+  }
+
+  private refreshCenter(state: WorkbenchState, changedPaths?: ReadonlySet<string>): void {
+    const { center, files, ...common } = state;
+    if (!center) throw new Error(m().reviewCenter.invalidAction);
+    const { document, ...meta } = center;
+    const previousDocument = this.lastCenterDocument;
+    const metadataOnly = document && previousDocument && document !== previousDocument
+      && document.path === previousDocument.path && document.revision === previousDocument.revision
+      && document.raw === previousDocument.raw && document.sourceLines === previousDocument.sourceLines
+      && document.diffLines === previousDocument.diffLines;
+    const structureChanged = this.lastCenterStructure !== state.structureVersion;
+    if (!this.rendered || !this.centerMode) {
+      this.centerMode = true;
+      this.rendered = true;
+      this.panel.webview.html = renderReviewCenter(state);
+    } else {
+      const update: ReviewCenterUpdate = {
+        type: 'center-state', state: common,
+        ...(structureChanged ? { files } : {
+          fileUpdates: changedPaths ? files.filter((file) => changedPaths.has(file.path)) : undefined,
+        }),
+        ...(center.version !== this.lastCenterVersion ? { center: meta } : {}),
+        ...(document !== previousDocument && !metadataOnly ? { document: document ?? null } : {}),
+        ...(metadataOnly ? { documentPatch: {
+          path: document.path, revision: document.revision, findings: document.findings, annotations: document.annotations,
+          annotationHtml: document.annotationHtml, seen: document.seen, analyzing: document.analyzing,
+          translationHtml: document.translationHtml ?? null, evidenceOnly: !!document.evidenceOnly, deleted: !!document.deleted,
+          defaultToDiff: document.defaultToDiff,
+        } } : {}),
+      };
+      void this.panel.webview.postMessage(update);
+    }
+    this.lastCenterVersion = center.version;
+    this.lastCenterStructure = state.structureVersion;
+    this.lastCenterDocument = document;
   }
 
   private indexStructure(state: WorkbenchState, root: TreeNode): void {
@@ -622,6 +727,10 @@ export class WorkbenchPanel {
 
   private handle(msg: InboundMessage): void {
     switch (msg.type) {
+      case 'center':
+        if (this.actions.center) this.actions.center(msg);
+        else void vscode.window.showWarningMessage(m().reviewCenter.invalidAction);
+        break;
       case 'select':
         this.actions.open(msg.path);
         break;
