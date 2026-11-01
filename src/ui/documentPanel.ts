@@ -652,6 +652,8 @@ export function documentViewParts(embedded = false): { styles: string; body: str
     background:var(--elevated); flex:none;
   }
   .fname { font-weight:600; font-size:13px; }
+  :host .topbar { flex-wrap:wrap; }
+  :host .fname { min-width:0; max-width:100%; overflow-wrap:anywhere; }
   .source-description { padding:7px 12px; font-size:11px; color:var(--dim); border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
   .spacer { flex:1; }
   .seg { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }

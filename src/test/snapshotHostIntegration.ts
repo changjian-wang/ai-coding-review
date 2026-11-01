@@ -17,6 +17,7 @@ import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './revie
 import { runStartupHostChecks } from './startupHostIntegration';
 import { runPreparationLoadingHostChecks } from './preparationLoadingHostIntegration';
 import { runPreparationActionsHostChecks } from './preparationActionsHostIntegration';
+import { runSourceScrollHostChecks } from './sourceScrollHostIntegration';
 import { runStageNavigationHostChecks } from './stageNavigationHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
@@ -144,6 +145,7 @@ export async function run(): Promise<void> {
     }, actions);
     assert.ok((await within(seen, 30_000, 'real document rendering and visible-line acknowledgement')).includes(1));
     checks.push('real document webview load and seen acknowledgement');
+    checks.push(...await runSourceScrollHostChecks());
     const business = await runBusinessReviewHostChecks(root, set);
     checks.push(...business.checks);
     checks.push(...await runStartupHostChecks(root));

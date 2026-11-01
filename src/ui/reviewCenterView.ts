@@ -46,11 +46,11 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   .navigator-foot details{margin-top:8px;color:var(--review-muted);font-size:10px}
   .navigator-foot details button{margin-top:6px}
   .main{min-width:0;min-height:0;position:relative;background:var(--review-canvas)}
-  #source-main{height:100%;display:grid;grid-template-rows:36px minmax(0,1fr)}
+  #source-main{height:100%;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:36px minmax(0,1fr)}
   .source-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 16px;border-bottom:1px solid var(--review-border);background:var(--review-subtle);font-size:10px;color:var(--review-muted);min-width:0}
   .source-heading strong{font-weight:500;color:var(--vscode-foreground);flex:none}
   #source-finding{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #review-source{width:100%;height:100%;min-height:0}
+  #review-source{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden}
   .source-placeholder{position:absolute;inset:36px 0 0;display:grid;place-items:center;padding:24px;background:var(--review-canvas);color:var(--review-muted);text-align:center}
   .inspector-head{padding:14px 17px 12px;border-bottom:1px solid var(--review-border)}
   .inspector-head>.row{justify-content:space-between;gap:8px;font-size:11px}
