@@ -106,17 +106,29 @@ export async function pickScope(
   preparationOptions?: ScopePreparationOptions,
 ): Promise<PickedScope | undefined> {
   if (preselectedKind === 'files') return buildFileSystemScope();
-  const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind, preparationOptions).result;
+  const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind, {
+    ...preparationOptions,
+    pickFiles: preparationOptions?.pickFiles ?? (async (cwd) => {
+      const picked = await buildFileSystemScope(cwd);
+      return picked ? picked.scope.load(picked.cwd) : undefined;
+    }),
+  }).result;
   if (!selected) return undefined;
   defaultCwd = selected.cwd;
-  if (selected.kind === 'files') return buildFileSystemScope();
+  if (selected.kind === 'files') {
+    if (!selected.reviewSet) throw new Error(m().scope.staleSelection);
+    return {
+      scope: new FileSystemScope(selected.reviewSet.files.filter((file) => !file.context).map((file) => file.path)),
+      cwd: selected.cwd, reviewSet: selected.reviewSet, requirements: selected.requirements,
+    };
+  }
   if (selected.kind === 'pr' && selected.prNumber !== undefined) {
     return { scope: new PrByNumberScope(selected.prNumber), cwd: selected.cwd, reviewSet: selected.reviewSet, requirements: selected.requirements };
   }
   if (!selected.headRef) throw new Error(m().scope.staleSelection);
   return { scope: new BranchSnapshotScope(selected.headRef, selected.baseRef), cwd: selected.cwd, reviewSet: selected.reviewSet, requirements: selected.requirements };
 
-  async function buildFileSystemScope(): Promise<PickedScope | undefined> {
+  async function buildFileSystemScope(cwd = defaultCwd): Promise<PickedScope | undefined> {
     // Scan the whole project root once, then let the reviewer narrow down via a
     // webview tree that is *locked* to this root. Because the tree is built only
     // from paths under `defaultCwd`, nothing outside the project can be picked —
@@ -125,8 +137,8 @@ export async function pickScope(
     const relPaths = await withWorkbenchProgress(
       m().scope.scanning,
       (progress) => scanReviewablePaths(
-        [vscode.Uri.file(defaultCwd)],
-        defaultCwd,
+        [vscode.Uri.file(cwd)],
+        cwd,
         ({ directoriesScanned, filesFound, percent, etaSeconds, estimated }) =>
           progress.report(
             m().scope.scanProgress(directoriesScanned, filesFound),
@@ -140,14 +152,14 @@ export async function pickScope(
       return undefined;
     }
     const picked = await pickScopeTree({
-      rootLabel: path.basename(defaultCwd) || defaultCwd,
+      rootLabel: path.basename(cwd) || cwd,
       relPaths,
       viewColumn,
     });
     if (!picked || picked.length === 0) {
       return undefined;
     }
-    return { scope: new FileSystemScope(picked), cwd: defaultCwd };
+    return { scope: new FileSystemScope(picked), cwd };
   }
 
 }

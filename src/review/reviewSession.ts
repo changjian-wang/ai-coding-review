@@ -65,6 +65,7 @@ export class ReviewSession {
   private workspaceViewFailure?: string;
   private previewedConclusion?: string;
   private publishingConclusion = false;
+  private businessInvalidationVersion = 0;
 
   reviewSet?: ReviewSet;
   snapshot?: ReviewSnapshot;
@@ -381,7 +382,9 @@ export class ReviewSession {
 
   invalidateBusinessReview(reason = m().businessReview.stale): void {
     const run = this.businessReview;
-    if (!run || run.status === 'stale' && run.errors.includes(reason)) return;
+    if (!run) return;
+    this.businessInvalidationVersion++;
+    if (run.status === 'stale' && run.errors.includes(reason)) return;
     run.status = 'stale'; run.confirmed = false;
     if (!run.errors.includes(reason)) run.errors.push(reason);
     if (this.snapshot) this.snapshot.conclusion = undefined;
@@ -414,17 +417,43 @@ export class ReviewSession {
     const next = restoreRequirementsDraft(draft);
     const key = requirementScopeKey(this.cwd, this.reviewSet);
     if (!requirementReadiness(next, key).confirmed) next.confirmation = undefined;
-    const previous = this.snapshot.requirements;
+    const snapshot = this.snapshot;
+    const previous = snapshot.requirements;
+    const previousRun = snapshot.businessReview;
+    const previousGlobal = snapshot.globalDone;
+    const previousConclusion = snapshot.conclusion;
+    const previousGlobalReport = snapshot.globalReport;
+    const invalidationVersion = this.businessInvalidationVersion;
     const changed = !previous || requirementFingerprint(previous, key) !== requirementFingerprint(next, key)
       || previous.confirmation?.fingerprint !== next.confirmation?.fingerprint
       || previous.technicalOnly !== next.technicalOnly;
-    this.snapshot.requirements = next;
+    snapshot.requirements = next;
     if (changed) {
-      this.invalidateBusinessReview();
-      this.snapshot.globalDone = false;
-      this.snapshot.conclusion = undefined;
+      if (previousRun) {
+        const run = structuredClone(previousRun);
+        run.status = 'stale'; run.confirmed = false;
+        if (!run.errors.includes(m().businessReview.stale)) run.errors.push(m().businessReview.stale);
+        snapshot.businessReview = run;
+      }
+      snapshot.globalDone = false;
+      snapshot.conclusion = undefined;
     }
-    await this.persistScopeMeta();
+    const updatedRun = snapshot.businessReview;
+    const runFingerprint = JSON.stringify(updatedRun);
+    try { await this.persistScopeMeta(snapshot); }
+    catch (error) {
+      if (snapshot === this.snapshot && snapshot.requirements === next) {
+        snapshot.requirements = previous;
+        if (invalidationVersion === this.businessInvalidationVersion && snapshot.businessReview === updatedRun
+          && JSON.stringify(updatedRun) === runFingerprint && snapshot.globalReport === previousGlobalReport) {
+          snapshot.businessReview = previousRun;
+          if (!snapshot.globalDone) snapshot.globalDone = previousGlobal;
+          if (!snapshot.conclusion) snapshot.conclusion = previousConclusion;
+        }
+        this._onDidChange.fire({});
+      }
+      throw error;
+    }
     this._onDidChange.fire({});
   }
 

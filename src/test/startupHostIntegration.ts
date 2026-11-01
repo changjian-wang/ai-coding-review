@@ -52,13 +52,17 @@ async function inspectPreparation(panel: vscode.WebviewPanel): Promise<Preparati
           cards:document.querySelectorAll('main>section').length,
           language:document.documentElement.lang,
           prototypeChrome:!!document.querySelector('.command .product-mark svg')&&document.querySelectorAll('.stages .stage-index').length===3,
-          targetChoices:document.querySelectorAll('.scope-kind input[type=radio]').length,
+          targetChoices:[...document.querySelectorAll('.scope-kind input[type=radio]')].filter(input=>!input.closest('[hidden]')).length,
           loading:!!document.getElementById('loadingElapsed'),
           refresh:document.getElementById('retry').textContent,
           browse:document.getElementById('browse-repository').textContent,saved:api.getState()
         }});
       } else if (event.data.type === 'startupCancel') {
-        window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+        const cancelWhenIdle=()=>{
+          if(state.committing){requestAnimationFrame(cancelWhenIdle);return;}
+          window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+        };
+        cancelWhenIdle();
       } else if (event.data.type === 'startupConfirm') {
         const timer=setInterval(()=>{
           const confirm=document.getElementById('confirm');

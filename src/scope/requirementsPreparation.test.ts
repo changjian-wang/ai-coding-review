@@ -29,6 +29,7 @@ function understood(draft: RequirementsDraft, key: string) {
 
 interface ClientState {
   revision: number; ready: boolean; busy: boolean; reading: boolean; error: string; html: string;
+  committing: boolean; humanOnly: boolean;
   scopeLoading: boolean; scopeReady: boolean; scopeError: string;
   materials: { id: string; name: string; selected: boolean; version: number }[];
 }
@@ -52,6 +53,19 @@ async function open(extra: ScopePreparationOptions = {}) {
   return { handle, panel, saved };
 }
 
+async function prepared(extra: ScopePreparationOptions = {}) {
+  const result = await open(extra);
+  result.panel.webview.receiveMessage({ type: 'material', ...selection, name: 'Original rule', text: 'Keep one effect.', human: true });
+  await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, busy: false }));
+  return result;
+}
+
+function currentRequirementId(): string {
+  const match = /data-requirement="([^"]+)"/.exec(state()?.html ?? '');
+  if (!match) throw new Error('Expected a rendered requirement');
+  return match[1];
+}
+
 beforeEach(() => {
   vi.mocked(repositoryRoot).mockResolvedValue(root);
   vi.mocked(listReviewRefs).mockResolvedValue(['main', 'feature']);
@@ -61,6 +75,193 @@ beforeEach(() => {
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
 
 describe('three-block preparation with real host state transitions', () => {
+  it('does not finish confirmation against a changed range while persistence is pending', async () => {
+    let pause = false;
+    let release: (() => void) | undefined;
+    const { handle, panel } = await prepared({
+      save: async () => { if (pause) { pause = false; await new Promise<void>((resolve) => { release = resolve; }); } },
+    });
+    try {
+      pause = true;
+      panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      expect(state()?.committing).toBe(true);
+      panel.webview.receiveMessage({ type: 'clearSelection', cwd: root, kind: 'branchFull' });
+      panel.webview.receiveMessage({ type: 'return', stage: 'review' });
+      expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'operationError' }));
+      release!();
+      const result = await handle.result;
+      expect(result?.reviewSet).toEqual(set);
+      expect(result?.requirements && requirementReadiness(result.requirements, requirementScopeKey(root, set)).confirmed).toBe(true);
+    } finally { release?.(); handle.dispose(); }
+  });
+
+  it('does not complete a disposed confirmation after a late successful save', async () => {
+    let pause = false;
+    let release: (() => void) | undefined;
+    const onReturn = vi.fn();
+    const { handle, panel } = await prepared({
+      retainOnReturn: true, onReturn,
+      save: async () => { if (pause) { pause = false; await new Promise<void>((resolve) => { release = resolve; }); } },
+    });
+    pause = true;
+    panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    handle.dispose();
+    release!();
+    await expect(handle.result).resolves.toBeUndefined();
+    expect(onReturn).not.toHaveBeenCalled();
+  });
+
+  it('does not apply a failed revision and accepts retry with the same original version', async () => {
+    let fail = false;
+    const saved: RequirementsDraft[] = [];
+    const { handle, panel } = await prepared({
+      save: async (_cwd, _identity, record) => {
+        if (fail) { fail = false; throw new Error('Controlled storage failure'); }
+        saved.push(structuredClone(record.draft));
+      },
+    });
+
+    try {
+      const id = currentRequirementId(), revision = state()!.revision;
+      const message = { type: 'revise', id, revision, name: 'New rule', text: 'A new requirement.', included: true, reason: '' };
+      panel.webview.receiveMessage({ type: 'editRequirement', id });
+      fail = true;
+      panel.webview.receiveMessage(message);
+      await vi.waitFor(() => expect(state()?.error).toContain('Controlled storage failure'));
+      expect(state()?.revision).toBe(revision);
+      expect(state()?.html).not.toContain('A new requirement.');
+      expect(saved.at(-1)?.understanding?.requirements[0].text).toBe('Keep one effect.');
+      panel.webview.receiveMessage(message);
+      await vi.waitFor(() => expect(state()?.html).toContain('A new requirement.'));
+      expect(state()?.revision).toBe(revision + 1);
+      expect(state()?.error).toBe('');
+    } finally { handle.dispose(); }
+  });
+
+  it('restores preparation storage if synchronizing the active review rejects a revision', async () => {
+    const records: RequirementsDraft[] = [];
+    let rejectChange = true;
+    const { handle, panel } = await prepared({
+      save: async (_cwd, _identity, record) => { records.push(structuredClone(record.draft)); },
+      onDraftChange: async (_cwd, _set, draft) => {
+        if (rejectChange && draft.understanding?.requirements[0].text === 'Rejected active update.') throw new Error('Active review storage failed');
+      },
+    });
+    try {
+      const id = currentRequirementId(), revision = state()!.revision;
+      const message = { type: 'revise', id, revision, name: 'Updated', text: 'Rejected active update.', included: true, reason: '' };
+      panel.webview.receiveMessage(message);
+      await vi.waitFor(() => expect(state()?.error).toContain('Active review storage failed'));
+      expect(state()?.revision).toBe(revision);
+      expect(records.at(-1)?.understanding?.requirements[0].text).toBe('Keep one effect.');
+      rejectChange = false;
+      panel.webview.receiveMessage(message);
+      await vi.waitFor(() => expect(state()).toMatchObject({ committing: false, error: '' }));
+      await vi.waitFor(() => expect(records.at(-1)?.understanding?.requirements[0].text).toBe('Rejected active update.'));
+    } finally { handle.dispose(); }
+  });
+
+  it('blocks confirmation when restoring the previous preparation also fails', async () => {
+    let rejectWrites = false;
+    const { handle, panel } = await prepared({
+      save: async () => { if (rejectWrites) throw new Error('Compensating write failed'); },
+      onDraftChange: async (_cwd, _set, draft) => {
+        if (draft.understanding?.requirements[0].text === 'Rejected update.') {
+          rejectWrites = true;
+          throw new Error('Active write failed');
+        }
+      },
+    });
+    try {
+      panel.webview.receiveMessage({ type: 'revise', id: currentRequirementId(), revision: state()!.revision, name: 'Updated', text: 'Rejected update.', included: true, reason: '' });
+      await vi.waitFor(() => expect(state()?.error).toContain('Compensating write failed'));
+      expect(state()).toMatchObject({ ready: false, scopeReady: false, committing: false });
+      expect(state()?.html).not.toContain('Rejected update.');
+    } finally { handle.dispose(); }
+  });
+
+  it('does not end an in-flight revision through the cancel-edit message', async () => {
+    let pause = false;
+    let release: (() => void) | undefined;
+    const { handle, panel } = await prepared({
+      save: async () => { if (pause) { pause = false; await new Promise<void>((resolve) => { release = resolve; }); } },
+    });
+    try {
+      const id = currentRequirementId(), revision = state()!.revision;
+      panel.webview.receiveMessage({ type: 'editRequirement', id });
+      pause = true;
+      panel.webview.receiveMessage({ type: 'revise', id, revision, name: 'Saved rule', text: 'A new requirement.', included: true, reason: '' });
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+      panel.webview.receiveMessage({ type: 'editingRequirement' });
+      expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'operationError' }));
+      release!();
+      await vi.waitFor(() => expect(state()?.committing).toBe(false));
+      expect(state()?.html).toContain('A new requirement.');
+    } finally { release?.(); handle.dispose(); }
+  });
+
+  it('keeps materials in preparation when local-file picking is cancelled or changes the scope', async () => {
+    const local: ReviewSet = { scopeId: 'files-selected', label: 'Selected local sources', headSha: 'live', files: [{ path: 'b.ts' }] };
+    const pickFiles = vi.fn<NonNullable<ScopePreparationOptions['pickFiles']>>()
+      .mockResolvedValueOnce(undefined).mockResolvedValueOnce(local);
+    const { handle, panel, saved } = await prepared({ pickFiles });
+    let completed = false;
+    void handle.result.then(() => { completed = true; });
+    try {
+      const originalSource = saved.at(-1)!.draft.materials[0];
+      panel.webview.receiveMessage({ type: 'pickFiles' });
+      await vi.waitFor(() => expect(pickFiles).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(state()?.committing).toBe(false));
+      expect(completed).toBe(false);
+      expect(state()?.materials[0].id).toBe(originalSource.id);
+      panel.webview.receiveMessage({ type: 'pickFiles' });
+      await vi.waitFor(() => expect(state()?.html).toContain('Keep one effect.'));
+      await vi.waitFor(() => expect(saved.at(-1)?.selection?.kind).toBe('files'));
+      await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, committing: false }));
+      expect(completed).toBe(false);
+      expect(saved.at(-1)?.draft.materials[0]).toEqual(originalSource);
+      expect(saved.at(-1)?.draft.confirmation).toBeUndefined();
+      panel.webview.receiveMessage({ type: 'select', cwd: root, kind: 'files', confirmed: true });
+      const result = await handle.result;
+      expect(result?.reviewSet).toEqual(local);
+      expect(result?.requirements?.materials[0]).toEqual(originalSource);
+      expect(result?.requirements && requirementReadiness(result.requirements, requirementScopeKey(root, local)).confirmed).toBe(true);
+    } finally { handle.dispose(); }
+  });
+
+  it('renders human additions once without inventing a previous AI summary or revision', async () => {
+    const { handle } = await prepared();
+    expect(state()?.humanOnly).toBe(true);
+    expect(state()?.html).not.toContain('Some items were revised by a human');
+    expect(state()?.html.match(/Keep one effect\./g)?.length).toBeGreaterThan(0);
+    handle.dispose();
+  });
+
+  it('restores selected local-file paths and the requirement draft before confirmation after reopening', async () => {
+    const first = await prepared({ pickFiles: async () => ({
+      scopeId: 'files-selected', label: 'Selected local sources', headSha: 'live', files: [{ path: 'b.ts' }],
+    }) });
+    first.panel.webview.receiveMessage({ type: 'pickFiles' });
+    await vi.waitFor(() => expect(first.saved.at(-1)?.selection?.relPaths).toEqual(['b.ts']));
+    await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, committing: false }));
+    const stored = structuredClone(first.saved.at(-1)!);
+    first.handle.dispose();
+    const handle = createScopePreparation(root, undefined, 'pr', { load: async () => stored, save: async () => {} });
+    const panel = vscodeMockState.panel!;
+    panel.webview.receiveMessage({ type: 'ready' });
+    await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'repository' })));
+    panel.webview.receiveMessage({ type: 'selection', cwd: root, kind: 'files' });
+    await vi.waitFor(() => expect(state()).toMatchObject({ ready: true, committing: false }));
+    expect(state()?.materials[0].id).toBe(stored.draft.materials[0].id);
+    panel.webview.receiveMessage({ type: 'select', cwd: root, kind: 'files', confirmed: true });
+    const result = await handle.result;
+    expect(result?.reviewSet?.files).toEqual([{ path: 'b.ts' }]);
+    expect(result?.requirements?.materials).toEqual(stored.draft.materials);
+    handle.dispose();
+  });
+
   it('persists pending material before returning from the retained preparation view without starting review', async () => {
     const onReturn = vi.fn();
     const { handle, panel, saved } = await open({ retainOnReturn: true, onReturn });

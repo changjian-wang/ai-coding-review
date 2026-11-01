@@ -6,7 +6,7 @@ import { currentBranch, listReviewRefs, repositoryRemoteIdentity, repositoryRoot
 import { ensureAuth, ensureGhAvailable, listPrs } from '../gh/ghClient';
 import type { PrSummary } from '../gh/types';
 import type { ReviewSet } from './types';
-import { BranchSnapshotScope, PrByNumberScope } from './scopes';
+import { BranchSnapshotScope, FileSystemScope, PrByNumberScope } from './scopes';
 import {
   acceptRequirementUnderstanding, addRequirementMaterial, clearRequirementConfirmation, confirmRequirements, createRequirementsDraft,
   currentMaterial, requirementReadiness, requirementScopeKey, restoreRequirementsDraft, reviseRequirement,
@@ -25,6 +25,7 @@ export interface PreparedScopeChoice {
   baseRef?: string;
   reviewSet?: ReviewSet;
   requirements?: RequirementsDraft;
+  relPaths?: string[];
 }
 
 interface RepositoryData {
@@ -47,6 +48,7 @@ export interface ScopePreparationOptions {
   analyze?(draft: RequirementsDraft, scope: { key: string; description: string }, token: vscode.CancellationToken, usage: (record: TokenUsage) => void): Promise<RequirementUnderstanding>;
   loadScope?(selection: PreparedScopeChoice): Promise<ReviewSet>;
   loadPrs?(cwd: string): Promise<PrSummary[]>;
+  pickFiles?(cwd: string): Promise<ReviewSet | undefined>;
   modelLabel?(): string;
   pickModel?(): Promise<void>;
   pickLanguage?(): Promise<void>;
@@ -88,14 +90,17 @@ function understandingHtml(draft: RequirementsDraft): string {
   const u = draft.understanding;
   if (!u) return '';
   const t = m().requirements;
+  const humanOnly = u.modelId === 'human';
+  const revised = !humanOnly && u.requirements.some((item) => item.basis === 'human'
+    && item.origins.some((ref) => draft.materials.find((source) => source.id === ref.sourceId)?.kind !== 'human'));
   const origin = (ref: { sourceId: string; version: number; line: number; endLine: number; quote: string }) => {
     const source = draft.materials.find((item) => item.id === ref.sourceId);
     return `<details><summary>${esc(source?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}–${ref.endLine}</summary><pre class="quote">${esc(ref.quote)}</pre><button class="secondary" data-source="${escAttr(ref.sourceId)}" data-version="${ref.version}">${esc(t.raw)}</button></details>`;
   };
-  return `<div class="understanding-intent markdown">${renderRequirementMarkdown(u.summary)}</div>${u.requirements.some((item) => item.basis === 'human') ? `<p class="hint">${esc(t.humanNotice)}</p>` : ''}${!u.requirements.length ? `<p>${esc(t.noRequirements)}</p>` : ''}
+  return `${revised ? `<p class="hint" data-human-notice>${esc(t.revisedNotice)}</p>` : `<div class="understanding-intent markdown">${renderRequirementMarkdown(humanOnly ? t.humanSummary : u.summary)}</div>`}${!u.requirements.length ? `<p>${esc(t.noRequirements)}</p>` : ''}
     ${u.requirements.map((item) => `<article class="item ${item.included ? '' : 'excluded'}" data-requirement="${escAttr(item.id)}"><div class="understanding-row"><span class="understanding-marker" aria-hidden="true">◇</span><div><h3>${esc(item.id)} · ${esc(item.title)}</h3><small>${item.origins.map((ref) => `${esc(draft.materials.find((source) => source.id === ref.sourceId)?.name ?? ref.sourceId)} · v${ref.version} · L${ref.line}`).join(' / ')}</small></div><span class="badge accent">${esc(item.basis === 'human' ? t.human : t.explicit)}</span></div><div class="markdown requirement-text">${renderRequirementMarkdown(item.text)}</div>${!item.included ? `<p class="hint">${esc(t.reason)}: ${esc(item.exclusionReason)}</p>` : ''}<details class="understanding-detail"><summary>${esc(m().reviewCenter.details)}</summary>${item.origins.map(origin).join('')}</details><button class="secondary" data-revise="${escAttr(item.id)}">${esc(t.revise)}</button></article>`).join('')}
     ${u.checks.length || u.questions.length ? `<details class="understanding-extras"><summary>${esc(fmt(m().reviewCenter.understandingExtras, u.checks.length, u.questions.length))}</summary><h3>${esc(t.checks)}</h3>${u.checks.map((check) => `<p>${esc(check.requirementIds.join(', '))} · ${esc(check.text)}</p>`).join('')}<h3>${esc(t.questions)}</h3>${u.questions.map((question) => `<div><p>${esc(question.text)}</p>${question.origins.map(origin).join('')}</div>`).join('')}</details>` : ''}
-    <details><summary>${esc(t.history)} (${draft.history.length})</summary><p class="hint">${esc(u.modelId)} · ${new Date(u.createdAt).toISOString()}</p>${draft.history.map((item) => `<p class="hint">${esc(new Date(item.at).toISOString())} · ${esc(item.action)}</p>`).join('')}
+    <details><summary>${esc(t.history)} (${draft.history.length})</summary>${revised ? `<p class="hint">${esc(t.priorSummary)}</p><div class="markdown">${renderRequirementMarkdown(u.summary)}</div>` : ''}<p class="hint">${esc(u.modelId)} · ${new Date(u.createdAt).toISOString()}</p>${draft.history.map((item) => `<p class="hint">${esc(new Date(item.at).toISOString())} · ${esc(item.action)}</p>`).join('')}
     ${draft.understandingHistory.map((previous) => `<details><summary>${esc(previous.modelId)} · ${esc(new Date(previous.createdAt).toISOString())}</summary>${previous.requirements.map((item) => `<article class="item"><strong>${esc(item.title)}</strong><div class="markdown">${renderRequirementMarkdown(item.text)}</div>${item.origins.map(origin).join('')}</article>`).join('')}</details>`).join('')}</details>
     `;
 }
@@ -112,8 +117,13 @@ export function createScopePreparation(
   const roots = [...new Set([defaultCwd, ...(vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath)])];
   let data: RepositoryData | undefined;
   let draft = createRequirementsDraft();
+  let savedRecord: { draft: RequirementsDraft; selection?: PreparedScopeChoice } = { draft: structuredClone(draft) };
   let selection: PreparedScopeChoice | undefined;
   let pinned: ReviewSet | undefined;
+  let fileScope = options.fileScope;
+  let saving = false;
+  let confirming = false;
+  let pickingFiles = false;
   let generation = 0;
   let analysis: vscode.CancellationTokenSource | undefined;
   let analyzing = false;
@@ -152,23 +162,28 @@ export function createScopePreparation(
   };
   const publish = () => {
     const key = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
+    const committing = saving || confirming || pickingFiles;
+    const visible = saving ? savedRecord.draft : draft;
     post({ type: 'requirements', state: {
-      revision: draft.revision, hasSources: selectedMaterials(draft).length > 0,
-      ready: !storageBlocked && scopeCurrent && !scopeLoading && !!key && requirementReadiness(draft, key).canConfirm,
+      revision: visible.revision, hasSources: selectedMaterials(visible).length > 0,
+      ready: !committing && !storageBlocked && scopeCurrent && !scopeLoading && !scopeError && !!key && requirementReadiness(visible, key).canConfirm,
+      committing, operation: confirming ? m().requirements.confirming : saving ? m().requirements.saving : pickingFiles ? m().scope.selectingFiles : '',
+      humanOnly: selectedMaterials(visible).length > 0 && selectedMaterials(visible).every((source) => source.kind === 'human'),
+      canPickFiles: !!options.pickFiles,
       busy: analyzing, reading, error: errorMessage,
-      scopeLoading, scopeReady: scopeCurrent && !scopeLoading, scopeError, scopeRetained: !!pinned && !scopeCurrent,
+      scopeLoading, scopeReady: !storageBlocked && scopeCurrent && !scopeLoading && !scopeError, scopeError, scopeRetained: !!pinned && !scopeCurrent,
       modelLabel: options.modelLabel?.() ?? m().reviewCenter.autoModel,
-      requirementCount: draft.understanding?.requirements.filter((item) => item.included).length ?? 0,
+      requirementCount: visible.understanding?.requirements.filter((item) => item.included).length ?? 0,
       scopeSummary: pinned ? `${pinned.source?.headRef ?? pinned.label}${pinned.source?.baseRef ? ` → ${pinned.source.baseRef}` : ''} · ${fmt(m().reviewCenter.scopeCount, pinned.files.filter((file) => !file.context).length)}` : '',
       scopeFiles: pinned?.files.filter((file) => !file.context).slice(0, 50).map((file) => file.path) ?? [],
       scopeMore: pinned ? Math.max(0, pinned.files.filter((file) => !file.context).length - 50) : 0,
       scopeDescription: pinned
         ? `${pinned.label} · ${m().scope.snapshotNotice(pinned.source?.headRef ?? '', pinned.headSha.slice(0, 12))}${pinned.comparison ? ` / ${m().scope.base}: ${pinned.comparison.baseSha.slice(0, 12)}` : ''}`
         : '',
-      usage: draft.usage,
-      materials: draft.materials.map((source) => ({
+      usage: visible.usage,
+      materials: visible.materials.map((source) => ({
         id: source.id, kind: source.kind, name: source.name, location: source.location, selected: source.selected, version: currentMaterial(source).version,
-      })), html: understandingHtml(draft),
+      })), html: understandingHtml(visible),
     } });
   };
   const notifyDraft = async () => {
@@ -176,12 +191,48 @@ export function createScopePreparation(
   };
   const save = async () => {
     if (!data || storageBlocked) throw new Error(m().requirements.loadFailed);
+    if (saving) throw new Error(m().requirements.committing);
     const owner = data, original = draft, scope = pinned;
-    await options.save?.(owner.cwd, owner.repositoryIdentity, { draft: structuredClone(original), selection: selection ? { ...selection } : undefined });
-    if (owner === data && original === draft && scope === pinned) await notifyDraft();
+    const run = generation, version = requestVersion;
+    const current = () => !disposed && run === generation && version === requestVersion
+      && owner === data && original === draft && scope === pinned;
+    const previous = structuredClone(savedRecord);
+    const next = { draft: structuredClone(original), selection: selection ? { ...selection } : undefined };
+    let persisted = false;
+    saving = true;
+    publish();
+    try {
+      await options.save?.(owner.cwd, owner.repositoryIdentity, next);
+      persisted = true;
+      if (!current()) return;
+      await notifyDraft();
+      if (current()) savedRecord = structuredClone(next);
+    } catch (error) {
+      let message = fmt(m().requirements.saveFailed, error instanceof Error ? error.message : String(error));
+      if (current()) {
+        draft = structuredClone(previous.draft);
+        if (persisted && options.save) {
+          try { await options.save(owner.cwd, owner.repositoryIdentity, previous); }
+          catch (rollbackError) {
+            storageBlocked = true;
+            message += ` ${fmt(m().requirements.rollbackFailed, rollbackError instanceof Error ? rollbackError.message : String(rollbackError))}`;
+          }
+        }
+      }
+      throw new Error(message);
+    } finally {
+      saving = false;
+      if (!disposed && run === generation && owner === data) publish();
+    }
   };
+  const loadSelection = (selected: PreparedScopeChoice) => selected.kind === 'files' && fileScope?.cwd === selected.cwd
+    ? Promise.resolve(fileScope.set) : (options.loadScope ?? loadPreparedScope)(selected);
   const choose = (input: Record<string, unknown>) => {
     const next = validatePreparedScope(data, input);
+    if (next.kind === 'files') {
+      if (fileScope?.cwd !== next.cwd) throw new Error(t.staleSelection);
+      next.relPaths = fileScope.set.files.filter((file) => !file.context).map((file) => file.path);
+    }
     if (next.kind !== 'pr' && data?.prsLoading) { prVersion++; data.prsLoading = false; }
     if (JSON.stringify(next) !== JSON.stringify(selection)) {
       cancel(); pinned = undefined; scopeCurrent = false; scopeError = '';
@@ -194,7 +245,7 @@ export function createScopePreparation(
     && (input.kind === 'pr' ? !data?.prsLoading && data?.prsCurrent !== false && Number(input.prNumber) > 0
       : input.kind === 'branchFull' ? !!input.headRef
         : input.kind === 'branchChanges' ? !!input.headRef && !!input.baseRef && input.headRef !== input.baseRef
-          : input.kind === 'files' && options.fileScope?.cwd === input.cwd);
+          : input.kind === 'files' && fileScope?.cwd === input.cwd);
   const refreshFiles = async (stillCurrent: () => boolean): Promise<void> => {
     const files = selectedMaterials(draft).filter((source) => source.kind === 'file');
     const reads = await Promise.all(files.map(async (source) => ({ source, loaded: await readRequirementFile(source.location) })));
@@ -221,8 +272,7 @@ export function createScopePreparation(
     scopeLoading = true; scopeCurrent = false; scopeError = ''; errorMessage = '';
     publish();
     try {
-      const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
-        ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
+      const set = await loadSelection(selected);
       if (disposed || run !== generation || version !== requestVersion) return;
       pinned = set;
       scopeLoading = false; scopeCurrent = true;
@@ -249,7 +299,6 @@ export function createScopePreparation(
       if (run === generation && version === requestVersion && !disposed) {
         if (scopeCurrent) errorMessage = String((error as Error).message);
         else scopeError = String((error as Error).message);
-        await save();
       }
     } finally {
       if (analysis === cts) { analysis = undefined; analyzing = false; scopeLoading = false; }
@@ -261,6 +310,7 @@ export function createScopePreparation(
     const run = ++generation;
     prVersion++;
     cancel(); data = undefined; selection = undefined; pinned = undefined; draft = createRequirementsDraft();
+    savedRecord = { draft: structuredClone(draft) };
     scopeCurrent = false; scopeError = '';
     storageBlocked = false; errorMessage = ''; reading = false;
     try {
@@ -276,14 +326,23 @@ export function createScopePreparation(
         const stored = await options.load?.(cwd, identity);
         if (run !== generation || disposed) return;
         if (stored) { draft = restoreRequirementsDraft(stored.draft); selection = stored.selection; }
+        if (selection?.kind === 'files' && selection.relPaths?.length) {
+          fileScope = { cwd, set: await new FileSystemScope(selection.relPaths).load(cwd) };
+          if (run !== generation || disposed) return;
+        }
+        if (selection?.kind === 'files' && fileScope?.cwd === cwd) selection.relPaths = fileScope.set.files.filter((file) => !file.context).map((file) => file.path);
+        savedRecord = { draft: structuredClone(draft), selection: selection ? { ...selection } : undefined };
       } catch (error) {
         storageBlocked = true;
         errorMessage = `${m().requirements.loadFailed} ${String((error as Error).message)}`;
       }
-      post({ type: 'repository', data, roots, selected, selection });
+      post({ type: 'repository', data, roots, selected, selection, filesCwd: fileScope?.cwd });
       publish();
     } catch (error) {
-      if (run === generation) post({ type: 'error', target: 'repository', message: String((error as Error).message) });
+      if (run === generation) {
+        post({ type: 'error', target: 'repository', message: String((error as Error).message) });
+        publish();
+      }
     }
   };
   lifecycle = panel.onDidDispose(() => { disposed = true; generation++; inbound?.dispose(); cancel(); markReady(false); if (!settled) finish(undefined); });
@@ -292,11 +351,22 @@ export function createScopePreparation(
     const run = generation;
     let inputVersion: number | undefined;
     try {
+      if ((saving || confirming || pickingFiles)
+        && !['ready', 'rendered', 'requirementsRendered', 'clientError'].includes(String(input.type))
+        && !(input.type === 'editingRequirement' && input.id === editingRequirement)) {
+        post({ type: 'operationError', message: m().requirements.committing });
+        return;
+      }
       if (input.type === 'ready') {
+        if ((saving || confirming || pickingFiles) && data) {
+          post({ type: 'repository', data, roots, selected: selectedRoot, selection, filesCwd: fileScope?.cwd, committing: true });
+          publish();
+          return;
+        }
         editingRequirement = undefined;
         if (rerendering && data) {
           rerendering = false;
-          post({ type: 'repository', data, roots, selected: selectedRoot, selection });
+          post({ type: 'repository', data, roots, selected: selectedRoot, selection, filesCwd: fileScope?.cwd });
           publish();
         } else { rerendering = false; await load(selectedRoot); }
         return;
@@ -306,7 +376,7 @@ export function createScopePreparation(
         editingRequirement = typeof input.id === 'string' && input.id ? input.id : undefined;
         return;
       }
-      if (editingRequirement && ['select', 'selection', 'clearSelection', 'repository', 'browse', 'return', 'cancel', 'organize', 'model', 'language'].includes(String(input.type))) {
+      if (editingRequirement && ['select', 'selection', 'clearSelection', 'repository', 'browse', 'return', 'cancel', 'organize', 'model', 'language', 'pickFiles'].includes(String(input.type))) {
         throw new Error(m().requirements.unsavedEdit);
       }
       if (input.type === 'rendered') { if (data && input.cwd === data.cwd) markReady(true); return; }
@@ -412,7 +482,7 @@ export function createScopePreparation(
           t = m().scope;
           rerendering = true;
           panel.title = t.prepareTitle;
-          panel.webview.html = scopePreparationView(selectedRoot, selection?.kind ?? initialKind, !!options.onReturn, options.fileScope?.cwd);
+          panel.webview.html = scopePreparationView(selectedRoot, selection?.kind ?? initialKind, !!options.onReturn, fileScope?.cwd);
         } else publish();
         return;
       }
@@ -423,20 +493,50 @@ export function createScopePreparation(
         editingRequirement = item.id;
         post({ type: 'editRequirement', item: { id: item.id, name: item.title, text: item.text, included: item.included, reason: item.exclusionReason, revision: draft.revision, cwd: data?.cwd } }); return;
       }
+      if (input.type === 'pickFiles' || input.type === 'select' && input.kind === 'files' && input.confirmed !== true && input.technicalOnly !== true) {
+        if (storageBlocked) throw new Error(m().requirements.loadFailed);
+        if (!options.pickFiles || reading || analyzing || scopeLoading) throw new Error(m().requirements.busy);
+        const owner = data, version = requestVersion;
+        pickingFiles = true;
+        publish();
+        let next: PreparedScopeChoice | undefined;
+        try {
+          const cwd = owner?.cwd ?? await realpath(selectedRoot);
+          const picked = await options.pickFiles(cwd);
+          if (!picked || owner !== data || run !== generation || version !== requestVersion || disposed) return;
+          if (!picked.files.length) throw new Error(m().scope.noFiles);
+          if (data && pinned && selection?.kind === 'files' && requirementScopeKey(cwd, picked) === requirementScopeKey(data.cwd, pinned)) return;
+          if (!data) {
+            const stored = await options.load?.(cwd);
+            if (owner !== data || run !== generation || version !== requestVersion || disposed) return;
+            if (stored) draft = restoreRequirementsDraft(stored.draft);
+            savedRecord = { draft: structuredClone(draft), selection: stored?.selection };
+            data = { cwd, refs: [], current: '', prsCurrent: false };
+          }
+          cancel();
+          fileScope = { cwd, set: picked };
+          selection = { cwd, kind: 'files', relPaths: picked.files.filter((file) => !file.context).map((file) => file.path) };
+          pinned = picked; scopeCurrent = true; scopeError = ''; errorMessage = '';
+          clearRequirementConfirmation(draft);
+          inputVersion = requestVersion;
+          post({ type: 'repository', data, roots, selected: selectedRoot, selection, filesCwd: cwd });
+          await save();
+          if (run === generation && inputVersion === requestVersion && !disposed) next = { ...selection };
+        } finally { pickingFiles = false; if (run === generation && !disposed) publish(); }
+        if (next) await organize({ ...next });
+        return;
+      }
       if (input.type === 'select') {
+        if (storageBlocked) throw new Error(m().requirements.loadFailed);
         if (reading || scopeLoading || analyzing) throw new Error(m().requirements.busy);
-        const selected = input.kind === 'files' && typeof input.cwd === 'string' && (input.cwd === selectedRoot || input.cwd === data?.cwd)
-          ? { cwd: await realpath(selectedRoot), kind: 'files' as const }
-          : choose(input);
-        if (selected.kind === 'files' && input.confirmed !== true && input.technicalOnly !== true) { complete(selected); return; }
+        const selected = choose(input);
         cancel();
         const previousKey = pinned && data ? requirementScopeKey(data.cwd, pinned) : '';
         const version = requestVersion;
         inputVersion = version;
-        scopeLoading = true; scopeCurrent = false; scopeError = ''; publish();
+        confirming = true; scopeLoading = true; scopeCurrent = false; scopeError = ''; errorMessage = ''; publish();
         try {
-          const set = selected.kind === 'files' && options.fileScope?.cwd === selected.cwd
-            ? options.fileScope.set : await (options.loadScope ?? loadPreparedScope)(selected);
+          const set = await loadSelection(selected);
           if (run !== generation || version !== requestVersion || disposed) return;
           const key = requirementScopeKey(selected.cwd, set);
           pinned = set; scopeCurrent = true;
@@ -451,8 +551,9 @@ export function createScopePreparation(
             confirmRequirements(draft, key, input.confirmed === true);
           }
           if (!storageBlocked) await save();
+          if (run !== generation || version !== requestVersion || disposed) return;
           complete({ ...selected, reviewSet: set, requirements: structuredClone(draft) });
-        } finally { if (run === generation && version === requestVersion) { scopeLoading = false; publish(); } }
+        } finally { confirming = false; if (run === generation && version === requestVersion) { scopeLoading = false; publish(); } }
         return;
       }
       if (storageBlocked || !data) throw new Error(m().requirements.loadFailed);
@@ -490,8 +591,8 @@ export function createScopePreparation(
       } else if (input.type === 'revise' && typeof input.id === 'string' && typeof input.text === 'string' && typeof input.name === 'string'
         && typeof input.included === 'boolean' && typeof input.reason === 'string') {
         if (input.revision !== draft.revision) throw new Error(m().requirements.stale);
-        cancel(); inputVersion = requestVersion; reviseRequirement(draft, input.id, input.name, input.text, input.included, input.reason);
-        await save(); if (run === generation && inputVersion === requestVersion && !disposed) { post({ type: 'editorSaved' }); publish(); } return;
+        cancel(); inputVersion = requestVersion; errorMessage = ''; reviseRequirement(draft, input.id, input.name, input.text, input.included, input.reason);
+        await save(); if (run === generation && inputVersion === requestVersion && !disposed) { editingRequirement = undefined; post({ type: 'editorSaved' }); publish(); } return;
       } else if (input.type === 'file' || input.type === 'link' || input.type === 'reloadSource') {
         cancel(); reading = true; readAbort = new AbortController(); publish();
         const owner = data;
@@ -534,7 +635,7 @@ export function createScopePreparation(
         if (target === 'scope') scopeError = String((error as Error).message);
         else errorMessage = String((error as Error).message);
         publish();
-        post({ type: input.type === 'link' || input.type === 'material' || input.type === 'revise' ? 'editorError' : 'error', target, message: target === 'scope' ? scopeError : errorMessage });
+        post({ type: input.type === 'link' || input.type === 'material' || input.type === 'revise' ? 'editorError' : 'error', target: target ?? 'operation', message: target === 'scope' ? scopeError : errorMessage });
       }
     }
   });

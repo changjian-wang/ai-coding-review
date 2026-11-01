@@ -79,7 +79,7 @@ export interface RequirementsDraft {
 
 export interface RequirementPreparationRecord {
   draft: RequirementsDraft;
-  selection?: { cwd: string; kind: 'pr' | 'branchChanges' | 'branchFull' | 'files'; prNumber?: number; headRef?: string; baseRef?: string };
+  selection?: { cwd: string; kind: 'pr' | 'branchChanges' | 'branchFull' | 'files'; prNumber?: number; headRef?: string; baseRef?: string; relPaths?: string[] };
 }
 
 export function createRequirementsDraft(): RequirementsDraft {
@@ -257,7 +257,7 @@ export function parseRequirementUnderstanding(
 
 export function humanRequirementUnderstanding(draft: RequirementsDraft, scopeKey: string): RequirementUnderstanding {
   return parseRequirementUnderstanding({
-    summary: m().requirements.humanNotice, requirements: [], checks: [], questions: [],
+    summary: m().requirements.humanSummary, requirements: [], checks: [], questions: [],
   }, draft, scopeKey, 'human');
 }
 

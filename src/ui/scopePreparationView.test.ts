@@ -9,9 +9,11 @@ function client(kind = 'pr') {
   if (!script) throw new Error('Preparation script is missing');
   interface Element {
     value: string; textContent: string; hidden: boolean; disabled: boolean; checked: boolean; open: boolean;
-    id: string; label: string; title: string; innerHTML: string; tag: string;
+    id: string; label: string; title: string; innerHTML: string; tag: string; inert: boolean;
     children: Element[]; readonly options: Element[];
+    classList: { toggle(name: string, force?: boolean): boolean };
     onclick?: () => void; onchange?: () => void;
+    onsubmit?: (event: { preventDefault(): void }) => void;
     replaceChildren(): void; appendChild(child: Element): void; addEventListener(): void;
     setAttribute(name: string, value: string): void; getAttribute(name: string): string | undefined;
     showModal(): void; close(): void;
@@ -20,11 +22,17 @@ function client(kind = 'pr') {
   const element = (tag = ''): Element => {
     let value = '';
     const attributes = new Map<string, string>();
+    const classes = new Set<string>();
     return {
       get value() { return value; },
       set value(next: string) { value = tag === 'select' && !this.options.some((option) => option.value === String(next)) ? '' : String(next); },
       textContent: '', innerHTML: '', hidden: false, disabled: false, checked: false, open: false,
-      id: '', label: '', title: '', tag, children: [],
+      id: '', label: '', title: '', tag, children: [], inert: false,
+      classList: { toggle(name, force) {
+        const enabled = force ?? !classes.has(name);
+        if (enabled) classes.add(name); else classes.delete(name);
+        return enabled;
+      } },
       get options() { return this.children.flatMap((child) => child.tag === 'optgroup' ? child.children : [child]); },
       replaceChildren() { this.children = []; value = ''; },
       appendChild(child) { this.children.push(child); if (child.id) elements.set(child.id, child); },
@@ -88,6 +96,56 @@ function client(kind = 'pr') {
 afterEach(() => resetVscodeMock());
 
 describe('preparation repository actions', () => {
+  it('cancels a link read even when the dialog is closed before the first host acknowledgement', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ ready: true });
+    page.get('link').onclick?.();
+    page.get('material-link').value = 'https://example.test/requirements.txt';
+    page.get('material-form').onsubmit?.({ preventDefault() {} });
+    expect(page.messages.at(-1)).toMatchObject({ type: 'link' });
+    page.get('close-editor').onclick?.();
+    expect(page.messages.at(-1)).toEqual({ type: 'cancelAnalysis' });
+  });
+  it('locks range changes, returns and cancellation while a save is awaiting acknowledgement', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ committing: true, operation: m().requirements.saving, ready: true });
+    for (const id of ['confirm', 'technical', 'head', 'base', 'repository', 'return-review', 'return-conclusion', 'cancel-inline', 'close-editor']) {
+      expect(page.get(id).disabled, id).toBe(true);
+    }
+    expect(page.get('preparation-shell').inert).toBe(true);
+    expect(page.get('status-text').textContent).toBe(m().requirements.saving);
+    page.requirements({ committing: false, ready: true });
+    expect(page.get('preparation-shell').inert).toBe(false);
+    expect(page.get('head').disabled).toBe(false);
+  });
+
+  it('keeps local-source selection inside preparation instead of completing a bare files scope', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ ready: true, humanOnly: true });
+    page.get('files').onclick?.();
+    expect(page.messages.at(-1)).toEqual({ type: 'pickFiles' });
+    page.receive({ type: 'fileScope', cwd: 'C:\\repo' });
+    expect(page.get('kind').value).toBe('files');
+    expect(page.get('target-files').checked).toBe(true);
+    expect(page.get('understanding-title').textContent).toBe(m().requirements.humanTitle);
+  });
+
+  it('does not carry a local-file mode into a different repository without selected paths', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.receive({ type: 'fileScope', cwd: 'C:\\repo' });
+    expect(page.get('kind').value).toBe('files');
+    page.receive({
+      type: 'repository', selected: 'C:\\other', roots: ['C:\\repo', 'C:\\other'],
+      data: { cwd: 'C:\\other', refs: ['main', 'feature'], current: 'feature', prsCurrent: false },
+    });
+    expect(page.get('kind').value).toBe('pr');
+    expect(page.get('files-target-field').hidden).toBe(true);
+    expect(page.messages.at(-1)).toMatchObject({ type: 'rendered', cwd: 'C:\\other' });
+  });
   it('provides one in-place revision surface and an explicit human requirement action', () => {
     const page = client();
     expect(page.html).toContain('id="human"');

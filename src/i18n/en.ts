@@ -266,6 +266,7 @@ export const en = {
   },
 
   scope: {
+    selectingFiles: 'Choosing local source files…',
     pickFilesLabel: '$(files) Pick source files/folders',
     pickFilesDescription: 'Pure source review',
     pickFilesDetail:
@@ -344,7 +345,9 @@ export const en = {
     refreshHint: 'Reload the repository, branch or PR choices. This is not the AI-understanding retry action.',
     startScope: 'Load selected code scope',
     scopeBoundary: 'Confirming the current understanding starts requirement-aware business review. Confirmation establishes intent and scope, not proof that requirements are correct or satisfied.',
-    localFiles: 'Review local working-tree files instead',
+    localFiles: 'Choose local source files…',
+    localFilesHint: 'Selected requirements are preserved. Confirm their applicability again for the selected files.',
+    fileTarget: 'Files',
     currentFilesTarget: 'Current local-file scope',
     staleSelection: 'The repository selection changed or is not ready. Select the target again.',
     noBranches: 'No commit-backed branches were found in this repository.',
@@ -353,6 +356,8 @@ export const en = {
   },
 
   reviewCenter: {
+    prepareActionHint: 'Confirm requirements to start review. Nothing is published to GitHub automatically.',
+    reviewOptions: 'Other review options',
     copyDraft: 'Copy',
     commentInBody: 'This location is outside commentable PR diff lines. Its feedback is included in the review body, not an invalid inline comment.',
     saveDraft: 'Save Markdown',
@@ -608,6 +613,16 @@ export const en = {
   },
 
   requirements: {
+    humanTitle: 'Requirements for this review',
+    editBoundary: 'This revises the review understanding, not the original source. Confirm the saved wording again before review.',
+    humanSummary: 'Explicit human requirements. AI review has not run yet.',
+    revisedNotice: 'Requirements were revised by a human. Confirm the current wording before review.',
+    priorSummary: 'Earlier AI summary · historical context, not revalidated',
+    saving: 'Saving changes…',
+    confirming: 'Confirming requirements and opening the review…',
+    committing: 'A save or confirmation is in progress. Wait for it to finish before cancelling or changing scope.',
+    saveFailed: 'The change was not applied. Your edit remains available for retry. {0}',
+    rollbackFailed: 'Restoring the previous saved preparation also failed. Reopen preparation before continuing. {0}',
     addHuman: 'Add an explicit requirement',
     unsavedEdit: 'Save or cancel the requirement revision first.',
     section: 'Requirement evidence (optional)',
@@ -633,7 +648,7 @@ export const en = {
     analyzing: 'Reading scope and organizing requirements…',
     failed: 'Understanding is not ready. Material is preserved; no requirement was confirmed.',
     ready: 'Check the understanding below. Confirming it does not prove the requirements correct.',
-    confirm: 'Confirm understanding and continue',
+    confirm: 'Confirm requirements and start review',
     startTechnical: 'Continue technical review',
     skip: 'Continue technical only — do not assess requirements',
     explicit: 'Explicit source requirement',

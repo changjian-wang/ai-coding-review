@@ -137,12 +137,17 @@ describe('preparation host messaging', () => {
   it('preserves explicit local-file review when Git metadata cannot be loaded', async () => {
     const root = process.cwd();
     vi.mocked(repositoryRoot).mockRejectedValueOnce(new Error('Not a Git repository'));
-    const handle = createScopePreparation(root);
+    const local = { scopeId: 'files-local', headSha: 'live', label: 'Selected local sources', files: [{ path: 'example.ts' }] };
+    const handle = createScopePreparation(root, undefined, 'pr', { pickFiles: async () => local });
     const panel = vscodeMockState.panel!;
     panel.webview.receiveMessage({ type: 'ready' });
     await vi.waitFor(() => expect(panel.webview.messages).toContainEqual({ type: 'error', target: 'repository', message: 'Not a Git repository' }));
     panel.webview.receiveMessage({ type: 'select', cwd: root, kind: 'files' });
-    await expect(handle.result).resolves.toMatchObject({ kind: 'files' });
+    await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({
+      type: 'requirements', state: expect.objectContaining({ ready: true, committing: false }),
+    })));
+    panel.webview.receiveMessage({ type: 'select', cwd: root, kind: 'files', confirmed: true });
+    await expect(handle.result).resolves.toMatchObject({ kind: 'files', reviewSet: local, requirements: expect.any(Object) });
   });
 
   it('discards a late PR error when a newer repository load is already active', async () => {

@@ -228,6 +228,7 @@ export const zh: Messages = {
   },
 
   scope: {
+    selectingFiles: '正在选择本地源码…',
     pickFilesLabel: '$(files) 选择源码文件/文件夹',
     pickFilesDescription: '纯源码审查',
     pickFilesDetail: '直接挑选要审查的源文件或目录，不依赖任何 diff',
@@ -304,7 +305,9 @@ export const zh: Messages = {
     refreshHint: '重新加载仓库、分支或 PR 选项，不是 AI 需求理解的重试入口。',
     startScope: '载入所选代码范围',
     scopeBoundary: '确认当前理解后开始需求感知业务审查。确认仅确立意图与范围，不代表需求本身正确或已满足。',
-    localFiles: '改为审查本地工作树文件',
+    localFiles: '选择本地源码…',
+    localFilesHint: '保留已选需求，选择文件后重新确认适用范围。',
+    fileTarget: '文件',
     currentFilesTarget: '当前本地文件范围',
     staleSelection: '仓库选择已变化或尚未就绪，请重新选择审查对象。',
     noBranches: '该仓库没有可读取提交的分支。',
@@ -313,6 +316,8 @@ export const zh: Messages = {
   },
 
   reviewCenter: {
+    prepareActionHint: '确认需求后开始审查，不会自动发布到 GitHub。',
+    reviewOptions: '其他审查方式',
     copyDraft: '复制',
     commentInBody: '该位置不在 PR 可行内评论的差异行内，反馈已保留在审查正文，不生成无效的行内评论。',
     saveDraft: '保存 Markdown',
@@ -568,6 +573,16 @@ export const zh: Messages = {
   },
 
   requirements: {
+    humanTitle: '本次审查要求',
+    editBoundary: '修订只影响本次理解，不修改原文；保存后需重新确认。',
+    humanSummary: '以下是人工明确提供的要求，尚未进行 AI 审查。',
+    revisedNotice: '条目已人工修订，请核对当前内容后开始审查。',
+    priorSummary: '修订前的 AI 摘要 · 仅作历史参考，未重新验证',
+    saving: '正在保存更改…',
+    confirming: '正在确认需求并进入审查…',
+    committing: '正在保存或确认，请等待完成后再取消或切换范围。',
+    saveFailed: '本次更改未应用，输入仍保留，可重试保存。{0}',
+    rollbackFailed: '恢复此前已保存的准备记录也失败，请重新打开准备页后再继续。{0}',
     addHuman: '补充明确要求',
     unsavedEdit: '请先保存或取消当前需求修订。',
     section: '提供需求依据（可选）',
@@ -593,7 +608,7 @@ export const zh: Messages = {
     analyzing: '正在读取代码范围并整理需求…',
     failed: '理解尚未就绪，材料原文已保留，没有确认任何需求。',
     ready: '请核对以下理解；确认不代表需求或其前提已经正确。',
-    confirm: '确认理解并继续审查',
+    confirm: '确认需求并开始审查',
     startTechnical: '继续技术审查',
     skip: '仅继续技术审查，不验证需求',
     explicit: '原文明确要求',

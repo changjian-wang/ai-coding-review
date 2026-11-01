@@ -16,6 +16,7 @@ import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
 import { runStartupHostChecks } from './startupHostIntegration';
 import { runPreparationLoadingHostChecks } from './preparationLoadingHostIntegration';
+import { runPreparationActionsHostChecks } from './preparationActionsHostIntegration';
 import { runStageNavigationHostChecks } from './stageNavigationHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
@@ -118,6 +119,7 @@ export async function run(): Promise<void> {
     await within(failedRequirements, 30_000, 'real requirement failure state');
     preparation.dispose();
     checks.push('real model-failure UI preserves material and does not fabricate understanding');
+    checks.push(...await runPreparationActionsHostChecks(root));
 
     const set = await new BranchSnapshotScope('feature', 'main').load(root);
     const source = new CommitSource(root, set);

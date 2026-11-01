@@ -2,6 +2,7 @@ import type * as vscode from 'vscode';
 import type { FileAnalysisSummary, Finding, GlobalReport } from '../ai/types';
 import type { ReviewComparison, ReviewSource } from '../scope/types';
 import { restoreRequirementsDraft, type RequirementsDraft, type RequirementPreparationRecord } from './requirements';
+import { validateRepositoryPath } from '../scope/gitClient';
 import { m } from '../i18n';
 import type { BusinessReviewRun } from './businessReview';
 
@@ -251,6 +252,10 @@ export class WorkspaceStateReviewStore implements ReviewStore {
       || typeof selection.cwd !== 'string' || !('kind' in selection)
       || !['pr', 'branchChanges', 'branchFull', 'files'].includes(String(selection.kind)))) {
       throw new Error(m().requirements.invalidState);
+    }
+    if (selection && typeof selection === 'object' && 'relPaths' in selection) {
+      if (!Array.isArray(selection.relPaths) || selection.relPaths.some((path) => typeof path !== 'string')) throw new Error(m().requirements.invalidState);
+      for (const path of selection.relPaths) validateRepositoryPath(path);
     }
     return {
       draft: restoreRequirementsDraft(raw.draft),

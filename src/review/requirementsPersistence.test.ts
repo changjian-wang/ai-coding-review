@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { ReviewSession } from './reviewSession';
 import { WorkspaceStateReviewStore } from './reviewStore';
@@ -7,6 +7,7 @@ import {
   createRequirementsDraft, parseRequirementUnderstanding, requirementScopeKey, updateRequirementMaterial,
 } from './requirements';
 import type { ReviewSet } from '../scope/types';
+import { reviewCenterFixture } from '../test/reviewCenterFixture';
 
 function storeFixture() {
   const entries = new Map<string, unknown>();
@@ -36,6 +37,34 @@ function confirmedDraft() {
 }
 
 describe('requirement baseline persistence and technical conclusions', () => {
+  it('rolls back active requirements and the business report if the awaited metadata save fails', async () => {
+    const { session, store } = await reviewCenterFixture({ defect: false });
+    const previous = structuredClone(session.requirements);
+    const next = structuredClone(session.requirements!);
+    updateRequirementMaterial(next, next.materials[0].id, 'A replacement requirement.');
+    vi.spyOn(store, 'save').mockRejectedValueOnce(new Error('Disk unavailable'));
+    await expect(session.setRequirements(next)).rejects.toThrow('Disk unavailable');
+    expect(session.requirements).toEqual(previous);
+    expect(session.businessReview?.status).toBe('completed');
+    expect(session.canSubmitConclusion('approve')).toBe(true);
+    session.dispose();
+  });
+
+  it('does not resurrect a completed report when code changes during a failed requirement write', async () => {
+    const { session, store } = await reviewCenterFixture({ defect: false });
+    const next = structuredClone(session.requirements!);
+    updateRequirementMaterial(next, next.materials[0].id, 'A replacement requirement.');
+    let reject!: (error: Error) => void;
+    vi.spyOn(store, 'save').mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const write = session.setRequirements(next);
+    await vi.waitFor(() => expect(reject).toBeTypeOf('function'));
+    session.invalidateBusinessReview();
+    reject(new Error('Disk unavailable'));
+    await expect(write).rejects.toThrow('Disk unavailable');
+    expect(session.businessReview?.status).toBe('stale');
+    expect(session.canSubmitConclusion('approve')).toBe(false);
+    session.dispose();
+  });
   it('restores original source, understanding and explicit confirmation for the same immutable scope', async () => {
     const { store } = storeFixture();
     const session = new ReviewSession(store, 'repo');
