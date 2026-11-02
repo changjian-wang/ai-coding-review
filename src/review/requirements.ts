@@ -349,6 +349,14 @@ export function clearRequirementConfirmation(draft: RequirementsDraft): void {
   draft.technicalOnly = false;
 }
 
+export function setTechnicalReviewMode(draft: RequirementsDraft, technicalOnly: boolean): void {
+  if ((draft.technicalOnly === true) === technicalOnly) return;
+  clearRequirementConfirmation(draft);
+  draft.technicalOnly = technicalOnly;
+  draft.revision++;
+  draft.history.push({ at: Date.now(), action: technicalOnly ? m().requirements.technicalNotice : m().requirements.requirementsMode });
+}
+
 export function restoreRequirementsDraft(value: unknown): RequirementsDraft {
   const root = record(value);
   if (root.version !== 1 || !Number.isInteger(root.revision) || Number(root.revision) < 0

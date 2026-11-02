@@ -10,7 +10,7 @@ import { BranchSnapshotScope, FileSystemScope, PrByNumberScope } from './scopes'
 import {
   acceptRequirementUnderstanding, addRequirementMaterial, clearRequirementConfirmation, confirmRequirements, createRequirementsDraft,
   currentMaterial, requirementReadiness, requirementScopeKey, restoreRequirementsDraft, reviseRequirement,
-  humanRequirementUnderstanding, selectedMaterials, selectRequirementMaterial, updateRequirementMaterial, type RequirementsDraft, type RequirementUnderstanding,
+  humanRequirementUnderstanding, selectedMaterials, selectRequirementMaterial, setTechnicalReviewMode, updateRequirementMaterial, type RequirementsDraft, type RequirementUnderstanding,
 } from '../review/requirements';
 import { readRequirementFile, readRequirementLink } from '../review/requirementSources';
 import { renderRequirementMarkdown } from '../ui/requirementMarkdown';
@@ -166,8 +166,9 @@ export function createScopePreparation(
     const visible = saving ? savedRecord.draft : draft;
     post({ type: 'requirements', state: {
       revision: visible.revision, hasSources: selectedMaterials(visible).length > 0,
-      ready: !committing && !storageBlocked && scopeCurrent && !scopeLoading && !scopeError && !!key && requirementReadiness(visible, key).canConfirm,
-      committing, operation: confirming ? m().requirements.confirming : saving ? m().requirements.saving : pickingFiles ? m().scope.selectingFiles : '',
+      ready: !committing && !storageBlocked && scopeCurrent && !scopeLoading && !scopeError && !!key && (visible.technicalOnly === true || requirementReadiness(visible, key).canConfirm),
+      technicalOnly: visible.technicalOnly === true,
+      committing, confirming, pickingFiles, operation: confirming ? m().requirements.confirming : saving ? m().requirements.saving : pickingFiles ? m().scope.selectingFiles : '',
       humanOnly: selectedMaterials(visible).length > 0 && selectedMaterials(visible).every((source) => source.kind === 'human'),
       canPickFiles: !!options.pickFiles,
       busy: analyzing, reading, error: errorMessage,
@@ -277,6 +278,7 @@ export function createScopePreparation(
       pinned = set;
       scopeLoading = false; scopeCurrent = true;
       await notifyDraft();
+      if (draft.technicalOnly && !force) return;
       await refreshFiles(() => !disposed && run === generation && version === requestVersion);
       if (disposed || run !== generation || version !== requestVersion) return;
       const scopeKey = requirementScopeKey(selected.cwd, set);
@@ -376,7 +378,7 @@ export function createScopePreparation(
         editingRequirement = typeof input.id === 'string' && input.id ? input.id : undefined;
         return;
       }
-      if (editingRequirement && ['select', 'selection', 'clearSelection', 'repository', 'browse', 'return', 'cancel', 'organize', 'model', 'language', 'pickFiles'].includes(String(input.type))) {
+      if (editingRequirement && ['select', 'selection', 'clearSelection', 'repository', 'browse', 'return', 'cancel', 'organize', 'model', 'language', 'pickFiles', 'reviewMode'].includes(String(input.type))) {
         throw new Error(m().requirements.unsavedEdit);
       }
       if (input.type === 'rendered') { if (data && input.cwd === data.cwd) markReady(true); return; }
@@ -541,9 +543,7 @@ export function createScopePreparation(
           const key = requirementScopeKey(selected.cwd, set);
           pinned = set; scopeCurrent = true;
           if (input.technicalOnly === true) {
-            clearRequirementConfirmation(draft);
-            draft.technicalOnly = true;
-            draft.history.push({ at: Date.now(), action: m().requirements.technicalNotice });
+            setTechnicalReviewMode(draft, true);
           } else {
             await refreshFiles(() => run === generation && version === requestVersion && !disposed);
             if (run !== generation || version !== requestVersion || disposed) return;
@@ -557,6 +557,19 @@ export function createScopePreparation(
         return;
       }
       if (storageBlocked || !data) throw new Error(m().requirements.loadFailed);
+      if (input.type === 'reviewMode') {
+        if (reading || analyzing || scopeLoading) throw new Error(m().requirements.busy);
+        if (typeof input.technicalOnly !== 'boolean') throw new Error(m().requirements.invalidState);
+        if (input.cwd !== data.cwd || input.revision !== draft.revision) throw new Error(m().requirements.stale);
+        setTechnicalReviewMode(draft, input.technicalOnly);
+        errorMessage = '';
+        inputVersion = requestVersion;
+        await save();
+        if (run !== generation || inputVersion !== requestVersion || disposed) return;
+        if (targetProvided(input)) await organize(input);
+        else publish();
+        return;
+      }
       if (input.type === 'clearSelection') {
         if (input.cwd !== data.cwd || !['pr', 'branchChanges', 'branchFull', 'files'].includes(String(input.kind))) throw new Error(t.staleSelection);
         cancel(); selection = undefined; pinned = undefined; scopeCurrent = false; scopeError = ''; errorMessage = '';
@@ -631,7 +644,7 @@ export function createScopePreparation(
       }
     } catch (error) {
       if (run === generation && (inputVersion === undefined || inputVersion === requestVersion) && !disposed) {
-        const target = ['select', 'selection', 'organize'].includes(String(input.type)) ? 'scope' : undefined;
+        const target = ['select', 'selection', 'organize', 'pickFiles'].includes(String(input.type)) ? 'scope' : undefined;
         if (target === 'scope') scopeError = String((error as Error).message);
         else errorMessage = String((error as Error).message);
         publish();

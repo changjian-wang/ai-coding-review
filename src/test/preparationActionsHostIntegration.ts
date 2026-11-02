@@ -31,6 +31,16 @@ interface ActionReport {
   bodyTop: number;
   bodyBottom: number;
   viewport: number;
+  modeChecked: boolean;
+  modeDisabled: boolean;
+  understandingHidden: boolean;
+  operationError: string;
+  targetError: string;
+  targetStatus: string;
+  footerButtons: number;
+  primaryText: string;
+  unifiedControls: boolean;
+  filesDisabled: boolean;
 }
 
 async function waitFor(test: () => boolean, label: string): Promise<void> {
@@ -75,7 +85,12 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
       if (mode === 'pause') await new Promise<void>((resolve) => { release = resolve; });
       saved = structuredClone(record.draft);
     },
-    pickFiles: async () => ++picks === 1 ? undefined : local,
+    pickFiles: async () => {
+      picks++;
+      if (picks === 1) return undefined;
+      if (picks === 2) throw new Error('Controlled native source selection failure');
+      return local;
+    },
   });
   void handle.result.then(() => { completed = true; });
   const anchor = "rememberPreparation();api.postMessage({type:'ready'});";
@@ -88,7 +103,9 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
         $('inline-body').dispatchEvent(new Event('input',{bubbles:true}));
         $('requirement-inline').requestSubmit();
       }else if(message.action==='cancel')$('cancel-inline').click();
-      else if(message.action==='files'){$('review-options').open=true;$('files').click();}
+      else if(message.action==='filesMode'){$('target-files').checked=true;$('target-files').dispatchEvent(new Event('change'));}
+      else if(message.action==='files')$('files').click();
+      else if(message.action==='technical')$('technical').click();
       else if(message.action==='confirm')$('confirm').click();
       else if(message.action==='lateScope')api.postMessage({type:'selection',cwd:${JSON.stringify(cwd)},kind:'branchFull',headRef:'main'});
       else if(message.action==='bottom')$('prepare-scroll').scrollTop=$('prepare-scroll').scrollHeight;
@@ -103,7 +120,12 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
           branchDisabled:$('head').disabled,inert:$('preparation-shell').inert,kind:$('kind').value,fileModeVisible:!$('files-target-field').hidden,
           materials:document.querySelectorAll('.material').length,humanNotice:$('understanding').textContent.includes(R.humanNotice),
           scrollTop:scroll.top,scrollBottom:scroll.bottom,footerTop:footer.top,footerBottom:footer.bottom,
-          bodyTop:rect?.top??0,bodyBottom:rect?.bottom??0,viewport:innerHeight
+          bodyTop:rect?.top??0,bodyBottom:rect?.bottom??0,viewport:innerHeight,
+          modeChecked:$('technical').checked,modeDisabled:$('technical').disabled,understandingHidden:$('understanding').hidden,
+          operationError:$('requirement-error').hidden?'':$('requirement-error').textContent,
+          targetError:$('error').hidden?'':$('error').textContent,targetStatus:$('status-text').textContent,
+          footerButtons:$('prepare-footer').querySelectorAll('button').length,primaryText:$('confirm').textContent,filesDisabled:$('files').disabled,
+          unifiedControls:!$('review-options')&&$('files').closest('section')===document.querySelectorAll('main>section')[0]&&$('technical').closest('section')===document.querySelectorAll('main>section')[1]
         }});
       });
     });
@@ -132,10 +154,27 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
     const initial = await probe('bottom');
     assert.equal(initial.heading, m().requirements.humanTitle);
     assert.equal(initial.humanNotice, false);
-    assert.equal(initial.fileModeVisible, false);
+    assert.equal(initial.fileModeVisible, true);
+    assert.equal(initial.footerButtons, 1);
+    assert.equal(initial.primaryText, m().reviewCenter.start);
+    assert.equal(initial.unifiedControls, true);
     assert.ok(initial.scrollBottom <= initial.footerTop + 1, 'Footer must not overlap the scrollable preparation');
     assert.ok(initial.bodyTop >= initial.scrollTop - 1 && initial.bodyBottom <= initial.footerTop + 1, 'Requirement body must be readable above the action area');
     assert.ok(initial.footerBottom <= initial.viewport + 1);
+    write = 'fail';
+    await probe('technical');
+    const failedMode = await until((report) => report.operationError.includes('Controlled native storage failure') && !report.modeDisabled, 'native failed-mode save rollback');
+    assert.equal(failedMode.modeChecked, false);
+    assert.equal(saved.technicalOnly, false);
+    await probe('technical');
+    const technical = await until((report) => report.modeChecked && !report.modeDisabled && !report.confirmDisabled, 'native technical-mode acknowledgement');
+    assert.equal(technical.understandingHidden, true);
+    assert.equal(technical.footerButtons, 1);
+    assert.equal(completed, false, 'Changing mode must not start a review');
+    assert.equal(saved.technicalOnly, true);
+    await probe('technical');
+    await until((report) => !report.modeChecked && !report.understandingHidden && !report.confirmDisabled, 'native requirement mode restored');
+    assert.equal(saved.confirmation, undefined);
     await probe('edit');
     await until((report) => report.editor && !report.saveDisabled, 'native inline editor');
     write = 'fail';
@@ -156,12 +195,23 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
     await until((report) => !report.editor && report.body === revised && !report.confirmDisabled, 'native retry saved');
     assert.equal(saved.materials[0].versions[0].text, original);
     assert.equal(saved.understanding?.requirements[0].text, revised);
+    await probe('filesMode');
+    const unselected = await until((report) => !report.inert && !report.filesDisabled && report.kind === 'files' && report.confirmDisabled, 'native file mode before selection');
+    assert.equal(unselected.targetStatus, m().scope.chooseFilesHint);
+    assert.equal(unselected.primaryText, m().reviewCenter.start);
     await probe('files');
     await waitFor(() => picks === 1, 'cancelled native file picker');
-    await until((report) => !report.inert && report.kind === 'branchChanges' && report.body === revised, 'native cancelled picker keeps preparation');
+    const cancelled = await until((report) => !report.inert && report.kind === 'files' && report.body === revised, 'native cancelled picker keeps preparation');
+    assert.equal(cancelled.confirmDisabled, true);
+    assert.equal(cancelled.primaryText, m().reviewCenter.start);
     assert.equal(completed, false);
     await probe('files');
-    await waitFor(() => picks === 2, 'selected native files');
+    await waitFor(() => picks === 2, 'native file-picker failure');
+    const failedFiles = await until((report) => !report.inert && report.targetError.includes('Controlled native source selection failure'), 'native source-selection error in target card');
+    assert.equal(failedFiles.confirmDisabled, true);
+    assert.equal(failedFiles.materials, 1);
+    await probe('files');
+    await waitFor(() => picks === 3, 'selected native files');
     const files = await until((report) => !report.inert && report.kind === 'files' && !report.confirmDisabled, 'native file scope ready');
     assert.equal(files.materials, 1);
     assert.equal(files.fileModeVisible, true);
@@ -185,6 +235,7 @@ export async function runPreparationActionsHostChecks(cwd: string): Promise<stri
       'native human requirements render once and remain fully readable above a non-overlapping action footer',
       'native failed save retains the edit and original state; retry works, while in-flight cancellation is disabled',
       'native local-file selection preserves requirements and waits for fresh confirmation; late scope changes cannot redirect it',
+      'native preparation has PR/branch/files targets, a persisted requirement-mode choice and one start action; mode-save and file-picker failures recover without starting review or losing material',
     ];
   } finally { release?.(); subscription.dispose(); handle.dispose(); }
 }

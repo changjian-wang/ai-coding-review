@@ -29,7 +29,7 @@ function understood(draft: RequirementsDraft, key: string) {
 
 interface ClientState {
   revision: number; ready: boolean; busy: boolean; reading: boolean; error: string; html: string;
-  committing: boolean; humanOnly: boolean;
+  committing: boolean; humanOnly: boolean; technicalOnly: boolean;
   scopeLoading: boolean; scopeReady: boolean; scopeError: string;
   materials: { id: string; name: string; selected: boolean; version: number }[];
 }
@@ -75,6 +75,88 @@ beforeEach(() => {
 afterEach(() => { resetVscodeMock(); vi.clearAllMocks(); });
 
 describe('three-block preparation with real host state transitions', () => {
+  it('persists technical mode without starting review, and requires fresh confirmation when switching back', async () => {
+    const { handle, panel, saved } = await prepared();
+    let completed = false;
+    void handle.result.then(() => { completed = true; });
+    try {
+      const source = structuredClone(saved.at(-1)!.draft.materials);
+      panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision: state()!.revision, technicalOnly: true });
+      await vi.waitFor(() => expect(state()).toMatchObject({ technicalOnly: true, ready: true, committing: false, scopeLoading: false }));
+      expect(completed).toBe(false);
+      expect(saved.at(-1)?.draft.technicalOnly).toBe(true);
+      expect(saved.at(-1)?.draft.materials).toEqual(source);
+      expect(saved.at(-1)?.draft.confirmation).toBeUndefined();
+      panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision: state()!.revision, technicalOnly: false });
+      await vi.waitFor(() => expect(state()).toMatchObject({ technicalOnly: false, ready: true, committing: false, scopeLoading: false }));
+      expect(saved.at(-1)?.draft.confirmation).toBeUndefined();
+      expect(completed).toBe(false);
+      panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
+      const result = await handle.result;
+      expect(result?.requirements?.technicalOnly).toBe(false);
+      expect(result?.requirements && requirementReadiness(result.requirements, requirementScopeKey(root, set)).confirmed).toBe(true);
+    } finally { handle.dispose(); }
+  });
+
+  it('rolls back a failed mode save and rejects mode messages from an older revision', async () => {
+    let fail = false;
+    const { handle, panel, saved } = await prepared({
+      save: async () => { if (fail) { fail = false; throw new Error('Mode persistence failed'); } },
+    });
+
+    try {
+      const revision = state()!.revision;
+      const material = structuredClone(state()!.materials);
+      fail = true;
+      panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision, technicalOnly: true });
+      await vi.waitFor(() => expect(state()?.error).toContain('Mode persistence failed'));
+      expect(state()).toMatchObject({ technicalOnly: false, committing: false });
+      expect(state()?.materials).toEqual(material);
+      panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision: revision - 1, technicalOnly: true });
+      await vi.waitFor(() => expect(state()?.error).toContain('changed'));
+      expect(state()?.technicalOnly).toBe(false);
+      expect(saved).toHaveLength(0);
+    } finally { handle.dispose(); }
+  });
+
+  it('restores a saved technical mode without silently organizing its preserved material or starting review', async () => {
+    const first = await prepared();
+    first.panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision: state()!.revision, technicalOnly: true });
+    await vi.waitFor(() => expect(state()).toMatchObject({ technicalOnly: true, ready: true, committing: false, scopeLoading: false }));
+    const record = structuredClone(first.saved.at(-1)!);
+    first.handle.dispose();
+    const analyze = vi.fn<NonNullable<ScopePreparationOptions['analyze']>>();
+    const handle = createScopePreparation(root, undefined, 'branchChanges', {
+      load: async () => record, loadScope: async () => structuredClone(set), save: async () => {}, analyze,
+    });
+    try {
+      const panel = vscodeMockState.panel!;
+      panel.webview.receiveMessage({ type: 'ready' });
+      await vi.waitFor(() => expect(panel.webview.messages).toContainEqual(expect.objectContaining({ type: 'repository' })));
+      panel.webview.receiveMessage({ type: 'selection', ...selection });
+      await vi.waitFor(() => expect(state()).toMatchObject({ technicalOnly: true, ready: true, scopeLoading: false }));
+      expect(state()?.materials).toHaveLength(1);
+      expect(analyze).not.toHaveBeenCalled();
+      expect(record.draft.confirmation).toBeUndefined();
+    } finally { handle.dispose(); }
+  });
+
+  it('reports a file-picker failure against the target and recovers without losing requirement material', async () => {
+    const pickFiles = vi.fn<NonNullable<ScopePreparationOptions['pickFiles']>>()
+      .mockRejectedValueOnce(new Error('Source selection failed')).mockResolvedValueOnce(undefined);
+    const { handle, panel, saved } = await prepared({ pickFiles });
+    try {
+      const original = structuredClone(saved.at(-1)?.draft.materials);
+      panel.webview.receiveMessage({ type: 'pickFiles' });
+      await vi.waitFor(() => expect(state()?.scopeError).toContain('Source selection failed'));
+      expect(state()).toMatchObject({ committing: false, scopeLoading: false, scopeReady: false });
+      expect(panel.webview.messages).toContainEqual({ type: 'error', target: 'scope', message: 'Source selection failed' });
+      panel.webview.receiveMessage({ type: 'pickFiles' });
+      await vi.waitFor(() => expect(pickFiles).toHaveBeenCalledTimes(2));
+      expect(saved.at(-1)?.draft.materials).toEqual(original);
+    } finally { handle.dispose(); }
+  });
+
   it('does not finish confirmation against a changed range while persistence is pending', async () => {
     let pause = false;
     let release: (() => void) | undefined;
@@ -389,6 +471,8 @@ describe('three-block preparation with real host state transitions', () => {
     expect(saved.at(-1)?.draft.materials[0].versions[0].text).toBe('Charge once.');
     panel.webview.receiveMessage({ type: 'select', ...selection, confirmed: true });
     await vi.waitFor(() => expect(state()?.scopeError).toContain('changed'));
+    panel.webview.receiveMessage({ type: 'reviewMode', ...selection, revision: state()!.revision, technicalOnly: true });
+    await vi.waitFor(() => expect(state()).toMatchObject({ technicalOnly: true, ready: true, committing: false }));
     panel.webview.receiveMessage({ type: 'select', ...selection, technicalOnly: true });
     const result = await handle.result;
     expect(result?.requirements?.confirmation).toBeUndefined();

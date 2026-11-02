@@ -95,7 +95,7 @@ export async function runStartupHostChecks(cwd: string): Promise<string[]> {
   assert.equal(report.cards, 3);
   assert.equal(report.language, 'zh-CN', 'A new profile must default to Simplified Chinese even with an English editor');
   assert.equal(report.prototypeChrome, true);
-  assert.equal(report.targetChoices, 2);
+  assert.equal(report.targetChoices, 3, 'PR, branch and selected files must share the same target selector');
   assert.equal(report.loading, false);
   assert.equal(report.refresh, m().scope.refreshRepository);
   assert.equal(report.browse, m().scope.browseRepository);

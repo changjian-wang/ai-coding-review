@@ -50,7 +50,7 @@ function client(kind = 'pr') {
     }
     return value;
   };
-  for (const id of ['kind', 'scope-mode']) for (const kind of ['pr', 'branchChanges', 'branchFull']) {
+  for (const id of ['kind', 'scope-mode']) for (const kind of ['pr', 'branchChanges', 'branchFull', 'files']) {
     const option = element('option'); option.value = kind; get(id).appendChild(option);
   }
   get('error').hidden = true;
@@ -143,7 +143,8 @@ describe('preparation repository actions', () => {
       data: { cwd: 'C:\\other', refs: ['main', 'feature'], current: 'feature', prsCurrent: false },
     });
     expect(page.get('kind').value).toBe('pr');
-    expect(page.get('files-target-field').hidden).toBe(true);
+    expect(page.get('files-target-field').hidden).toBe(false);
+    expect(page.get('files-field').hidden).toBe(true);
     expect(page.messages.at(-1)).toMatchObject({ type: 'rendered', cwd: 'C:\\other' });
   });
   it('provides one in-place revision surface and an explicit human requirement action', () => {
@@ -152,6 +153,76 @@ describe('preparation repository actions', () => {
     expect(page.html).toContain('id="requirement-inline"');
     expect(page.html).toContain("renderInline()");
     expect(page.html).not.toContain("openEditor('revise',msg.item)");
+  });
+
+  it('puts source selection in the target card and technical mode in requirements, leaving one primary footer action', () => {
+    const page = client();
+    const sections = page.html.split('<section class="review-card">');
+    expect(sections[1]).toContain('id="target-files"');
+    expect(sections[1]).toContain('id="files"');
+    expect(sections[2]).toContain('id="technical" type="checkbox"');
+    expect(page.html).not.toContain('id="review-options"');
+    const footer = page.html.slice(page.html.indexOf('<footer class="prepare-footer"'), page.html.indexOf('<footer class="bottom"'));
+    expect(footer.match(/<button /g)).toHaveLength(1);
+    expect(footer).toContain(m().reviewCenter.start);
+  });
+
+  it('offers file scope before any files have been chosen, with missing selection explained in the target area', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ ready: true });
+    page.get('target-files').onchange?.();
+    expect(page.messages.at(-1)).toMatchObject({ type: 'clearSelection', kind: 'files' });
+    expect(page.get('files').disabled).toBe(true);
+    page.requirements({ ready: false, scopeReady: false });
+    expect(page.get('kind').value).toBe('files');
+    expect(page.get('files-field').hidden).toBe(false);
+    expect(page.get('retry').hidden).toBe(true);
+    expect(page.get('status-text').textContent).toBe(m().scope.chooseFilesHint);
+    expect(page.get('confirm').disabled).toBe(true);
+    expect(page.get('confirm').textContent).toBe(m().reviewCenter.start);
+    page.requirements({ committing: true, pickingFiles: true, operation: m().scope.selectingFiles, ready: false });
+    expect(page.get('files').textContent).toBe(m().scope.selectingFiles);
+    expect(page.get('status-text').textContent).toBe(m().scope.selectingFiles);
+    expect(page.get('confirm').textContent).toBe(m().reviewCenter.start);
+    expect(page.get('confirm').disabled).toBe(true);
+  });
+
+  it('persists technical mode without starting review, and uses the same primary action only after acknowledgement', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ revision: 4, hasSources: true, ready: false, technicalOnly: false });
+    expect(page.get('technical').checked).toBe(false);
+    expect(page.get('confirm').disabled).toBe(true);
+    page.get('technical').checked = true;
+    page.get('technical').onchange?.();
+    expect(page.messages.at(-1)).toMatchObject({ type: 'reviewMode', revision: 4, technicalOnly: true });
+    expect(page.messages).not.toContainEqual(expect.objectContaining({ type: 'select' }));
+    expect(page.get('confirm').disabled).toBe(true);
+    page.requirements({ revision: 5, hasSources: true, ready: true, technicalOnly: true });
+    expect(page.get('technical').checked).toBe(true);
+    expect(page.get('technical-boundary').hidden).toBe(false);
+    expect(page.get('understanding').hidden).toBe(true);
+    expect(page.get('organize').hidden).toBe(true);
+    expect(page.get('confirm').disabled).toBe(false);
+    expect(page.get('confirm').textContent).toBe(m().reviewCenter.start);
+    page.get('confirm').onclick?.();
+    expect(page.messages.at(-1)).toMatchObject({ type: 'select', kind: 'branchChanges', technicalOnly: true });
+  });
+
+  it('keeps picker failures and retrying file selection in the target without enabling the start action', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.get('target-files').onchange?.();
+    page.requirements({ ready: false, scopeReady: false, scopeError: 'Source picker failed' });
+    expect(page.get('error').hidden).toBe(false);
+    expect(page.get('error').textContent).toBe('Source picker failed');
+    expect(page.get('files-field').hidden).toBe(false);
+    expect(page.get('files').disabled).toBe(false);
+    expect(page.get('retry').hidden).toBe(true);
+    expect(page.get('confirm').disabled).toBe(true);
+    page.get('files').onclick?.();
+    expect(page.messages.at(-1)).toEqual({ type: 'pickFiles' });
   });
   it.each(['en', 'zh-CN'])('describes repository browsing and refresh/retry accurately in %s', (language) => {
     vscodeMockState.language = language;

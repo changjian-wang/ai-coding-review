@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acceptRequirementUnderstanding, addRequirementMaterial, confirmRequirements, createRequirementsDraft, currentMaterial,
   parseRequirementUnderstanding, requirementBoundary, requirementReadiness, requirementScopeKey, requirementSourceKey,
-  restoreRequirementsDraft, reviseRequirement, selectRequirementMaterial, updateRequirementMaterial, humanRequirementUnderstanding, REQUIREMENT_LIMITS,
+  restoreRequirementsDraft, reviseRequirement, selectRequirementMaterial, setTechnicalReviewMode, updateRequirementMaterial, humanRequirementUnderstanding, REQUIREMENT_LIMITS,
 } from './requirements';
 import type { ReviewSet } from '../scope/types';
 
@@ -23,6 +23,27 @@ function fixture() {
 }
 
 describe('requirement evidence and confirmation', () => {
+  it('stores technical mode without discarding materials or treating an old requirement confirmation as current', () => {
+    const { draft, output, id } = fixture();
+    acceptRequirementUnderstanding(draft, parseRequirementUnderstanding(output, draft, 'scope', 'model'));
+    confirmRequirements(draft, 'scope', true);
+    const original = structuredClone(draft.materials);
+    const revision = draft.revision;
+    setTechnicalReviewMode(draft, true);
+    expect(draft.revision).toBe(revision + 1);
+    expect(draft.confirmation).toBeUndefined();
+    expect(draft.materials).toEqual(original);
+    expect(restoreRequirementsDraft(draft).technicalOnly).toBe(true);
+    setTechnicalReviewMode(draft, true);
+    expect(draft.revision).toBe(revision + 1);
+    setTechnicalReviewMode(draft, false);
+    expect(requirementReadiness(draft, 'scope')).toMatchObject({ canConfirm: true, confirmed: false });
+    expect(draft.materials).toEqual(original);
+    setTechnicalReviewMode(draft, true);
+    updateRequirementMaterial(draft, id, 'A replacement requirement.');
+    expect(draft.technicalOnly).toBe(false);
+  });
+
   it('does not invalidate a confirmed baseline when saving an unchanged in-place revision', () => {
     const { draft, output } = fixture();
     acceptRequirementUnderstanding(draft, parseRequirementUnderstanding(output, draft, 'scope', 'model'));
