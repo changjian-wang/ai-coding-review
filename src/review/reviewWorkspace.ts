@@ -3,11 +3,11 @@ import { m } from '../i18n';
 import type { ReviewSession } from './reviewSession';
 
 export type ReviewStage = 'prepare' | 'review' | 'conclusion';
-export type ReviewNavigator = 'business' | 'findings' | 'feedback' | 'files';
+export type ReviewNavigator = 'findings' | 'files';
 export type ReviewInspectorTab = 'judgment' | 'evidence' | 'handling';
 export type ReviewSelection =
   | { kind: 'overview' }
-  | { kind: 'unit' | 'finding' | 'critical' | 'legacy'; id: string };
+  | { kind: 'finding' | 'critical' | 'legacy'; id: string };
 export type ReviewSourceSelection =
   | { kind: 'file'; path: string }
   | { kind: 'reference'; id: string };
@@ -55,11 +55,15 @@ export function restoreWorkspaceView(value: unknown, scopeKey: string): ReviewWo
       || source.kind === 'reference' && (typeof source.id !== 'string' || !source.id)) throw new ReviewWorkspaceDataError();
   }
   const restored = structuredClone(value) as ReviewWorkspaceView;
+  if (v.navigator === 'business' || v.navigator === 'feedback') restored.navigator = 'findings';
+  if (selection.kind === 'unit') {
+    restored.selection = { kind: 'overview' };
+    restored.source = undefined;
+  }
   if (!restored.layout) {
     restored.layout = 'issues-first';
     restored.navigator = 'findings';
     restored.focus = false;
-    if (restored.selection.kind === 'unit') restored.selection = { kind: 'overview' };
   }
   return restored;
 }

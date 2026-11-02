@@ -61,15 +61,6 @@
         "icon": "$(globe)"
       },
       {
-        "command": "codereview.openWorkbench",
-        "title": "%cmd.openWorkbench%",
-        "icon": "$(layout)"
-      },
-      {
-        "command": "codereview.openFile",
-        "title": "%cmd.openFile%"
-      },
-      {
         "command": "codereview.analyzeFile",
         "title": "%cmd.analyzeFile%",
         "icon": "$(search-fuzzy)"
@@ -93,10 +84,6 @@
         "command": "codereview.viewPendingComments",
         "title": "%cmd.viewPendingComments%",
         "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "codereview.locateFinding",
-        "title": "%cmd.locateFinding%"
       },
       {
         "command": "codereview.jumpToNextUnseen",
@@ -158,28 +145,6 @@
           "type": "boolean",
           "default": false,
           "description": "%config.focusedWorkbench.description%"
-        },
-        "codereview.repositoryAwareAnalysis": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "off"
-          ],
-          "enumDescriptions": [
-            "%config.repositoryAwareAnalysis.auto%",
-            "%config.repositoryAwareAnalysis.off%"
-          ],
-          "default": "auto",
-          "description": "%config.repositoryAwareAnalysis.description%",
-          "deprecationMessage": "%config.legacyAnalysis.deprecated%"
-        },
-        "codereview.repositoryContextTokenBudget": {
-          "type": "number",
-          "default": 28000,
-          "minimum": 8000,
-          "maximum": 64000,
-          "description": "%config.repositoryContextTokenBudget.description%",
-          "deprecationMessage": "%config.legacyAnalysis.deprecated%"
         },
         "codereview.autoAccount": {
           "type": "boolean",

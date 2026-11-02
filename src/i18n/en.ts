@@ -362,7 +362,6 @@ export const en = {
     issueNavigation: 'Review issues',
     activeIssues: 'To check',
     closedIssues: 'Ruled out / clarified',
-    auxiliaryReading: 'Supporting views',
     primaryEvidence: 'Inspect related code',
     backToJudgment: 'Back to the issue',
     reviewResult: 'Current review',

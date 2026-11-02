@@ -37,8 +37,6 @@ export interface ReviewCenterServices {
   confirmReplace(): Promise<boolean>;
   confirmRemoteCheck(): Promise<boolean>;
   publish(input: { id: string; revision: number; previewKey: string }): Promise<void>;
-  legacyAnalyze(): Promise<void>;
-  legacyGlobal(): Promise<void>;
 }
 
 export class ReviewCenterController {
@@ -75,9 +73,6 @@ export class ReviewCenterController {
       const finding = run?.findings.find((finding) => finding.id === selection.id);
       const ref = finding?.evidence.find((ref) => ref.kind === 'code' && ref.side === 'head') ?? finding?.evidence[0] ?? finding?.counterEvidence[0];
       if (ref) await this.reference(centerReferenceId({ kind: 'business', citation: ref }));
-    } else if (selection.kind === 'unit') {
-      const path = run?.units.find((unit) => unit.id === selection.id)?.files[0];
-      if (path) await this.file({ path });
     } else if (selection.kind === 'legacy') {
       const item = centerLegacyFindings(this.session).get(selection.id);
       if (item) await this.file({ path: item.path, line: item.finding.line, endLine: item.finding.endLine, legacyId: item.finding.id });
@@ -116,7 +111,7 @@ export class ReviewCenterController {
         }
         break;
       case 'navigator':
-        if (value !== 'business' && value !== 'findings' && value !== 'feedback' && value !== 'files') throw new ConclusionDraftDataError();
+        if (value !== 'findings' && value !== 'files') throw new ConclusionDraftDataError();
         this.session.setWorkspaceView({ navigator: value });
         break;
       case 'inspector':
@@ -136,10 +131,9 @@ export class ReviewCenterController {
         }
         const run = this.session.businessReview;
         if (!id || !(kind === 'finding' && run?.findings.some((finding) => finding.id === id)
-          || kind === 'unit' && run?.units.some((unit) => unit.id === id)
           || kind === 'critical' && run?.priorCritical.some((item) => item.id === id)
           || kind === 'legacy' && centerLegacyFindings(this.session).has(id))) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
-        if (kind !== 'finding' && kind !== 'unit' && kind !== 'critical' && kind !== 'legacy') throw new ConclusionDraftDataError();
+        if (kind !== 'finding' && kind !== 'critical' && kind !== 'legacy') throw new ConclusionDraftDataError();
         this.session.setWorkspaceView({
           stage: 'review', selection: { kind, id },
           navigator: kind === 'finding' || kind === 'critical' ? 'findings' : this.session.workspaceView.navigator,
@@ -223,8 +217,6 @@ export class ReviewCenterController {
         this.current(message.contextKey);
         await this.session.acknowledgePublicationUncertainty(message.id);
         break;
-      case 'legacyAnalyze': await this.services.legacyAnalyze(); break;
-      case 'legacyGlobal': await this.services.legacyGlobal(); break;
       default: throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
     }
     return {};

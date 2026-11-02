@@ -6,10 +6,10 @@ import { conclusionDraftText, ConclusionDraftDataError, type ConclusionDraft, ty
 import { legacySelectionId, openReviewProblems, type ReviewWorkspaceView } from '../review/reviewWorkspace';
 import type { ReviewSession } from '../review/reviewSession';
 import type { RequirementItem } from '../review/requirements';
-import { businessReportReferences } from './businessReviewPanel';
+import { businessReportReferences } from './businessReviewReport';
 import { esc, escAttr } from './html';
 import { renderRequirementMarkdown } from './requirementMarkdown';
-import { tokenSummary, tokenTooltip } from './workbenchPanel';
+import { tokenTooltip } from './workbenchPanel';
 
 export type CenterReference =
   | { kind: 'business'; citation: BusinessCitation }
@@ -17,7 +17,7 @@ export type CenterReference =
 
 export interface CenterRow {
   id: string;
-  kind: 'unit' | 'finding' | 'critical' | 'legacy';
+  kind: 'finding' | 'critical';
   title: string;
   detail: string;
   badge?: string;
@@ -33,7 +33,6 @@ export interface CenterInspector {
   primaryFile?: { path: string; line?: number };
   findingId?: string;
   canFix?: boolean;
-  legacy?: { path: string; id: string };
 }
 
 export interface CenterConclusion {
@@ -72,15 +71,13 @@ export interface ReviewCenterState {
   progress: string;
   model: string;
   language: string;
-  units: CenterRow[];
   findings: CenterRow[];
-  legacy: CenterRow[];
   inspector: CenterInspector;
   conclusion: CenterConclusion;
   status: string;
   sourceCoverage: { reviewed: number; total: number };
   outcome: { title: string; detail: string; tone: 'normal' | 'warning'; limitations: string[] };
-  tokens?: { label: string; tooltip: string };
+  tokens?: { tooltip: string };
 }
 
 export function centerReferenceId(ref: CenterReference): string {
@@ -182,9 +179,6 @@ export function buildReviewCenterState(
   const view = session.workspaceView;
   const set = session.reviewSet;
   const legacy = centerLegacyFindings(session);
-  const units: CenterRow[] = (run?.units ?? []).map((unit) => ({
-    id: unit.id, kind: 'unit', title: unit.goal, detail: unit.files.join(' · '), badge: unit.id,
-  }));
   const findings: CenterRow[] = (run?.findings ?? []).map((finding) => ({
     id: finding.id, kind: 'finding', title: finding.title,
     detail: finding.evidence.filter((ref) => ref.kind === 'code').map((ref) => ref.path).join(' · '),
@@ -196,9 +190,6 @@ export function buildReviewCenterState(
     badge: b[run?.priorCriticalVerdicts.find((verdict) => verdict.id === item.id)?.status ?? 'unknown'],
     tone: run?.priorCriticalVerdicts.some((verdict) => verdict.id === item.id && verdict.status === 'cleared') ? 'ok' : 'warning',
   })));
-  const legacyRows: CenterRow[] = [...legacy].map(([id, { path, finding }]) => ({
-    id, kind: 'legacy', title: finding.title, detail: `${path} · L${finding.line}`, badge: m().severity[finding.severity],
-  }));
   const reviewed = run?.coverage.filter(coverageComplete).length ?? 0;
   const expectedCoverage = set?.files.filter((file) => !file.context).reduce((count, file) =>
     count + Number(file.status !== 'deleted') + Number(!!set.comparison && file.status !== 'added'), 0) ?? 0;
@@ -221,7 +212,7 @@ export function buildReviewCenterState(
   };
   let inspector: CenterInspector = {
     title: t.overview, subtitle: session.requirementStatus,
-    html: `<p class="overview-next">${esc(openItems.length ? t.overviewNext : !run ? t.noRunAction : eligible ? t.outcomeCaution : t.incompleteNext)}</p>${openItems.slice(0, 3).map((item) => `<button class="overview-issue" data-center-action="select" data-kind="${item.kind}" data-id="${escAttr(item.id)}"><strong>${esc(item.title)}</strong><p>${esc(item.summary || item.detail)}</p><small>${esc(item.badge ?? '')}</small></button>`).join('')}
+    html: `<p class="overview-next">${esc(openItems.length ? t.overviewNext : !run ? t.noRunAction : eligible ? t.outcomeCaution : t.incompleteNext)}</p>
       <details class="review-audit"><summary>${esc(t.inspectionDetails)}</summary><p class="boundary">${esc(b.boundary)}</p><h3>${esc(b.coverage)}</h3><p>${reviewed}/${total}</p>
       <h3>${esc(b.limits)}</h3>${run ? [...businessBlockers(run), ...run.limitations, ...run.errors].map((reason) => `<p>${esc(reason)}</p>`).join('') : `<p>${esc(t.noRun)}</p>`}
       <h3>${esc(t.evidenceRequests)}</h3>${(run?.requests ?? []).map((result) => `<details><summary>${esc(result.request.symbol)} · ${esc(result.request.kind)}</summary><p>${esc(result.request.question)}</p><p>${esc(result.paths.join(', '))}</p>${result.error ? `<p class="error-text">${esc(result.error)}</p>` : ''}</details>`).join('')}
@@ -235,17 +226,6 @@ export function buildReviewCenterState(
   if (selected.kind === 'finding') {
     const finding = run?.findings.find((finding) => finding.id === selected.id);
     if (finding) { inspector = findingInspector(session, finding); validSelection = true; }
-  } else if (selected.kind === 'unit') {
-    const unit = run?.units.find((unit) => unit.id === selected.id);
-    if (unit) {
-      validSelection = true;
-      inspector = {
-        title: unit.goal, subtitle: t.unitBoundary, primaryFile: unit.files[0] ? { path: unit.files[0] } : undefined,
-        html: `<h3>${esc(t.requirements)}</h3>${rulesHtml(session, run!.baseline.requirements.filter((rule) => unit.requirementIds.includes(rule.id)))}
-        <h3>${esc(t.formalFiles)}</h3>${unit.files.map((path) => `<button class="reference-link" data-center-action="file" data-path="${escAttr(path)}">${esc(path)}</button>`).join('')}
-        ${(run?.unitSummaries ?? []).filter((summary) => summary.id.startsWith(`${unit.id}-`)).map((summary) => `<div class="markdown">${renderRequirementMarkdown(summary.text)}</div>`).join('')}`,
-      };
-    }
   } else if (selected.kind === 'critical') {
     const item = run?.priorCritical.find((item) => item.id === selected.id);
     if (item) {
@@ -290,9 +270,9 @@ export function buildReviewCenterState(
     base: set?.comparison?.baseSha, running: input.running, analysisBusy: !!input.analysisBusy, globalRunning: !!input.globalRunning, runStatus: run?.status, isPr: !!pr, requirementStatus: session.requirementStatus,
     model: input.model, language: input.language,
     progress: input.running && run?.status !== 'running' ? b.read : run ? fmt(b.progress, b[run.phase], reviewed, total, run.calls) : t.noRun,
-    units, findings, legacy: legacyRows, inspector,
+    findings, inspector,
     status: input.running ? b.running : run ? `${b[run.status]} · ${run.modelId}` : t.noRun, sourceCoverage: { reviewed, total }, outcome,
-    tokens: tokens ? { label: `${m().workbench.tokens}: ${tokenSummary(tokens, m().workbench)}`, tooltip: tokenTooltip(tokens, m().workbench) } : undefined,
+    tokens: tokens ? { tooltip: `${m().workbench.tokens}\n${tokenTooltip(tokens, m().workbench)}` } : undefined,
     conclusion: {
       draft, error: draftError, stale: stale && !published, published,
       unknownAttempt: unknownAttempt ? { id: unknownAttempt.id, error: unknownAttempt.error } : undefined,
@@ -323,7 +303,7 @@ export interface CenterAction {
   type: 'center';
   action: 'ready' | 'stage' | 'navigator' | 'select' | 'file' | 'reference' | 'inspector' | 'focus' | 'next'
     | 'run' | 'cancel' | 'model' | 'language' | 'export' | 'confirmReport' | 'note' | 'fix'
-    | 'generateDraft' | 'savePreview' | 'previewRendered' | 'publish' | 'appendFinding' | 'legacyAnalyze' | 'legacyGlobal' | 'checkPublication'
+    | 'generateDraft' | 'savePreview' | 'previewRendered' | 'publish' | 'appendFinding' | 'checkPublication'
     | 'copyDraft' | 'saveDraft';
   contextKey: string;
   id?: string;

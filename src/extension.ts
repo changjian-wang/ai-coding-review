@@ -38,7 +38,7 @@ import { CommitSource } from './review/commitSource';
 import { businessBaseline, businessBindingKey, businessBlockers, businessHash, businessKnownCritical, coverageComplete, type BusinessCitation } from './review/businessReview';
 import { runBusinessReview, type BusinessLegacyCandidate } from './review/businessReviewEngine';
 import { BusinessReviewSource } from './review/businessReviewSource';
-import { BusinessReviewPanel, businessConclusionSummary, businessReportMarkdown } from './ui/businessReviewPanel';
+import { businessConclusionSummary, businessReportMarkdown } from './ui/businessReviewReport';
 import { buildReviewCenterState, centerReferenceId, centerReferences, reviewCenterContextKey, type CenterAction, type CenterReference } from './ui/reviewCenterState';
 import { ReviewCenterController, type CenterFileTarget } from './review/reviewCenterController';
 import { captureReviewFileAction } from './review/reviewWorkspace';
@@ -226,7 +226,6 @@ function closeScopeBoundPanels(): void {
   fixProposalOpenGeneration += 1;
   FixProposalPanel.closeIfOpen();
   GlobalReportPanel.closeIfOpen();
-  BusinessReviewPanel.closeIfOpen();
 }
 
 function reflectReviewInvalidation(
@@ -792,7 +791,6 @@ function refreshUiForLanguageSwitch(): void {
     void refreshDocPanel(currentPath);
   }
   FixProposalPanel.refreshIfOpen();
-  BusinessReviewPanel.refreshIfOpen(session.businessReview);
   if (session.globalReport && GlobalReportPanel.isOpen) {
     showGlobalReport();
   } else {
@@ -906,7 +904,6 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
         });
       }
       WorkbenchPanel.refreshIfOpen(change.filePath);
-      BusinessReviewPanel.refreshIfOpen(session.businessReview);
     }),
   );
 
@@ -1475,7 +1472,6 @@ async function startBusinessReview(focusPath?: string): Promise<void> {
       context.cts.dispose();
       if (DocumentPanel.currentPath) DocumentPanel.setAnalyzing(DocumentPanel.currentPath, false, false);
       WorkbenchPanel.refreshIfOpen();
-      BusinessReviewPanel.refreshIfOpen(session.businessReview);
     }
   }
 }
@@ -1843,12 +1839,6 @@ function reviewCenterController(): ReviewCenterController {
     confirmReplace: async () => await vscode.window.showWarningMessage(m().reviewCenter.confirmReplaceDraft, { modal: true }, m().reviewCenter.replaceDraft) === m().reviewCenter.replaceDraft,
     confirmRemoteCheck: async () => await vscode.window.showWarningMessage(m().reviewCenter.confirmRemoteCheck, { modal: true }, m().reviewCenter.remoteChecked) === m().reviewCenter.remoteChecked,
     publish: publishCenterConclusion,
-    legacyAnalyze: async () => {
-      const path = session.workspaceView.source;
-      if (path?.kind !== 'file' || DocumentPanel.isReadOnly) throw new ConclusionDraftDataError(m().reviewCenter.readOnlyEvidence);
-      await startBusinessReview(path.path);
-    },
-    legacyGlobal: async () => { if (businessContext) cancelBusinessReview(); else await startBusinessReview(); },
   });
   return centerController;
 }
@@ -3721,35 +3711,12 @@ function showGlobalReport(): void {
     return;
   }
   const localizedReport = localizeGlobalReportNow(report, resolveLanguage());
-  const cov = session.totalCoverage();
-  const reviewSet = session.reviewSet;
-  const findingsCount = reviewSet
-    ? reviewSet.files.reduce((sum, f) => sum + session.findings(f.path).length, 0)
-    : 0;
-  GlobalReportPanel.show(localizedReport, session.globalConfirmed, {
-    readOnly: true,
-    onLocate: () => {},
-    onConfirm: () => {},
+  GlobalReportPanel.show(localizedReport, {
     onGotoFiles: () => void switchToFileReview(),
-    fixDisposition: (spotId, file, line) =>
-      session.globalFixDisposition(spotId, file, line, globalFixAnchor(spotId))?.kind,
-    stats: {
-      seen: cov.seen,
-      total: cov.total,
-      filesReady: cov.filesReady,
-      filesTotal: cov.filesTotal,
-      findings: findingsCount,
-      gatePassed: session.gatePassed(),
-      requirementStatus: session.requirementStatus,
-    },
   });
   void ensureGlobalReportLocalized(report);
 }
 
-/** Looks up a global fix spot's anchor snippet by id, for disposition resolution. */
-function globalFixAnchor(spotId: string): string | undefined {
-  return session.globalReport?.fixSpots.find((s) => s.id === spotId)?.anchor;
-}
 
 
 

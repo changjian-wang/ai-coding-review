@@ -322,7 +322,6 @@ export const zh: Messages = {
     issueNavigation: '审查问题',
     activeIssues: '待核对',
     closedIssues: '已排除 / 澄清',
-    auxiliaryReading: '辅助阅读',
     primaryEvidence: '查看相关代码',
     backToJudgment: '返回问题判断',
     reviewResult: '本次审查',

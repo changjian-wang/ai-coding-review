@@ -3,7 +3,7 @@ import { ReviewSession } from './reviewSession';
 import { ReviewCenterController, type ReviewCenterServices } from './reviewCenterController';
 import { captureReviewFileAction, createWorkspaceView, openReviewProblems, restoreWorkspaceView } from './reviewWorkspace';
 import { buildReviewCenterState, centerReferenceId, centerReferences, reviewCenterContextKey } from '../ui/reviewCenterState';
-import { businessConclusionSummary } from '../ui/businessReviewPanel';
+import { businessConclusionSummary } from '../ui/businessReviewReport';
 import { businessHash } from './businessReview';
 import { m } from '../i18n';
 import { reviewCenterFixture } from '../test/reviewCenterFixture';
@@ -16,11 +16,47 @@ function services(): ReviewCenterServices {
     language: vi.fn(async () => {}), export: vi.fn(async () => {}), confirmReport: vi.fn(async () => {}), note: vi.fn(async () => {}),
     fix: vi.fn(async () => {}), defaultBody: () => 'Controlled draft.', findingBody: () => 'Controlled finding.',
     confirmReplace: async () => true, confirmRemoteCheck: async () => true, publish: vi.fn(async () => {}),
-    legacyAnalyze: vi.fn(async () => {}), legacyGlobal: vi.fn(async () => {}),
   };
 }
 
 describe('review center selection and versioning', () => {
+  it('removes placeholder and planning navigation, obsolete analysis actions and redundant model cards from the live center', async () => {
+    const { session } = await reviewCenterFixture();
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    const html = reviewCenterView(state, [], 'strict-pruning');
+    const body = html.slice(html.indexOf('<body>'), html.indexOf('<template id="source-template">'));
+    for (const removed of ['data-value="feedback"', 'data-value="business"', 'center-tokens', 'overview-issue', 'auxiliary-navigation']) {
+      expect(body).not.toContain(removed);
+    }
+    expect(state).not.toHaveProperty('units');
+    expect(state).not.toHaveProperty('legacy');
+    const deps = services();
+    const controller = new ReviewCenterController(session, deps);
+    for (const value of ['business', 'feedback']) {
+      await expect(controller.handle({ type: 'center', action: 'navigator', value, contextKey: reviewCenterContextKey(session) })).rejects.toThrow();
+    }
+    await expect(controller.handle({ type: 'center', action: 'select', kind: 'unit', id: 'U-1', contextKey: reviewCenterContextKey(session) })).rejects.toThrow();
+    for (const action of ['legacyAnalyze', 'legacyGlobal']) {
+      await expect(Reflect.apply(controller.handle, controller, [{ type: 'center', action, contextKey: reviewCenterContextKey(session) }])).rejects.toThrow();
+    }
+    expect(deps.run).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('escapes model and source HTML in the actual issue view after removing the separate report renderer', async () => {
+    const { session } = await reviewCenterFixture();
+    const finding = session.businessReview!.findings[0];
+    finding.title = '<script>unexpected()</script>';
+    finding.evidence[0].quote = '<script>untrustedSource()</script>';
+    session.setWorkspaceView({ selection: { kind: 'finding', id: finding.id }, inspector: 'judgment' });
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    const html = reviewCenterView(state, [], 'actual-issue-escaping');
+    expect(html).not.toContain('<script>unexpected()</script>');
+    expect(html).not.toContain('<script>untrustedSource()</script>');
+    expect(state.inspector.html).toContain('&lt;script&gt;untrustedSource()&lt;/script&gt;');
+    session.dispose();
+  });
+
   it('lands on review issues and migrates the old business-first layout without losing an explicitly selected finding or source', () => {
     const view = createWorkspaceView('scope');
     expect(view.navigator).toBe('findings');
@@ -30,7 +66,9 @@ describe('review center selection and versioning', () => {
       .toMatchObject({ layout: 'issues-first', navigator: 'findings', selection: { kind: 'overview' }, focus: false });
     expect(restoreWorkspaceView({ ...old, selection: { kind: 'finding', id: 'F-1' }, source: { kind: 'reference', id: 'source' } }, 'scope'))
       .toMatchObject({ selection: { kind: 'finding', id: 'F-1' }, source: { kind: 'reference', id: 'source' } });
-    expect(restoreWorkspaceView({ ...view, navigator: 'business', selection: { kind: 'unit', id: 'U-1' } }, 'scope').navigator).toBe('business');
+    expect(restoreWorkspaceView({ ...view, navigator: 'business', selection: { kind: 'unit', id: 'U-1' } }, 'scope'))
+      .toMatchObject({ navigator: 'findings', selection: { kind: 'overview' }, source: undefined });
+    expect(restoreWorkspaceView({ ...view, navigator: 'feedback' }, 'scope').navigator).toBe('findings');
   });
 
   it('shows a bounded no-issue result only for complete current coverage, never for partial, stale or missing coverage', async () => {
@@ -291,14 +329,15 @@ describe('review center selection and versioning', () => {
     session.dispose();
   });
 
-  it('preserves the shared estimated-token HUD and per-operation disclosure in the center', async () => {
+  it('keeps estimated usage and per-operation disclosure in model details instead of a permanent HUD', async () => {
     const { session } = await reviewCenterFixture();
     session.recordTokenUsage({ op: 'business', input: 12_345, output: 123 });
     const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
-    expect(state.tokens?.label).toContain('Tokens (est.)');
-    expect(state.tokens?.label).toContain('12.3k');
+    expect(state.tokens).not.toHaveProperty('label');
+    expect(state.tokens?.tooltip).toContain('Tokens (est.)');
     expect(state.tokens?.tooltip).toContain('12,345');
     expect(state.tokens?.tooltip).toContain(m().workbench.tokenEstimateNote);
+    expect(reviewCenterView(state, [], 'usage-details')).not.toContain('id="center-tokens"');
     session.dispose();
   });
 });

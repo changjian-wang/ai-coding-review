@@ -8,7 +8,9 @@ import { ReviewSession } from '../review/reviewSession';
 import { WorkspaceStateReviewStore } from '../review/reviewStore';
 import { acceptRequirementUnderstanding, addRequirementMaterial, confirmRequirements, createRequirementsDraft, parseRequirementUnderstanding, requirementScopeKey } from '../review/requirements';
 import type { ReviewSet } from '../scope/types';
-import { BusinessReviewPanel, businessReportReferences } from '../ui/businessReviewPanel';
+import { businessReportMarkdown, businessReportReferences } from '../ui/businessReviewReport';
+import { buildReviewCenterState } from '../ui/reviewCenterState';
+import { resolveLanguage } from '../i18n';
 import { WorkbenchPanel, type WorkbenchActions, type WorkbenchState } from '../ui/workbenchPanel';
 
 function within<T>(work: Promise<T>, label: string): Promise<T> {
@@ -106,18 +108,11 @@ export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet) {
     assert.equal(reloaded.businessReview?.id, run.id);
     assert.equal(reloaded.businessReview?.confirmed, false);
 
-    let finishReport!: () => void;
-    let failReport!: (error: Error) => void;
-    const reportReady = new Promise<void>((resolve, reject) => { finishReport = resolve; failReport = reject; });
+    const markdown = businessReportMarkdown(run);
+    assert.ok(markdown.includes(run.findings[0].title));
+    assert.ok(businessReportReferences(run).length >= 3);
+    for (const reference of businessReportReferences(run)) assert.ok(markdown.includes(reference.sourceHash));
     const noop = () => {};
-    BusinessReviewPanel.show(run, {
-      recheck: noop, cancel: noop, prepare: noop, confirm: () => session.confirmBusinessReview(), note: noop, source: noop,
-      onRendered: (report) => {
-        if (report.error) failReport(new Error(report.error));
-        else if (report.references === businessReportReferences(run).length && report.references >= 3 && report.quotationBlocks >= 6) finishReport();
-      },
-    });
-    await within(reportReady, 'native M3 report script and source-reference rendering');
     let finishWorkbench!: () => void;
     const workbenchReady = new Promise<void>((resolve) => { finishWorkbench = resolve; });
     const state: WorkbenchState = {
@@ -126,6 +121,7 @@ export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet) {
       requirementStatus: session.requirementStatus, globalDone: false, hasGlobalReport: false,
       modelLabel: model.name, repoName: 'Host fixture', projects: [], languages: [],
       businessReview: { running: false, hasReport: true, progress: 'Controlled workflow complete; verified defect remains.', blockers: businessBlockers(run) },
+      center: buildReviewCenterState(session, { running: false, publishBusy: false, model: model.name, language: resolveLanguage() }),
     };
     const actions: WorkbenchActions = {
       open: noop, openFocus: noop, focusDoc: noop, disposeFinding: noop, locate: noop,
@@ -134,23 +130,27 @@ export async function runBusinessReviewHostChecks(cwd: string, set: ReviewSet) {
       exportReport: noop, submit: noop, pickModel: noop, pickLanguage: noop, pickBranch: noop,
       pickProject: noop, pickScope: noop, pickScopeKind: noop, pickProjectCwd: noop, pickLanguageId: noop,
       openDynMenu: noop, applyDynMenu: noop,
-      onRendered: (report) => {
-        if (report.businessControls === 3 && !report.running && report.showEnabled && report.feedbackEnabled) finishWorkbench();
+      center: noop,
+      document: {
+        seen: noop, translate: noop, translateWhole: noop, explain: noop, note: noop, comment: noop,
+        removeAnnotation: noop, regenerateAnnotation: noop, convertAnnotationToNote: noop,
+        editAnnotation: noop, disposeFinding: noop, viewFix: noop, locate: noop,
+        analyze: noop, jumpNext: noop, focusTree: noop,
       },
+      onCenterRendered: (report) => { if (report.columns === 2 && report.stage === 'review' && report.sourceShadow) finishWorkbench(); },
     };
     workbench = vscode.window.createWebviewPanel('codereview.workbench', 'Business host fixture', vscode.ViewColumn.One, { enableScripts: true });
     WorkbenchPanel.adopt(workbench, () => state, actions);
-    await within(workbenchReady, 'native M3 workbench controls and non-approval feedback state');
+    await within(workbenchReady, 'native M3 unified review center');
     return {
       checks: [
         'native M3 exact-source five-phase workflow, independent global finding and persistence (controlled model response, not semantic quality evaluation)',
-        'native M3 report/source rendering and workbench feedback/approval controls',
+        'native M3 unified review center and complete Markdown evidence export, without a second live report panel',
       ],
       run, draft,
     };
   } finally {
     workbench?.dispose();
-    BusinessReviewPanel.closeIfOpen();
     cts.cancel(); cts.dispose(); session.dispose(); reloaded.dispose();
   }
 }

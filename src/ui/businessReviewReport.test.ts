@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { businessBaseline, businessHash, createBusinessRun } from '../review/businessReview';
-import { resetVscodeMock, vscodeMockState } from '../test/vscodeMock';
-import { BusinessReviewPanel, businessConclusionSummary, businessReportMarkdown, businessReportReferences, type BusinessReviewPanelActions } from './businessReviewPanel';
+import { resetVscodeMock } from '../test/vscodeMock';
+import { businessConclusionSummary, businessReportMarkdown, businessReportReferences } from './businessReviewReport';
+import { reviewCenterFixture } from '../test/reviewCenterFixture';
 
-afterEach(() => { BusinessReviewPanel.closeIfOpen(); resetVscodeMock(); });
+afterEach(() => resetVscodeMock());
 
 function fixture() {
   const run = createBusinessRun(businessBaseline('C:\\repo', { scopeId: 'scope', label: 'Scope', headSha: 'live', files: [{ path: 'app.ts' }] }), 'model');
@@ -14,43 +15,24 @@ function fixture() {
     requirementIds: [], evidence: [{ evidenceId: 'ev', kind: 'code', side: 'head', path: 'app.ts', sourceHash: 'source-hash', line: 1, endLine: 1, quote: '<script>untrustedSource()</script>' }],
     counterEvidence: [], counterRationale: 'No hidden safeguard was invented.', critical: null,
   }];
-  const actions: BusinessReviewPanelActions = { recheck: vi.fn(), cancel: vi.fn(), prepare: vi.fn(), confirm: vi.fn(), note: vi.fn(), source: vi.fn() };
-  return { run, actions };
+  return { run };
 }
 
-describe('business report and actions', () => {
-  it('escapes model/source HTML and includes evidence, hashes, limitations and the non-execution boundary', () => {
-    const { run, actions } = fixture();
-    BusinessReviewPanel.show(run, actions);
-    const html = vscodeMockState.panel!.webview.html;
-    expect(html).not.toContain('<script>unexpected()</script>');
-    expect(html).not.toContain('<script>untrustedSource()</script>');
-    expect(html).toContain('&lt;script&gt;');
-    expect(html).toContain('<pre><code>&lt;script&gt;untrustedSource()&lt;/script&gt;');
-    expect(html).toContain('source-hash');
-    expect(html).toContain('No tests or production calls were executed.');
-    expect(businessReportMarkdown(run)).toContain('sha256 `source-hash`');
-    expect(businessReportReferences(run)).toHaveLength(1);
+describe('business report exports', () => {
+  it('keeps requirement-origin snapshot hashes in the export after removing the separate report panel', async () => {
+    const { session, run } = await reviewCenterFixture();
+    const report = businessReportMarkdown(run);
+    for (const reference of businessReportReferences(run)) expect(report).toContain(reference.sourceHash);
+    session.dispose();
   });
 
-  it('binds actions to the current run and resolves references by identity, not a shifting array index', () => {
-    const { run, actions } = fixture();
-    BusinessReviewPanel.show(run, actions);
-    const webview = vscodeMockState.panel!.webview;
-    const ref = businessReportReferences(run)[0];
-    webview.receiveMessage({ type: 'source', runId: run.id, id: businessHash(JSON.stringify(ref)) });
-    expect(actions.source).toHaveBeenCalledWith(ref);
-    webview.receiveMessage({ type: 'source', runId: run.id, id: '0' });
-    expect(actions.source).toHaveBeenCalledTimes(1);
-    expect(vscodeMockState.warnings.at(-1)).toMatch(/quotation/);
-    const next = { ...run, id: 'next-run' };
-    BusinessReviewPanel.refreshIfOpen(next);
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    webview.receiveMessage({ type: 'confirm', runId: run.id });
-    expect(actions.confirm).not.toHaveBeenCalled();
-    webview.receiveMessage({ type: 'confirm', runId: next.id });
-    expect(actions.confirm).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
+  it('includes exact evidence, hashes and the non-execution boundary without opening a panel', () => {
+    const { run } = fixture();
+    const markdown = businessReportMarkdown(run);
+    expect(markdown).toContain('sha256 `source-hash`');
+    expect(markdown).toContain('    <script>untrustedSource()</script>');
+    expect(markdown).toContain('not executed tests');
+    expect(businessReportReferences(run)).toHaveLength(1);
   });
 
   it('preserves per-requirement source facts in Markdown exports, not only in a separate UI source list', () => {

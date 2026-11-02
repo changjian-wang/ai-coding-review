@@ -43,6 +43,7 @@ interface ScrollReport {
   scopeReadOnly: boolean;
   optimisticBusy: boolean;
   recheckBlocked: boolean;
+  modelTooltip: string;
 }
 
 async function waitFor(test: () => boolean, label: string): Promise<void> {
@@ -55,12 +56,14 @@ async function waitFor(test: () => boolean, label: string): Promise<void> {
 
 export async function runSourceScrollHostChecks(): Promise<string[]> {
   const { session } = await reviewCenterFixture();
+  session.recordTokenUsage({ op: 'business', input: 12_345, output: 123 });
   const run = session.businessReview!;
   const finding = run.findings[0];
   run.findings.push({ ...structuredClone(finding), id: 'dismissed-control', status: 'dismissed', kind: 'reasonable' });
-  run.units[0].goal = 'Validate end-to-end UI test baselines, cross-browser visual snapshots and assertion-tool contracts';
   const lastPath = 'tests/e2e/visual.spec.ts-snapshots/detail-paragraphs-content-understanding-chrome-win32-14.png';
-  run.units[0].files.push(...Array.from({ length: 15 }, (_, i) => lastPath.replace('-14.png', `-${i}.png`)));
+  session.reviewSet!.files.push(...Array.from({ length: 15 }, (_, i) => ({
+    path: lastPath.replace('-14.png', `-${i}.png`), context: true,
+  })));
   session.setWorkspaceView({ navigator: 'findings', selection: { kind: 'finding', id: finding.id }, inspector: 'judgment' });
   const input = {
     running: false, publishBusy: false, model: 'Controlled scroll fixture', language: resolveLanguage(),
@@ -106,7 +109,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     if (message.type === 'center' && message.action === 'file') selectedPath = message.path;
     if (message.type === 'center' && message.action === 'stage') preparationRequests++;
     if (message.type === 'center' && message.action === 'navigator'
-      && (message.value === 'business' || message.value === 'files' || message.value === 'findings' || message.value === 'feedback')) {
+      && (message.value === 'files' || message.value === 'findings')) {
       session.setWorkspaceView({ navigator: message.value });
       void panel.webview.postMessage({ type: 'centerState', center: buildReviewCenterState(session, input) });
     }
@@ -139,7 +142,8 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
       if(message.id===1){analyze.click();optimisticBusy=analyze.disabled;}
       if(message.mode){root.getElementById(message.mode==='diff'?'m-diff':'m-file').click();scroll.scrollTop=message.top;scroll.scrollLeft=message.left;}
       const sourceTop=scroll.scrollTop,sourceLeft=scroll.scrollLeft;
-      const link=message.reference?[...document.querySelectorAll('#inspector-body .reference-link')].at(-1):undefined;
+      if(message.reference){const search=document.getElementById('center-search');search.value=${JSON.stringify(lastPath)};search.dispatchEvent(new Event('input',{bubbles:true}));}
+      const link=message.reference?document.querySelector('#center-list .nav-row[data-path]'):undefined;
       if(link)link.scrollIntoView({block:'center'});
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
       const main=mainElement.getBoundingClientRect(),source=host.getBoundingClientRect(),content=scroll.getBoundingClientRect(),edge=inspector.getBoundingClientRect(),paneRect=pane.getBoundingClientRect();
@@ -148,7 +152,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
       if(link){
         const rect=link.getBoundingClientRect();
         const target=document.elementFromPoint(rect.left+Math.min(20,rect.width/2),rect.top+rect.height/2);
-        referenceClickable=!!target&&target.closest('.reference-link')===link;if(referenceClickable)link.click();
+        referenceClickable=!!target&&target.closest('.nav-row')===link;if(referenceClickable)link.click();
       }
       window.__reviewCenterApi.postMessage({type:'sourceScrollReport',report:{
         id:message.id,mode:message.mode||'',sourceLeft:source.left,sourceRight:source.right,sourceWidth:source.width,
@@ -159,6 +163,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
         pendingVisible:!!document.querySelector('#center-list [data-id="'+${JSON.stringify(finding.id)}+'"]'),
         dismissedVisible:!!document.querySelector('#center-list [data-id="dismissed-control"]'),
         recheckEntries:root.querySelectorAll('#act-analyze').length,scopeReadOnly,optimisticBusy,recheckBlocked:analyze.disabled,
+        modelTooltip:document.getElementById('center-model').title,
         contentRight:content.right,contentBottom:content.bottom,contentHeight:content.height,mainLeft:main.left,mainRight:main.right,mainBottom:main.bottom,
         scrollTop:scroll.scrollTop,scrollLeft:scroll.scrollLeft,horizontalRange:scroll.scrollWidth-scroll.clientWidth,
         diffRows:root.querySelectorAll('.diff-row').length,judgmentAboveSource:edge.bottom<=paneRect.top+1,
@@ -173,7 +178,12 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     seen: 0, total: raw.length, analyzed: false, ready: false, fullySeen: false, unconfirmed: 0, findings: 0,
     active: file.path === model.path, analyzing: false,
   }));
-  panel.webview.html = reviewCenterView(center, files, token).replace('</body>', `<script nonce="${token}">${automation}</script></body>`);
+  const html = reviewCenterView(center, files, token);
+  const restoreAnchor = 'const saved=api.getState();';
+  assert.ok(html.includes(restoreAnchor));
+  panel.webview.html = html.replace(restoreAnchor,
+    `api.setState({...api.getState(),center:{...api.getState()?.center,sourceOpen:true,sourceKey:${JSON.stringify(center.contextKey)}}});${restoreAnchor}`)
+    .replace('</body>', `<script nonce="${token}">${automation}</script></body>`);
   const probe = async (input: { mode?: 'diff' | 'file'; width?: number; top?: number; left?: number; reference?: boolean; action?: 'back' | 'closed' | 'pending' }): Promise<ScrollReport> => {
     const id = reports.size + 1;
     await panel.webview.postMessage({ type: 'sourceScrollProbe', id, ...input });
@@ -193,6 +203,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     assert.equal(chrome.preparationEntries, 1);
     assert.equal(chrome.exportEntries, 1);
     assert.equal(chrome.recheckEntries, 1);
+    assert.ok(chrome.modelTooltip.includes('12,345'), 'Estimated usage must remain available on the real model control after removing the HUD');
     assert.equal(chrome.scopeReadOnly, true, 'Scope details must be a read-only modal that does not change the stage');
     assert.equal(chrome.optimisticBusy, false, 'A refused/undelivered analysis action must not leave the source button permanently busy');
     await waitFor(() => analysisRequests === 1, 'single contextual source action');
@@ -230,7 +241,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     assert.equal(back.sourceClosed, true, 'Returning to the issue must collapse the optional source reader');
     assert.equal(back.issueContentVisible, true, JSON.stringify(back));
     await probe({});
-    session.setWorkspaceView({ navigator: 'business', selection: { kind: 'unit', id: run.units[0].id } });
+    session.setWorkspaceView({ navigator: 'files' });
     await panel.webview.postMessage({ type: 'centerState', center: buildReviewCenterState(session, input) });
     const reference = await probe({ reference: true });
     assert.equal(reference.independent, true, 'Inspector scrolling must not move the code viewport');
@@ -239,7 +250,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     return [
       'native issues-first layout has two columns, defaults to pending issues and actual judgment/evidence, and keeps code collapsed until requested',
       'native full-width/320px optional source scrolling is contained below the judgment; returning collapses code without losing the issue',
-      'native pending/ruled-out issue filters stay distinct; auxiliary long-path references remain clickable without changing source scroll position',
+      'native pending/ruled-out issue filters stay distinct; long paths in the real file navigator remain clickable without changing source scroll position',
       'native center has one preparation/export/source-recheck entry; scope details stay read-only and host-controlled source busy state recovers without optimistic stuck loading',
     ];
   } finally {

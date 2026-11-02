@@ -71,18 +71,18 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 
 ### Review center (M4 development slice)
 
-- Production keeps the product header, numbered stages and theme-aware surfaces. Preparation uses a centered 840px canvas; review is now **issues-first with two columns**: pending issues and a judgment/evidence pane. Old business-first defaults migrate to issue navigation, while later explicit supporting-view choices remain available.
+- Production keeps the product header, numbered stages and theme-aware surfaces. Preparation uses a centered 840px canvas; review is **issues-first with two columns**: pending issues and a judgment/evidence pane. Old business/feedback views migrate safely to issue navigation without deleting review or historical data.
 - Conclusion keeps real open/overturned findings, source boundaries and one exact Markdown preview in the main pane; verdict-specific blockers and submission are grouped in the inspector. Approval has one final confirmation, without an additional report checkbox.
-- **To check** and **Ruled out / clarified** are separate. Issue navigation highlights business consequences and verification status, not planning goals presented as defects. Selecting an issue shows impact, trigger, cause, a key quotation and counterevidence reasoning. Business groups, complete files and unavailable PR-feedback integration are supporting views.
+- **To check** and **Ruled out / clarified** are separate. Selecting an issue shows impact, trigger, cause, a key quotation and counterevidence reasoning. Only actual issue and file navigation remain: planning-group browsing, the PR-feedback placeholder and duplicate issue cards are removed. Internal cross-file grouping still runs and remains available in the complete report.
 - A prominent outcome distinguishes not started, running, stale, incomplete and a bounded no-outstanding-issue result. Missing coverage does not masquerade as complete by counting only existing entries. Limits/errors and blockers remain visible; an empty list is not proof of correct code.
 - The shared source/Diff/Markdown reader is collapsed by default and opens beneath judgment on a code-reference or file action; returning collapses it without discarding the issue. Long-line scrolling remains inside the reader and narrow toolbars wrap. Read-only quotations do not add formal coverage. Narrow windows retain an issue-navigation drawer; F8 traverses only outstanding issues.
 - Edits are saved for one exact preview of the body and frozen inline comments; Copy and Save Markdown use the same content. Saving alone is not preview acknowledgement. Comments and requested changes do not use the approval-only confirmation. The body limit is 60,000 characters; oversize input stays editable.
 - Drafts and receipts bind to scope, requirements, analysis and draft revision. Busy/stale inputs, concurrent or repeated publication and unknown write outcomes are guarded on the host. An uncertain write requires explicit remote checking; that acknowledgement does not claim the remote state was automatically reconciled.
 - A local working-tree business fix explicitly selects a single repair file when several reviewed files are available; the first evidence citation is not treated as the required repair location. Applying a patch invalidates the report, not the defect. Cached proposals can still be inspected/undone, but generating or applying another fix requires a current review.
 - Workspace navigation, source and saved drafts survive a real window restart. A hidden saved preview does not inherit publication acknowledgement. Async annotations/comments stay bound to their original snapshot and source hash.
-- PR feedback explicitly states that existing Reviewer discussions have not been read yet; synchronization and Reply/Resolve belong to M5/M6, not an empty “zero comments” result.
+- Existing Reviewer discussions have not been read, and there is no placeholder navigation entry. Synchronization and Reply/Resolve belong to M5/M6; unimplemented integration is not a “zero comments” result.
 - Can be popped out into a separate window (like "Open in Agents Window")
-- **Token accounting (estimated)**: a HUD row shows estimated LLM tokens (↑input ↓output) with a per-operation breakdown on hover, accumulated over the review and persisted; estimated locally via `countTokens`, not the provider's billed counts
+- **Token accounting (estimated)**: the permanent footer HUD is removed. The model tooltip retains accumulated usage and per-operation details, estimated locally via `countTokens` and persisted, not provider billing.
 
 ### One review workflow and source reading
 
@@ -91,6 +91,7 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 - Full inline Diff, old/new line numbers, unread navigation, selection translation and explanation remain available. Related evidence is read-only and does not silently expand the formal scope.
 - Preparation lives in the top stage navigation. Conclusion scope details only display repository, snapshots and files; complete report export has one permanent entry in the lower-left navigation.
 - An explicit history command opens saved legacy technical reports read-only. Their original text cannot confirm, fix, comment on, ignore or approve the current review. Legacy records in a full export are clearly labeled as a historical appendix.
+- The standalone business-report panel and interactive legacy global-report implementation are deleted. Only the unified center, complete Markdown export and permanently read-only legacy archive remain, not another active UI behind a switchable read-only flag.
 
 ### Gate and conclusion
 
@@ -128,7 +129,6 @@ AI Coding Review is fully bilingual (简体中文 / English), **Simplified Chine
 | `codereview.openOrStart` | Open or start a review (status-bar entry) |
 | `codereview.openInNewWindow` | Open the review workbench in a separate window |
 | `codereview.startReview` | Pick a scope and start a review |
-| `codereview.openWorkbench` | Open the review workbench |
 | `codereview.analyzeFile` | Prioritize the current file's units while checking the full scope and global relationships |
 | `codereview.globalAnalysis` | Review the current scope using the unified business engine |
 | `codereview.showGlobalReport` | Compatibility alias for the unified conclusion center |
@@ -140,12 +140,14 @@ AI Coding Review is fully bilingual (简体中文 / English), **Simplified Chine
 
 ### Settings
 
+Old workbench, open-file and locate command IDs remain compatible with existing keybindings/internal calls, without duplicate or argument-dependent Command Palette entries.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `codereview.language` | `zh-CN` | Language for the whole experience (UI + new LLM output): `zh-CN` / `en` / `auto` |
 | `codereview.focusedWorkbench` | `false` | When opening the workbench, hide the side bar / activity bar so it takes over the main editor area; restored on close |
-| `codereview.repositoryAwareAnalysis` | `auto` | Deprecated legacy file-analysis option; does not control unified review |
-| `codereview.repositoryContextTokenBudget` | `28000` | Deprecated; unified review uses the engine limits and measured model capacity above |
+
+The two ineffective legacy file-analysis settings are no longer contributed; saved user configuration is not rewritten. Unified review still uses the engine limits and measured model capacity above.
 
 ## Architecture
 
