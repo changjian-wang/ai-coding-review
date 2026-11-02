@@ -3,8 +3,8 @@ import { scopePreparationView } from './scopePreparationView';
 import { m } from '../i18n';
 import { resetVscodeMock, vscodeMockState } from '../test/vscodeMock';
 
-function client(kind = 'pr') {
-  const html = scopePreparationView('C:\\repo', kind);
+function client(kind = 'pr', handoffError?: string) {
+  const html = scopePreparationView('C:\\repo', kind, false, undefined, handoffError);
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error('Preparation script is missing');
   interface Element {
@@ -96,6 +96,28 @@ function client(kind = 'pr') {
 afterEach(() => resetVscodeMock());
 
 describe('preparation repository actions', () => {
+  it('keeps the preparation visible and locked while its own window enters review', () => {
+    const page = client('branchChanges');
+    page.repository();
+    page.requirements({ ready: true });
+    page.receive({ type: 'handoffProgress', message: m().scope.enteringReview });
+    expect(page.get('preparation-shell').inert).toBe(true);
+    expect(page.get('confirm').disabled).toBe(true);
+    expect(page.get('confirm').textContent).toBe(m().scope.enteringReview);
+    expect(page.get('status-text').textContent).toBe(m().scope.enteringReview);
+    expect(page.html).not.toContain('id="loadingElapsed"');
+  });
+
+  it('shows the actual failed handoff in the retained preparation without executing error HTML', () => {
+    const page = client('branchChanges', '<script>unexpected()</script>');
+    expect(page.html).toContain('id="handoff-error"');
+    expect(page.html).toContain('&lt;script&gt;unexpected()&lt;/script&gt;');
+    expect(page.html).not.toContain('<script>unexpected()</script>');
+    page.repository();
+    page.requirements({ ready: true });
+    expect(page.get('confirm').disabled).toBe(false);
+  });
+
   it('cancels a link read even when the dialog is closed before the first host acknowledgement', () => {
     const page = client('branchChanges');
     page.repository();
@@ -133,7 +155,7 @@ describe('preparation repository actions', () => {
     expect(page.get('understanding-title').textContent).toBe(m().requirements.humanTitle);
   });
 
-  it('does not carry a local-file mode into a different repository without selected paths', () => {
+  it('keeps explicit file mode but requires new selected paths when the repository changes', () => {
     const page = client('branchChanges');
     page.repository();
     page.receive({ type: 'fileScope', cwd: 'C:\\repo' });
@@ -142,10 +164,11 @@ describe('preparation repository actions', () => {
       type: 'repository', selected: 'C:\\other', roots: ['C:\\repo', 'C:\\other'],
       data: { cwd: 'C:\\other', refs: ['main', 'feature'], current: 'feature', prsCurrent: false },
     });
-    expect(page.get('kind').value).toBe('pr');
+    expect(page.get('kind').value).toBe('files');
     expect(page.get('files-target-field').hidden).toBe(false);
-    expect(page.get('files-field').hidden).toBe(true);
-    expect(page.messages.at(-1)).toMatchObject({ type: 'rendered', cwd: 'C:\\other' });
+    expect(page.get('files-field').hidden).toBe(false);
+    expect(page.get('confirm').disabled).toBe(true);
+    expect(page.messages.at(-1)).toMatchObject({ type: 'clearSelection', cwd: 'C:\\other', kind: 'files' });
   });
   it('provides one in-place revision surface and an explicit human requirement action', () => {
     const page = client();

@@ -71,6 +71,12 @@ describe('WorkbenchPanel incremental patching', () => {
     panel.webview.receiveMessage({ type: 'select', path: 'src/a.ts' });
     expect(open).toHaveBeenCalledWith('src/a.ts');
     expect(close).not.toHaveBeenCalled();
+    WorkbenchPanel.adopt(handoff.panel, () => state, actions);
+    expect(close).not.toHaveBeenCalled();
+    const adopted = panel.webview.html;
+    handoff.resume();
+    expect(panel.webview.html).toBe(adopted);
+    expect(vscodeMockState.panel).toBe(panel);
   });
 
   it('does not revive an old panel when preparation was closed and another workbench was created', () => {

@@ -38,17 +38,17 @@ async function main() {
         finally { await vscode.commands.executeCommand('workbench.action.quit'); }
       };
     `);
-    const launch = async (phase) => {
+    const launch = async (phase, targetWorkspace = workspace, profile = path.join(root, 'profile')) => {
       const { stdout, stderr } = await promisify(execFile)(executable, [
         '--new-window', '--disable-extensions', '--disable-workspace-trust',
         '--skip-welcome', '--skip-release-notes', '--disable-updates', '--disable-telemetry',
-        `--user-data-dir=${path.join(root, 'profile')}`,
+        `--user-data-dir=${profile}`,
         `--extensions-dir=${path.join(root, 'extensions')}`,
         `--extensionDevelopmentPath=${path.resolve(__dirname, '..')}`,
-        `--extensionDevelopmentPath=${driver}`, workspace,
+        `--extensionDevelopmentPath=${driver}`, targetWorkspace,
       ], {
         timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
-        env: { ...process.env, CODEREVIEW_HOST_TEST_ROOT: workspace, CODEREVIEW_HOST_TEST_RESULT: output, CODEREVIEW_HOST_TEST_PHASE: phase },
+        env: { ...process.env, CODEREVIEW_HOST_TEST_ROOT: targetWorkspace, CODEREVIEW_HOST_TEST_RESULT: output, CODEREVIEW_HOST_TEST_PHASE: phase },
       });
       if (stdout) process.stdout.write(stdout);
       if (stderr) process.stderr.write(stderr);
@@ -56,7 +56,12 @@ async function main() {
       if (result.status !== 'passed') throw new Error(JSON.stringify(result));
       return result.checks;
     };
-    const checks = [...await launch('initial'), ...await launch('restore')];
+    const coldWorkspace = path.join(root, 'cold-workspace');
+    await mkdir(coldWorkspace);
+    const checks = [
+      ...await launch('cold-popup', coldWorkspace, path.join(root, 'cold-profile')),
+      ...await launch('initial'), ...await launch('restore'),
+    ];
     console.log(`Real VS Code host: ${checks.join('; ')}`);
   } finally {
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });

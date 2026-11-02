@@ -309,6 +309,8 @@ export const zh: Messages = {
     changeFiles: '更改所选文件…',
     chooseFilesHint: '请选择本次要审查的源码文件。',
     loadingFilesScope: '正在准备文件范围…',
+    enteringReview: '正在原窗口进入审查…',
+    handoffFailed: '进入审查失败：{0}。已保存的材料与范围仍保留，可在此重试。',
     localFilesHint: '保留已选需求，选择文件后重新确认适用范围。',
     fileTarget: '指定文件',
     currentFilesTarget: '当前本地文件范围',

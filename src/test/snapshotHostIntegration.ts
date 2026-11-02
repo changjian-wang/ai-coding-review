@@ -14,7 +14,7 @@ import { readRequirementFile } from '../review/requirementSources';
 import { analyzeRequirementUnderstanding } from '../ai/analyzer';
 import { runBusinessReviewHostChecks } from './businessReviewHostIntegration';
 import { runReviewCenterHostChecks, runReviewCenterRestartChecks } from './reviewCenterHostIntegration';
-import { runStartupHostChecks } from './startupHostIntegration';
+import { runColdStartHostChecks, runStartupHostChecks } from './startupHostIntegration';
 import { runPreparationLoadingHostChecks } from './preparationLoadingHostIntegration';
 import { runPreparationActionsHostChecks } from './preparationActionsHostIntegration';
 import { runSourceScrollHostChecks } from './sourceScrollHostIntegration';
@@ -64,6 +64,12 @@ export async function run(): Promise<void> {
     await extension.activate();
     assert.ok(extension.isActive);
     checks.push('extension activation');
+    if (process.env.CODEREVIEW_HOST_TEST_PHASE === 'cold-popup') {
+      checks.push(...await within(runColdStartHostChecks(root, 'codereview.openInNewWindow'), 40_000, 'true cold auxiliary-window confirmation'));
+      await writeFile(output, JSON.stringify({ status: 'passed', checks }, null, 2));
+      return;
+    }
+    checks.push(...await within(runColdStartHostChecks(root, 'codereview.openOrStart'), 40_000, 'true cold standard-entry confirmation'));
 
     preparation = createScopePreparation(root, vscode.ViewColumn.One, 'branchChanges');
     assert.equal(await within(preparation.ready, 30_000, 'preparation webview render handshake'), true);

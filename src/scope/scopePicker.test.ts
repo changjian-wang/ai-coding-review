@@ -1,10 +1,13 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as vscode from 'vscode';
+import { resetVscodeMock } from '../test/vscodeMock';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ReviewSet } from './types';
 import {
   CurrentBranchSourceScope,
+  pickScope,
   scanReviewablePaths,
   tryLoadPreferredScope,
   type ScopeScanProgress,
@@ -16,6 +19,19 @@ const sampleReviewSet: ReviewSet = {
   headSha: 'abc123',
   files: [{ path: 'src/extension.ts' }],
 };
+
+describe('owned preparation surface', () => {
+  it('keeps explicit file selection inside the provided preparation panel instead of starting an unmanaged scan', async () => {
+    const panel = vscode.window.createWebviewPanel('codereview.workbench', 'Preparation', vscode.ViewColumn.One, { enableScripts: true });
+    const progress = vi.spyOn(vscode.window, 'withProgress');
+    const pending = pickScope('C:\\repo', vscode.ViewColumn.One, 'files', { hostPanel: panel, retainOnSelect: true });
+    try {
+      expect(panel.webview.html).toContain('id="target-files"');
+      expect(panel.webview.html).toContain('id="confirm"');
+      expect(progress).not.toHaveBeenCalled();
+    } finally { panel.dispose(); await pending; progress.mockRestore(); resetVscodeMock(); }
+  });
+});
 
 describe('scanReviewablePaths progress', () => {
   let root: string | undefined;

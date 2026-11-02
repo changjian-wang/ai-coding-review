@@ -2,6 +2,7 @@ import * as assert from 'node:assert/strict';
 import * as vscode from 'vscode';
 import type { ReviewExtensionApi } from '../extension';
 import { m } from '../i18n';
+import type { RequirementsDraft } from '../review/requirements';
 
 interface PreparationReport {
   cards: number;
@@ -68,7 +69,18 @@ async function inspectPreparation(panel: vscode.WebviewPanel): Promise<Preparati
           const confirm=document.getElementById('confirm');
           if (!confirm.disabled) { clearInterval(timer);confirm.click(); }
         },40);
+      } else if (event.data.type === 'startupBranch') {
+        $('head').value='feature';$('base').value='main';
+        $('scope-mode').value='branchChanges';$('target-branch').checked=true;
+        $('target-branch').dispatchEvent(new Event('change'));
+      } else if (event.data.type === 'startupHuman') {
+        api.postMessage({type:'material',...choice(),human:true,name:'Cold handoff requirement',text:'Keep one effect across retries.'});
+      } else if (event.data.type === 'handoffProgress') {
+        api.postMessage({type:'requirementsRendered',startupHandoff:{locked:$('preparation-shell').inert,label:$('confirm').textContent}});
+      } else if (event.data.type === 'startupStatus') {
+        api.postMessage({type:'requirementsRendered',startupState:{ready:state.ready,committing:state.committing,materials:state.materials.length}});
       }
+      if(event.data.type==='requirements')api.postMessage({type:'requirementsRendered',startupState:{ready:event.data.state.ready,committing:event.data.state.committing,materials:event.data.state.materials.length}});
     });
   `;
   panel.webview.html = panel.webview.html.replace(anchor, `${automation}${anchor}`);
@@ -79,6 +91,78 @@ async function inspectPreparation(panel: vscode.WebviewPanel): Promise<Preparati
 function reviewTabs(): vscode.Tab[] {
   return vscode.window.tabGroups.all.flatMap((group) => group.tabs)
     .filter((tab) => tab.input instanceof vscode.TabInputWebview && tab.input.viewType.includes('codereview.workbench'));
+}
+
+export async function runColdStartHostChecks(cwd: string, command: 'codereview.openOrStart' | 'codereview.openInNewWindow'): Promise<string[]> {
+  const extension = vscode.extensions.getExtension<ReviewExtensionApi>('changjian-wang.ai-coding-review');
+  assert.ok(extension);
+  const api = (await extension.activate()).test;
+  assert.ok(api);
+  assert.equal(!!api.session.reviewSet, false, 'This scenario must start without an active review or preloaded scope');
+  const opening = vscode.commands.executeCommand(command, cwd);
+  const panel = await openingPanel(api);
+  await inspectPreparation(panel);
+  await panel.webview.postMessage({ type: 'startupBranch' });
+  let disposed = false;
+  const subscription = panel.onDidDispose(() => { disposed = true; });
+  const owner = reviewTabs()[0];
+  const groups = vscode.window.tabGroups.all.map((group) => group.viewColumn);
+  const setRequirements = api.session.setRequirements;
+  let release: (() => void) | undefined;
+  let held = false, failTransfer = false;
+  let originalDraft: RequirementsDraft | undefined;
+  let rendered: { ready: boolean; committing: boolean; materials: number } | undefined;
+  let progress: { locked: boolean; label: string } | undefined;
+  const messages = panel.webview.onDidReceiveMessage((message: {
+    startupState?: typeof rendered;
+    startupHandoff?: typeof progress;
+  }) => {
+    if (message.startupState) rendered = message.startupState;
+    if (message.startupHandoff) progress = message.startupHandoff;
+  });
+  try {
+    if (command === 'codereview.openOrStart') {
+      await panel.webview.postMessage({ type: 'startupStatus' });
+      await waitFor(() => rendered?.ready === true && !rendered.committing, 'cold-start branch readiness before editing material');
+      await panel.webview.postMessage({ type: 'startupHuman' });
+      await waitFor(() => rendered?.materials === 1 && rendered.ready && !rendered.committing, 'cold-start human requirement readiness');
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      api.session.setRequirements = async (draft) => {
+        if (failTransfer && api.session.reviewSet) {
+          failTransfer = false; originalDraft = structuredClone(draft); held = true;
+          await gate;
+          throw new Error('Controlled cold handoff failure');
+        }
+        await setRequirements.call(api.session, draft);
+      };
+      failTransfer = true;
+      await panel.webview.postMessage({ type: 'startupConfirm' });
+      await waitFor(() => held && progress !== undefined, 'retained-window loading acknowledgement');
+      assert.equal(disposed, false);
+      assert.ok(panel.webview.html.includes('id="repository"'), 'Loading must keep preparation visible rather than replace it with a scan screen');
+      assert.equal(progress?.locked, true);
+      assert.equal(progress?.label, m().scope.enteringReview);
+      release!(); release = undefined;
+      await waitFor(() => panel.webview.html.includes('id="handoff-error"'), 'failed transfer remains in the same window');
+      assert.equal(disposed, false);
+      assert.equal(api.openingPanel(), panel);
+      assert.ok(panel.webview.html.includes('Controlled cold handoff failure'));
+      await inspectPreparation(panel);
+    }
+    await panel.webview.postMessage({ type: 'startupConfirm' });
+    await within(Promise.resolve(opening), `first confirmation from ${command}`);
+    assert.equal(disposed, false, 'The first Start review must not close its preparation panel or auxiliary window');
+    assert.ok(panel.webview.html.includes('id="review-source"'));
+    assert.equal(reviewTabs()[0], owner, 'The selected editor must be the same actual tab after the first handoff');
+    assert.deepEqual(vscode.window.tabGroups.all.map((group) => group.viewColumn), groups, 'Confirmation must not relocate or recreate editor groups');
+    assert.equal(api.session.reviewSet?.source?.headRef, 'feature');
+    assert.equal(api.session.reviewSet?.source?.baseRef, 'main');
+    if (originalDraft) assert.deepEqual(api.session.requirements?.materials, originalDraft.materials, 'Failure and retry must retain the saved original requirements');
+    return [`true cold ${command}: confirmation retains its exact panel/tab/groups${originalDraft ? ', with inline loading and a real failed-transfer retry preserving material' : ''}`];
+  } finally {
+    release?.(); api.session.setRequirements = setRequirements;
+    messages.dispose(); subscription.dispose(); panel.dispose();
+  }
 }
 
 export async function runStartupHostChecks(cwd: string): Promise<string[]> {

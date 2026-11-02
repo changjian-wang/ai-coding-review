@@ -41,6 +41,7 @@ interface RepositoryData {
 
 export interface ScopePreparationOptions {
   hostPanel?: vscode.WebviewPanel;
+  handoffError?: string;
   retainOnSelect?: boolean;
   retainOnReturn?: boolean;
   load?(cwd: string, identity?: string): Promise<{ draft: RequirementsDraft; selection?: PreparedScopeChoice } | undefined>;
@@ -484,7 +485,7 @@ export function createScopePreparation(
           t = m().scope;
           rerendering = true;
           panel.title = t.prepareTitle;
-          panel.webview.html = scopePreparationView(selectedRoot, selection?.kind ?? initialKind, !!options.onReturn, fileScope?.cwd);
+          panel.webview.html = scopePreparationView(selectedRoot, selection?.kind ?? initialKind, !!options.onReturn, fileScope?.cwd, options.handoffError);
         } else publish();
         return;
       }
@@ -652,6 +653,6 @@ export function createScopePreparation(
       }
     }
   });
-  panel.webview.html = scopePreparationView(defaultCwd, initialKind, !!options.onReturn, options.fileScope?.cwd);
+  panel.webview.html = scopePreparationView(defaultCwd, initialKind, !!options.onReturn, options.fileScope?.cwd, options.handoffError);
   return { result, ready, dispose: () => panel.dispose() };
 }

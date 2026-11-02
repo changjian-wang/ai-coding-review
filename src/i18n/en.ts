@@ -349,6 +349,8 @@ export const en = {
     changeFiles: 'Change selected files…',
     chooseFilesHint: 'Choose the source files to review in this scope.',
     loadingFilesScope: 'Preparing the file scope…',
+    enteringReview: 'Opening the review in this window…',
+    handoffFailed: 'Could not open the review: {0}. Saved material and scope are retained; you can retry here.',
     localFilesHint: 'Selected requirements are preserved. Confirm their applicability again for the selected files.',
     fileTarget: 'Selected files',
     currentFilesTarget: 'Current local-file scope',

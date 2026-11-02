@@ -1134,44 +1134,57 @@ async function openInNewWindow(
   }
 }
 
-async function prepareWorkbenchInto(panel: vscode.WebviewPanel, cwd: string, moveToNewWindow = false): Promise<void> {
+async function prepareWorkbenchInto(panel: vscode.WebviewPanel, cwd: string, moveToNewWindow = false, kind?: string): Promise<void> {
   openingWorkbenchPanel = panel;
   let closed = false;
   const disposal = panel.onDidDispose(() => { closed = true; });
   let returnStage: 'review' | 'conclusion' | undefined = session.reviewSet
     ? session.workspaceView.stage === 'conclusion' ? 'conclusion' : 'review' : undefined;
+  let handoffError: string | undefined;
   try {
-    const pending = pickScope(cwd, panel.viewColumn, undefined, {
-      ...requirementPreparationOptions(), hostPanel: panel, retainOnSelect: true,
-      retainOnReturn: !!session.reviewSet,
-      onReturn: session.reviewSet ? (stage) => { returnStage = stage; } : undefined,
-    });
-    if (moveToNewWindow) await moveActiveEditorToNewWindow();
-    const picked = await pending;
-    if (closed) return;
-    if (!picked) {
-      if (returnStage) {
-        if (returnStage === 'conclusion' && !session.conclusionDraft) await session.generateConclusionDraft(defaultCenterBody());
-        session.setWorkspaceView({ stage: returnStage });
+    while (!closed) {
+      if (session.snapshot) session.setWorkspaceView({ stage: 'prepare' });
+      const pending = pickScope(cwd, panel.viewColumn, kind, {
+        ...requirementPreparationOptions(), hostPanel: panel, retainOnSelect: true, handoffError,
+        retainOnReturn: !!returnStage,
+        onReturn: returnStage ? (stage) => { returnStage = stage; } : undefined,
+      });
+      if (moveToNewWindow) { moveToNewWindow = false; await moveActiveEditorToNewWindow(); }
+      const picked = await pending;
+      if (closed) return;
+      if (!picked) {
+        if (returnStage) {
+          if (returnStage === 'conclusion' && !session.conclusionDraft) await session.generateConclusionDraft(defaultCenterBody());
+          session.setWorkspaceView({ stage: returnStage });
+          panel.title = m().workbench.title;
+          WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
+        }
+        return;
+      }
+      cwd = picked.cwd;
+      try {
+        setStatusBarBusy(true);
+        await panel.webview.postMessage({ type: 'handoffProgress', message: m().scope.enteringReview });
+        const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
+        if (closed) return;
+        if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
+        await activateReviewSet(reviewSet, picked.cwd, false);
+        if (closed) return;
+        if (picked.requirements) await session.setRequirements(picked.requirements);
+        if (closed) return;
+        session.setWorkspaceView({ stage: 'review' });
+        persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
         panel.title = m().workbench.title;
         WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
+        if (picked.requirements) void startBusinessReview();
+        return;
+      } catch (error) {
+        if (closed) return;
+        console.warn('[codereview] preparation handoff failed:', error);
+        handoffError = error instanceof Error ? error.message : String(error);
+        setStatusBarBusy(false);
       }
-      return;
     }
-    setStatusBarBusy(true);
-    const progress = WorkbenchPanel.showLoading(panel, m().review.loadingSource, 'restore');
-    const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
-    if (closed) return;
-    if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
-    await activateReviewSet(reviewSet, picked.cwd);
-    if (picked.requirements) await session.setRequirements(picked.requirements);
-    session.setWorkspaceView({ stage: 'review' });
-    persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
-    if (closed) return;
-    progress.report(m().workbench.loadingOpening, 'open');
-    panel.title = m().workbench.title;
-    WorkbenchPanel.adopt(panel, buildWorkbenchState, workbenchActions());
-    if (picked.requirements) void startBusinessReview();
   } finally { disposal.dispose(); }
 }
 
@@ -1219,7 +1232,7 @@ async function loadPreferredReviewWithProgress(
   }
 }
 
-async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<void> {
+async function activateReviewSet(reviewSet: ReviewSet, cwd: string, notifyLoaded = true): Promise<void> {
   const resolvedCwd = await realpath(reviewSet.source ? await repositoryRoot(cwd) : cwd);
   await session.start(reviewSet, resolvedCwd);
   commitSource = undefined;
@@ -1235,7 +1248,7 @@ async function activateReviewSet(reviewSet: ReviewSet, cwd: string): Promise<voi
   WorkbenchPanel.resetFolders();
   layoutAppliedForCurrentReview = false;
   void vscode.commands.executeCommand('setContext', 'codereview.active', true);
-  transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
+  if (notifyLoaded) transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
   const archive = session.legacyArchive;
   if (archive && (archive.snapshots.length || Object.keys(archive.files).length) && !legacyHistoryNotices.has(resolvedCwd)) {
     legacyHistoryNotices.add(resolvedCwd);
@@ -1270,9 +1283,9 @@ async function startReview(kind?: string): Promise<void> {
     return;
   }
   scopePickInFlight = true;
-  const previousStage = session.workspaceView.stage;
   const inPlace = WorkbenchPanel.suspendForPreparation();
-  let returnStage: 'review' | 'conclusion' = previousStage === 'conclusion' ? 'conclusion' : 'review';
+  const panel = inPlace?.panel ?? vscode.window.createWebviewPanel('codereview.workbench', m().scope.prepareTitle,
+    vscode.ViewColumn.One, { enableScripts: true, retainContextWhenHidden: true });
   if (inPlace) {
     openingWorkbenchPanel = inPlace.panel;
     openFileGeneration++;
@@ -1280,43 +1293,17 @@ async function startReview(kind?: string): Promise<void> {
     fixProposalOpenGeneration++;
     FixProposalPanel.closeIfOpen();
   }
-  if (session.snapshot) session.setWorkspaceView({ stage: 'prepare' });
+  openingWorkbenchPanel = panel;
   try {
-    const picked = await pickScope(session.getCwd() ?? defaultCwd, WorkbenchPanel.viewColumn, kind, {
-      ...requirementPreparationOptions(),
-      ...(inPlace ? {
-        hostPanel: inPlace.panel, retainOnSelect: true, retainOnReturn: true,
-        onReturn: (stage: 'review' | 'conclusion') => { returnStage = stage; },
-      } : {}),
-    });
-    if (!picked) return;
-    const { scope: source, cwd } = picked;
-    await withWorkbenchProgress(m().review.loadingSource, async () => {
-      const reviewSet = picked.reviewSet ?? await source.load(cwd);
-      if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
-      await activateReviewSet(reviewSet, cwd);
-      if (picked.requirements) await session.setRequirements(picked.requirements);
-      session.setWorkspaceView({ stage: 'review' });
-      persistScope(source, reviewSet, session.getCwd() ?? cwd);
-      void vscode.commands.executeCommand('setContext', 'codereview.active', true);
-      await openWorkbench();
-    });
-    if (picked.requirements) void startBusinessReview();
+    await prepareWorkbenchInto(panel, session.getCwd() ?? defaultCwd, false, kind);
   } catch (error) {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
     scopePickInFlight = false;
-    try {
-      if (session.snapshot && session.workspaceView.stage === 'prepare') {
-        session.setWorkspaceView({ stage: returnStage });
-        if (returnStage === 'conclusion' && !session.conclusionDraft) await session.generateConclusionDraft(defaultCenterBody());
-      }
-    } finally {
-      if (inPlace) {
-        if (openingWorkbenchPanel === inPlace.panel) openingWorkbenchPanel = undefined;
-        inPlace.resume();
-      }
-    }
+    if (openingWorkbenchPanel === panel) openingWorkbenchPanel = undefined;
+    if (inPlace) inPlace.resume();
+    else if (!WorkbenchPanel.isOpen) panel.dispose();
+    setStatusBarBusy(false);
   }
 }
 

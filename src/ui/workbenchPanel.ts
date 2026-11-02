@@ -244,8 +244,8 @@ export class WorkbenchPanel {
 
   private constructor(
     panel: vscode.WebviewPanel,
-    private readonly getState: WorkbenchStateProvider,
-    private readonly actions: WorkbenchActions,
+    private getState: WorkbenchStateProvider,
+    private actions: WorkbenchActions,
   ) {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -292,6 +292,20 @@ export class WorkbenchPanel {
     getState: WorkbenchStateProvider,
     actions: WorkbenchActions,
   ): WorkbenchPanel {
+    const current = WorkbenchPanel.current;
+    if (current?.panel === panel) {
+      if (current.embeddedRegistration) {
+        DocumentPanel.closeIfOpen();
+        current.embeddedRegistration.dispose();
+        current.embeddedRegistration = undefined;
+      }
+      current.getState = getState;
+      current.actions = actions;
+      current.preparing = false;
+      current.forceFullRender();
+      current.panel.reveal(undefined, false);
+      return current;
+    }
     WorkbenchPanel.current?.panel.dispose();
     panel.webview.options = { enableScripts: true };
     const instance = new WorkbenchPanel(panel, getState, actions);
@@ -370,7 +384,7 @@ export class WorkbenchPanel {
     return {
       panel: owner.panel,
       resume: () => {
-        if (WorkbenchPanel.current !== owner) return;
+        if (WorkbenchPanel.current !== owner || !owner.preparing) return;
         owner.preparing = false;
         owner.panel.title = m().workbench.title;
         owner.forceFullRender();

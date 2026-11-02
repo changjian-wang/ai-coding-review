@@ -105,7 +105,7 @@ export async function pickScope(
   preselectedKind?: string,
   preparationOptions?: ScopePreparationOptions,
 ): Promise<PickedScope | undefined> {
-  if (preselectedKind === 'files') return buildFileSystemScope();
+  if (preselectedKind === 'files' && !preparationOptions?.hostPanel) return buildFileSystemScope();
   const selected = await createScopePreparation(defaultCwd, viewColumn, preselectedKind, {
     ...preparationOptions,
     pickFiles: preparationOptions?.pickFiles ?? (async (cwd) => {
