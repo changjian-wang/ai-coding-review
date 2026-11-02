@@ -20,6 +20,7 @@ import { runPreparationActionsHostChecks } from './preparationActionsHostIntegra
 import { runSourceScrollHostChecks } from './sourceScrollHostIntegration';
 import { runStageNavigationHostChecks } from './stageNavigationHostIntegration';
 import { runUnifiedReviewHostChecks } from './unifiedReviewHostIntegration';
+import { runFlowConsistencyHostChecks } from './flowConsistencyHostIntegration';
 
 function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -156,6 +157,7 @@ export async function run(): Promise<void> {
     checks.push(...await within(runUnifiedReviewHostChecks(root), 30_000, 'production unified command routes'));
     const business = await within(runBusinessReviewHostChecks(root, set), 30_000, 'business review host workflow');
     checks.push(...business.checks);
+    checks.push(...await within(runFlowConsistencyHostChecks(root, business), 70_000, 'seven composed flow-consistency regressions'));
     checks.push(...await within(runStartupHostChecks(root), 30_000, 'review-center startup'));
     checks.push(...await within(runStageNavigationHostChecks(root, business), 30_000, 'review-center stage navigation'));
     checks.push(...await within(runReviewCenterHostChecks(root, business), 30_000, 'review-center publication and persistence'));

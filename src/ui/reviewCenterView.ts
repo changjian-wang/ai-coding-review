@@ -167,6 +167,7 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
       <section class="review-card"><div class="section-heading"><h2>${esc(t.draftTitle)}</h2><button data-center-action="generateDraft" class="secondary">${esc(t.rebuildDraft)}</button></div><div id="draft-form" hidden>
       <div class="row draft-toolbar"><span id="draft-status"></span><div class="row"><button id="show-draft-edit">${esc(t.edit)}</button><button id="show-draft-preview">${esc(t.preview)}</button><button data-center-action="copyDraft">${esc(t.copyDraft)}</button><button data-center-action="saveDraft">${esc(t.saveDraft)}</button></div></div>
       <label for="draft-body">${esc(t.body)}</label><textarea id="draft-body" rows="14"></textarea><div class="row" style="margin:10px 0"><button id="save-preview" hidden>${esc(t.savePreview)}</button><button class="decision-toggle" id="open-conclusion-decision">${esc(t.decisionTitle)}</button></div>
+      <details id="draft-buffer-conflict" class="notice warning" hidden><summary>${esc(t.draftBufferConflict)}</summary><p>${esc(t.draftBufferConflictHint)}</p><pre id="draft-buffer-conflict-body"></pre></details>
       <article id="draft-preview" class="draft-preview markdown" hidden></article><div id="draft-comments" hidden></div><p class="boundary">${esc(t.bodyDisclosure)}</p>
       </div></section></section></main>
     </div>
@@ -184,20 +185,22 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   const api=window.__reviewCenterApi,CLIENT=window.__reviewCenterClient,T=${json(t)},B=${json(m().businessReview)},C=${json(m().conclusion)},W=${json(m().workbench)};
   const $=id=>document.getElementById(id),esc=value=>String(value??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   let data=${json(center)},files=${json(files)},request=0,pendingBody,replaceEditor=false,previewMode=false,lastPreviewKey,filter='',rowKind,inspectorContext,inspectorContent,inspectorActions,summaryKey,outcomeKey,globalMessage='',saveTimer,automatedRequest;
-  const persisted=api.getState()?.center||{},buffers=persisted.buffers||{};let editorId;
+  const persisted=api.getState()?.center||{},buffers=persisted.buffers||{},conflicts=persisted.conflicts||{};let editorId;
   let sourceOpen=!!data.view.source&&persisted.sourceKey===data.contextKey&&persisted.sourceOpen===true,showClosed=persisted.sourceKey===data.contextKey&&persisted.showClosed===true;
-  function store(){api.setState({...api.getState(),center:{buffers,filter,previewMode,sourceOpen,sourceKey:data.contextKey,showClosed}})}
+  function store(){api.setState({...api.getState(),center:{buffers,conflicts,filter,previewMode,sourceOpen,sourceKey:data.contextKey,showClosed}})}
   function revealSource(){sourceOpen=true;$('source-main').open=true;store();requestAnimationFrame(()=>$('source-main').scrollIntoView({block:'start'}));}
   function closeSource(){sourceOpen=false;$('source-main').open=false;if(data.view.focus)send('focus',{value:'false'});store();}
   function draftEdit(){const draft=data.conclusion.draft;if(!draft||editorId!==draft.id)return;return{id:draft.id,revision:draft.revision,body:$('draft-body').value,verdict:$('draft-verdict').value}}
   function dirty(){const d=data.conclusion.draft,e=draftEdit();return!!d&&!!e&&(e.body!==d.body||e.verdict!==d.verdict)}
-  function send(action,fields={},bodyOperation=false){window.clearTimeout(saveTimer);const id=++request;const message={type:'center',action,contextKey:data.contextKey,clientId:CLIENT,requestId:id,...fields};
+  function send(action,fields={},bodyOperation=false){if(bodyOperation&&pendingBody)return;window.clearTimeout(saveTimer);const id=++request;const message={type:'center',action,contextKey:data.contextKey,clientId:CLIENT,requestId:id,...fields};
     if((bodyOperation||action==='stage'&&fields.value==='prepare')&&dirty())message.draft=draftEdit();
     if(bodyOperation){pendingBody=id;replaceEditor=action==='appendFinding'||action==='generateDraft';$('draft-body').disabled=true;$('draft-verdict').disabled=true;$('save-preview').disabled=true;updateDraftStatus();}
     api.postMessage(message);return id;}
   function saveSoon(preview=false){window.clearTimeout(saveTimer);saveTimer=window.setTimeout(()=>{if(pendingBody||data.view.stage!=='conclusion'||data.conclusion.stale||data.conclusion.published)return;const id=send('savePreview',{draft:draftEdit()},true);automatedRequest=preview?undefined:id;},350);}
-  function rememberDraft(){const d=data.conclusion.draft;if(d){buffers[d.id]={scope:data.view.scopeKey,body:$('draft-body').value,verdict:$('draft-verdict').value};store();saveSoon()}updateDraftStatus()}
-  function updateDraftStatus(){const d=data.conclusion.draft;if(!d)return;$('draft-status').textContent=pendingBody?T.draftPending:dirty()?T.unsavedDraft:T.savedDraft;
+  function rememberDraft(){const d=data.conclusion.draft;if(d){buffers[d.id]={scope:data.view.scopeKey,binding:d.bindingKey,revision:d.revision,body:$('draft-body').value,verdict:$('draft-verdict').value};store();saveSoon()}updateDraftStatus()}
+  function syncBodyActions(){const busy=!!pendingBody||data.conclusion.publishBusy;document.querySelectorAll('[data-center-action="appendFinding"],[data-center-action="generateDraft"],[data-center-action="copyDraft"],[data-center-action="saveDraft"]').forEach(button=>button.disabled=busy);}
+  function retainConflict(draft,buffer){if(buffer?.scope===data.view.scopeKey&&typeof buffer.body==='string'){(conflicts[draft.id]||=[]).push({body:buffer.body,verdict:buffer.verdict});delete buffers[draft.id];store();}}
+  function updateDraftStatus(){syncBodyActions();const d=data.conclusion.draft;if(!d)return;$('draft-status').textContent=pendingBody?T.draftPending:dirty()?T.unsavedDraft:T.savedDraft;
     const allowed=d.verdict==='approve'?data.conclusion.canApprove:d.verdict==='request-changes'?data.conclusion.canRequestChanges:data.conclusion.canComment;
     if(data.conclusion.published)$('draft-status').textContent=T.alreadyPublished;
     $('publish-draft').disabled=!!pendingBody||data.conclusion.publishBusy||data.conclusion.stale||data.conclusion.published||!!data.conclusion.unknownAttempt||!data.conclusion.previewCurrent||!previewMode||dirty()||!allowed;syncVerdicts();}
@@ -211,8 +214,13 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
     $('check-publication').hidden=!state.unknownAttempt;if(state.unknownAttempt)$('check-publication').dataset.id=state.unknownAttempt.id;
     $('draft-form').hidden=!d;$('conclusion-decision').hidden=data.view.stage!=='conclusion'||!d;$('conclusion-actions').hidden=data.view.stage!=='conclusion'||!d;if(!d)return;
     const first=editorId!==d.id,wasClean=previous?.id===d.id&&$('draft-body').value===previous.body&&$('draft-verdict').value===previous.verdict;
-    if(first){editorId=d.id;const buffer=buffers[d.id];$('draft-body').value=buffer?.scope===data.view.scopeKey?buffer.body:d.body;$('draft-verdict').value=buffer?.scope===data.view.scopeKey?buffer.verdict:d.verdict;previewMode=!!persisted.previewMode&&!dirty();}
+    const matches=$('draft-body').value===d.body&&$('draft-verdict').value===d.verdict;
+    const changed=previous?.id===d.id&&(previous.revision!==d.revision||previous.bindingKey!==d.bindingKey);
+    if(first){editorId=d.id;let buffer=buffers[d.id];if(buffer&&(buffer.scope!==data.view.scopeKey||buffer.binding!==d.bindingKey||buffer.revision!==d.revision)){if(buffer.body!==d.body||buffer.verdict!==d.verdict)retainConflict(d,buffer);else{delete buffers[d.id];store();}buffer=undefined;}$('draft-body').value=buffer?buffer.body:d.body;$('draft-verdict').value=buffer?buffer.verdict:d.verdict;previewMode=!!persisted.previewMode&&!dirty();}
     else if(wasClean||replaceEditor&&(!previous||d.revision!==previous.revision)){ $('draft-body').value=d.body;$('draft-verdict').value=d.verdict;replaceEditor=false; }
+    else if(changed&&!matches){retainConflict(d,{scope:data.view.scopeKey,body:$('draft-body').value,verdict:$('draft-verdict').value});$('draft-body').value=d.body;$('draft-verdict').value=d.verdict;}
+    if($('draft-body').value===d.body&&$('draft-verdict').value===d.verdict&&buffers[d.id]?.scope===data.view.scopeKey){delete buffers[d.id];store();}
+    $('draft-buffer-conflict').hidden=!conflicts[d.id]?.length;$('draft-buffer-conflict-body').textContent=(conflicts[d.id]||[]).map(buffer=>buffer.body).join('\\n\\n---\\n\\n');
     $('draft-verdict').querySelector('[value="approve"]').disabled=false;
     $('draft-verdict').querySelector('[value="request-changes"]').disabled=false;
     $('draft-verdict').querySelector('[value="comment"]').disabled=false;
@@ -236,10 +244,13 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   function inspector(){const item=data.inspector,concluding=data.view.stage==='conclusion';$('inspector-heading').textContent=concluding?T.decisionTitle:T.context;$('inspector-title').textContent=concluding?T.verdict:item.title;$('inspector-subtitle').textContent=concluding?data.status:item.subtitle;
     $('inspector-tabs').hidden=concluding||!item.findingId;$('next-finding').hidden=concluding;$('next-finding').disabled=!data.conclusion.openItems.length;$('judgment-help').hidden=true;
     const warning=data.viewError||(data.runStatus==='stale'?B.stale:'');$('inspector-notice').hidden=!warning;$('inspector-notice').textContent=warning;
-    const html=concluding?(data.conclusion.blockers.length?data.conclusion.blockers.map(reason=>'<div class="gate-row">'+esc(reason)+'</div>').join(''):'<div class="gate-row '+(data.conclusion.canApprove?'ok':'')+'">'+esc(data.conclusion.canApprove?T.decisionReady:B.incomplete)+'</div>')+'<p class="boundary">'+T.reportBoundary+'</p>':item.html;
+    const verdict=data.conclusion.draft?.verdict,allowed=!data.conclusion.stale&&!data.conclusion.error&&(verdict==='approve'?data.conclusion.canApprove:verdict==='request-changes'?data.conclusion.canRequestChanges:data.conclusion.canComment);
+    const html=concluding?(data.conclusion.blockers.length?data.conclusion.blockers.map(reason=>'<div class="gate-row">'+esc(reason)+'</div>').join(''):'<div class="gate-row '+(allowed?'ok':'')+'">'+esc(allowed?(verdict==='approve'?T.decisionReady:T.feedbackReady):B.incomplete)+'</div>')+'<p class="boundary">'+T.reportBoundary+'</p>':item.html;
     const body=$('inspector-body'),context=JSON.stringify([data.view.scopeKey,data.view.runId,data.view.selection,data.view.inspector,data.view.stage]);if(inspectorContext!==context||inspectorContent!==html){const scroll=concluding?$('center-inspector'):document.querySelector('.main'),position=inspectorContext===context?scroll.scrollTop:0;body.innerHTML=html;scroll.scrollTop=position;inspectorContext=context;inspectorContent=html;}
-    const actions=[];if(data.view.stage==='review'){if(item.primaryReference||item.primaryFile)actions.push('<button data-center-action="return">'+T.primaryEvidence+'</button>');if(item.findingId)actions.push('<button data-center-action="note">'+B.comment+'</button><button data-center-action="appendFinding">'+T.appendFinding+'</button>');if(item.canFix)actions.push('<button data-center-action="fix">'+T.fix+'</button>');}
-    const controls=actions.join('');if(inspectorActions!==controls){$('inspector-actions').innerHTML=controls;inspectorActions=controls;}}
+    const noteBusy=data.running||data.analysisBusy||data.runStatus==='running'||data.runStatus==='stale'||data.conclusion.publishBusy;
+    const noteReason=data.runStatus==='stale'?B.stale:data.conclusion.publishBusy?T.checking:B.running;
+    const actions=[];if(data.view.stage==='review'){if(item.primaryReference||item.primaryFile)actions.push('<button data-center-action="return">'+T.primaryEvidence+'</button>');if(item.findingId)actions.push('<button data-center-action="note" '+(noteBusy?'disabled title="'+esc(noteReason)+'"':'')+'>'+B.comment+'</button><button data-center-action="appendFinding">'+T.appendFinding+'</button>');if(item.canFix)actions.push('<button data-center-action="fix">'+T.fix+'</button>');}
+    const controls=actions.join('');if(inspectorActions!==controls){$('inspector-actions').innerHTML=controls;inspectorActions=controls;}syncBodyActions();}
   function paint(previous){const shell=$('center-shell');shell.classList.toggle('prepare',data.view.stage==='prepare');shell.classList.toggle('conclusion',data.view.stage==='conclusion');shell.classList.toggle('focus',data.view.focus);
     $('source-main').hidden=data.view.stage!=='review';$('prepare-main').hidden=data.view.stage!=='prepare';$('conclusion-main').hidden=data.view.stage!=='conclusion';
     $('review-summary').hidden=data.view.stage!=='review';$('toggle-inspector').hidden=data.view.stage!=='conclusion';

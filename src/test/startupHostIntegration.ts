@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import * as vscode from 'vscode';
 import type { ReviewExtensionApi } from '../extension';
 import { m } from '../i18n';
-import type { RequirementsDraft } from '../review/requirements';
+import { restoreRequirementsDraft, type RequirementsDraft } from '../review/requirements';
 
 interface PreparationReport {
   cards: number;
@@ -107,7 +107,7 @@ export async function runColdStartHostChecks(cwd: string, command: 'codereview.o
   const subscription = panel.onDidDispose(() => { disposed = true; });
   const owner = reviewTabs()[0];
   const groups = vscode.window.tabGroups.all.map((group) => group.viewColumn);
-  const setRequirements = api.session.setRequirements;
+  const update = api.workspaceState.update;
   let release: (() => void) | undefined;
   let held = false, failTransfer = false;
   let originalDraft: RequirementsDraft | undefined;
@@ -127,18 +127,21 @@ export async function runColdStartHostChecks(cwd: string, command: 'codereview.o
       await panel.webview.postMessage({ type: 'startupHuman' });
       await waitFor(() => rendered?.materials === 1 && rendered.ready && !rendered.committing, 'cold-start human requirement readiness');
       const gate = new Promise<void>((resolve) => { release = resolve; });
-      api.session.setRequirements = async (draft) => {
-        if (failTransfer && api.session.reviewSet) {
-          failTransfer = false; originalDraft = structuredClone(draft); held = true;
+      api.workspaceState.update = async (key, value: unknown) => {
+        const source = value && typeof value === 'object' && 'source' in value ? value.source : undefined;
+        if (failTransfer && source && typeof source === 'object' && 'headRef' in source && source.headRef === 'feature'
+          && value && typeof value === 'object' && 'requirements' in value) {
+          failTransfer = false; originalDraft = restoreRequirementsDraft(value.requirements); held = true;
           await gate;
           throw new Error('Controlled cold handoff failure');
         }
-        await setRequirements.call(api.session, draft);
+        await update.call(api.workspaceState, key, value);
       };
       failTransfer = true;
       await panel.webview.postMessage({ type: 'startupConfirm' });
       await waitFor(() => held && progress !== undefined, 'retained-window loading acknowledgement');
       assert.equal(disposed, false);
+      assert.equal(!!api.session.reviewSet, false, 'A failed first-scope write must not become the active review');
       assert.ok(panel.webview.html.includes('id="repository"'), 'Loading must keep preparation visible rather than replace it with a scan screen');
       assert.equal(progress?.locked, true);
       assert.equal(progress?.label, m().scope.enteringReview);
@@ -160,7 +163,7 @@ export async function runColdStartHostChecks(cwd: string, command: 'codereview.o
     if (originalDraft) assert.deepEqual(api.session.requirements?.materials, originalDraft.materials, 'Failure and retry must retain the saved original requirements');
     return [`true cold ${command}: confirmation retains its exact panel/tab/groups${originalDraft ? ', with inline loading and a real failed-transfer retry preserving material' : ''}`];
   } finally {
-    release?.(); api.session.setRequirements = setRequirements;
+    release?.(); api.workspaceState.update = update;
     messages.dispose(); subscription.dispose(); panel.dispose();
   }
 }

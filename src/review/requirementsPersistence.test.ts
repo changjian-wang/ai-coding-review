@@ -37,6 +37,48 @@ function confirmedDraft() {
 }
 
 describe('requirement baseline persistence and technical conclusions', () => {
+  it('does not replace an active scope, report or manual draft when the next scope cannot be persisted', async () => {
+    const { session, store, set, cwd } = await reviewCenterFixture({ defect: false });
+    const originalDraft = await session.generateConclusionDraft('# Original manual conclusion');
+    const originalSet = session.reviewSet;
+    const originalSnapshot = session.snapshot;
+    const next = structuredClone(session.requirements!);
+    clearRequirementConfirmation(next); next.technicalOnly = true;
+    const other: ReviewSet = { ...set, scopeId: 'other-scope', headSha: 'c'.repeat(40),
+      source: { ...set.source, kind: 'commit', headRef: 'other' } };
+    vi.spyOn(store, 'save').mockRejectedValueOnce(new Error('Next scope storage unavailable'));
+    await expect(session.start(other, cwd, next)).rejects.toThrow('Next scope storage unavailable');
+    expect(session.reviewSet).toBe(originalSet);
+    expect(session.snapshot).toBe(originalSnapshot);
+    expect(session.businessReview?.status).toBe('completed');
+    expect(session.conclusionDraft?.id).toBe(originalDraft.id);
+    expect(session.conclusionDraft?.body).toBe('# Original manual conclusion');
+    expect(session.canSubmitConclusion('approve')).toBe(true);
+    session.dispose();
+  });
+
+  it('keeps the previous review current until prepared scope and requirements have finished saving together', async () => {
+    const { session, store, set, cwd } = await reviewCenterFixture();
+    const original = session.snapshot;
+    const next = structuredClone(session.requirements!);
+    clearRequirementConfirmation(next); next.technicalOnly = true;
+    const other: ReviewSet = { ...set, scopeId: 'other-scope', headSha: 'c'.repeat(40),
+      source: { ...set.source, kind: 'commit', headRef: 'other' } };
+    let release!: () => void;
+    vi.spyOn(store, 'save').mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    const switching = session.start(other, cwd, next);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    expect(session.snapshot).toBe(original);
+    expect(session.reviewSet?.scopeId).toBe(set.scopeId);
+    release();
+    await switching;
+    expect(session.reviewSet?.scopeId).toBe('other-scope');
+    expect(session.requirements?.technicalOnly).toBe(true);
+    expect(session.businessReview).toBeUndefined();
+    expect(session.canSubmitConclusion('approve')).toBe(false);
+    session.dispose();
+  });
+
   it('rolls back active requirements and the business report if the awaited metadata save fails', async () => {
     const { session, store } = await reviewCenterFixture({ defect: false });
     const previous = structuredClone(session.requirements);

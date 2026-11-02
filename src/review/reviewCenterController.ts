@@ -192,7 +192,10 @@ export class ReviewCenterController {
         if (!message.id || !this.session.businessReview?.findings.some((finding) => finding.id === message.id)) throw new ConclusionDraftDataError();
         await this.ensureDraft();
         const draft = this.session.conclusionDraft!;
-        await this.session.saveConclusionDraft(draft.id, draft.revision, `${draft.body}\n\n${this.services.findingBody(message.id)}`, draft.verdict);
+        const addition = this.services.findingBody(message.id);
+        if (!draft.body.includes(addition)) {
+          await this.session.saveConclusionDraft(draft.id, draft.revision, `${draft.body}\n\n${addition}`, draft.verdict);
+        }
         this.session.setWorkspaceView({ stage: 'conclusion' });
         break;
       }

@@ -47,11 +47,11 @@ import { publishConclusionDraft } from './review/conclusionPublisher';
 import { conclusionDraftText, ConclusionDraftDataError } from './review/conclusionDraft';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
-import { createRequirementsDraft, requirementScopeKey } from './review/requirements';
+import { createRequirementsDraft, requirementScopeKey, type RequirementsDraft } from './review/requirements';
 import { renderRequirementMarkdown } from './ui/requirementMarkdown';
 import { realpath } from 'node:fs/promises';
 import type { PreparedScopeChoice, ScopePreparationOptions } from './scope/scopePreparationPanel';
-import { repositoryStorageId } from './review/repositoryIdentity';
+import { canonicalRepositoryPath, repositoryStorageId } from './review/repositoryIdentity';
 import type { ReviewFile, ReviewScope, ReviewSet } from './scope/types';
 import { submitPrReviewWithComments } from './gh/ghClient';
 import { GlobalReportPanel } from './ui/globalReportPanel';
@@ -1081,6 +1081,23 @@ async function openInNewWindow(
   cwdArg?: string | vscode.WorkspaceFolder | vscode.Uri,
 ): Promise<void> {
   if (WorkbenchPanel.isOpen) {
+    const requested = resolveCwdArg(cwdArg);
+    if (requested) {
+      try {
+        const target = await realpath(requested);
+        const current = session.getCwd();
+        if (!current || canonicalRepositoryPath(current) !== canonicalRepositoryPath(target)) {
+          if (scopePickInFlight || workbenchOpenInFlight) {
+            transientWarning(m().reviewCenter.preparingOtherRepository);
+            openingWorkbenchPanel?.reveal(undefined, false);
+          } else {
+            preferredDefaultCwd = target;
+            await startReview(undefined, target);
+          }
+          return;
+        }
+      } catch (error) { reportError(error); return; }
+    }
     WorkbenchPanel.reveal();
     return;
   }
@@ -1168,9 +1185,7 @@ async function prepareWorkbenchInto(panel: vscode.WebviewPanel, cwd: string, mov
         const reviewSet = picked.reviewSet ?? await picked.scope.load(picked.cwd);
         if (closed) return;
         if (!reviewSet.files.length) throw new Error(reviewSet.source ? m().scope.emptySnapshot : m().scope.noFiles);
-        await activateReviewSet(reviewSet, picked.cwd, false);
-        if (closed) return;
-        if (picked.requirements) await session.setRequirements(picked.requirements);
+        await activateReviewSet(reviewSet, picked.cwd, { notifyLoaded: false, requirements: picked.requirements });
         if (closed) return;
         session.setWorkspaceView({ stage: 'review' });
         persistScope(picked.scope, reviewSet, session.getCwd() ?? picked.cwd);
@@ -1232,9 +1247,14 @@ async function loadPreferredReviewWithProgress(
   }
 }
 
-async function activateReviewSet(reviewSet: ReviewSet, cwd: string, notifyLoaded = true): Promise<void> {
+async function activateReviewSet(
+  reviewSet: ReviewSet, cwd: string,
+  options: { notifyLoaded?: boolean; requirements?: RequirementsDraft } = {},
+): Promise<void> {
   const resolvedCwd = await realpath(reviewSet.source ? await repositoryRoot(cwd) : cwd);
-  await session.start(reviewSet, resolvedCwd);
+  await session.start(reviewSet, resolvedCwd, options.requirements);
+  if (session.reviewSet?.scopeId !== reviewSet.scopeId || session.reviewSet?.headSha !== reviewSet.headSha
+    || session.getCwd() !== resolvedCwd) throw new Error(m().scope.staleSelection);
   commitSource = undefined;
   await refreshBranchLabel();
   closeScopeBoundPanels();
@@ -1248,7 +1268,7 @@ async function activateReviewSet(reviewSet: ReviewSet, cwd: string, notifyLoaded
   WorkbenchPanel.resetFolders();
   layoutAppliedForCurrentReview = false;
   void vscode.commands.executeCommand('setContext', 'codereview.active', true);
-  if (notifyLoaded) transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
+  if (options.notifyLoaded !== false) transientInfo(m().review.loaded(reviewSet.label, reviewSet.files.length));
   const archive = session.legacyArchive;
   if (archive && (archive.snapshots.length || Object.keys(archive.files).length) && !legacyHistoryNotices.has(resolvedCwd)) {
     legacyHistoryNotices.add(resolvedCwd);
@@ -1271,8 +1291,8 @@ function resolveCwdArg(arg?: string | vscode.WorkspaceFolder | vscode.Uri): stri
   return undefined;
 }
 
-async function startReview(kind?: string): Promise<void> {
-  const defaultCwd = preferredDefaultCwd ?? workspaceFolderPath();
+async function startReview(kind?: string, targetCwd?: string): Promise<void> {
+  const defaultCwd = targetCwd ?? preferredDefaultCwd ?? workspaceFolderPath();
   if (!defaultCwd) {
     void vscode.window.showErrorMessage(m().review.noGitWorkspace);
     return;
@@ -1295,7 +1315,7 @@ async function startReview(kind?: string): Promise<void> {
   }
   openingWorkbenchPanel = panel;
   try {
-    await prepareWorkbenchInto(panel, session.getCwd() ?? defaultCwd, false, kind);
+    await prepareWorkbenchInto(panel, targetCwd ?? session.getCwd() ?? defaultCwd, false, kind);
   } catch (error) {
     void vscode.window.showErrorMessage(m().review.error(String(error)));
   } finally {
@@ -1832,8 +1852,7 @@ function reviewCenterController(): ReviewCenterController {
 
 function defaultCenterBody(): string {
   if (session.businessReview) return businessConclusionSummary(session.businessReview);
-  const coverage = session.totalCoverage();
-  return `${m().conclusion.prBody(coverage.filesReady, coverage.filesTotal)}\n\n${session.requirementStatus}\n\n${m().businessReview.boundary}`;
+  return `${m().reviewCenter.unreviewedBody}\n\n${session.requirementStatus}\n\n${m().businessReview.boundary}`;
 }
 
 async function handleCenterAction(message: CenterAction): Promise<void> {
@@ -1869,6 +1888,9 @@ async function restoreCenterSource(): Promise<void> {
 }
 
 async function recordCenterNote(id: string): Promise<void> {
+  if (businessContext || session.businessReview?.status === 'running') throw new ConclusionDraftDataError(m().businessReview.running);
+  if (!session.businessReviewCurrent || !session.businessReview?.findings.some((finding) => finding.id === id)) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
+  if (session.publicationInFlight) throw new ConclusionDraftDataError(m().reviewCenter.checking);
   const runId = session.businessReview?.id;
   const snapshot = session.snapshot;
   if (!runId) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);

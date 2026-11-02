@@ -283,7 +283,8 @@ export function buildReviewCenterState(
       canRequestChanges: !input.running && !input.analysisBusy && session.canSubmitConclusion('request-changes'),
       publishBusy: input.publishBusy,
       target: pr ? `${set?.repositoryIdentity ?? session.getRepoLabel()} · PR #${pr[1]}` : `${session.getRepoLabel()} · ${t.localTarget}`,
-      blockers: input.running || input.analysisBusy ? [b.incomplete] : draft?.verdict === 'approve'
+      blockers: input.running || input.analysisBusy ? [b.incomplete] : draftError ? [draftError]
+        : unknownAttempt ? [t.unknownPublication] : published ? [t.alreadyPublished] : stale ? [t.draftStale] : draft?.verdict === 'approve'
         ? run ? businessBlockers(run) : [b.incomplete]
         : session.canSubmitConclusion(draft?.verdict ?? 'comment') ? [] : [stale ? b.stale : b.incomplete],
       confirmed: run?.confirmed ?? false,

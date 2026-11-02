@@ -17,7 +17,7 @@ import type { PerFileState, ReviewKey, ReviewSnapshot, ReviewStore, Annotation, 
 import { isBlankFileState } from './reviewStore';
 import { canonicalRepositoryPath, repositoryLabel, repositoryStorageId } from './repositoryIdentity';
 import {
-  requirementBoundary, requirementFingerprint, requirementReadiness,
+  requirementBoundary, requirementReadiness,
   requirementScopeKey, restoreRequirementsDraft, type RequirementsDraft,
 } from './requirements';
 import {
@@ -99,7 +99,7 @@ export class ReviewSession {
   }
 
   /** Loads or initialises review progress for the given review set. */
-  async start(reviewSet: ReviewSet, cwd?: string): Promise<void> {
+  async start(reviewSet: ReviewSet, cwd?: string, preparedRequirements?: RequirementsDraft): Promise<void> {
     const generation = ++this.startGeneration;
     await this.flushPendingFilePersists();
     const label = cwd ? repositoryLabel(cwd) : this.defaultRepo;
@@ -174,7 +174,12 @@ export class ReviewSession {
       }
     }
 
-    const requirements = scopeSnap?.requirements ? restoreRequirementsDraft(scopeSnap.requirements) : undefined;
+    const previousRequirements = scopeSnap?.requirements ? restoreRequirementsDraft(scopeSnap.requirements) : undefined;
+    const requirements = preparedRequirements ? restoreRequirementsDraft(preparedRequirements) : previousRequirements;
+    const scopeKey = requirementScopeKey(cwd ?? this.defaultRepo, reviewSet);
+    if (preparedRequirements && requirements && !requirementReadiness(requirements, scopeKey).confirmed) requirements.confirmation = undefined;
+    const requirementsChanged = businessBindingKey(cwd ?? this.defaultRepo, reviewSet, previousRequirements)
+      !== businessBindingKey(cwd ?? this.defaultRepo, reviewSet, requirements);
     const businessReview = scopeSnap?.businessReview ? restoreBusinessReview(scopeSnap.businessReview) : undefined;
     if (businessReview?.status === 'running') {
       businessReview.status = 'cancelled'; businessReview.confirmed = false;
@@ -183,7 +188,6 @@ export class ReviewSession {
     if (businessReview && (!cwd || businessReview.bindingKey !== businessBindingKey(cwd, reviewSet, requirements))) {
       businessReview.status = 'stale'; businessReview.confirmed = false;
     }
-    const scopeKey = requirementScopeKey(cwd ?? this.defaultRepo, reviewSet);
     let workspaceView = createWorkspaceView(scopeKey);
     let viewFailure: string | undefined;
     try { workspaceView = restoreWorkspaceView(scopeSnap?.workspaceView, scopeKey); }
@@ -192,21 +196,8 @@ export class ReviewSession {
       viewFailure = error.message;
       void vscode.window.showWarningMessage(error.message);
     }
-    if (generation !== this.startGeneration) return;
-    this.cwd = cwd;
-    this.repoLabel = label;
-    this.repoName = repo;
-    this.legacyArchive = legacyArchive;
-    this.reviewSet = { ...reviewSet, files: effectiveFiles };
-    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
-    this.deletedPaths = new Set(
-      effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path),
-    );
-    this.structureVersion++;
-    this.workspaceViewState = reconcileWorkspaceView(workspaceView, businessReview);
-    this.workspaceViewFailure = viewFailure;
-    this.previewedConclusion = undefined;
-    this.snapshot = {
+    const nextView = reconcileWorkspaceView(workspaceView, businessReview);
+    const candidate: ReviewSnapshot = {
       schemaVersion: 2,
       repositoryRoot: cwd ? canonicalRepositoryPath(cwd) : undefined,
       repositoryIdentity: reviewSet.repositoryIdentity,
@@ -214,7 +205,7 @@ export class ReviewSession {
       comparison: reviewSet.comparison,
       requirements,
       businessReview,
-      workspaceView: viewFailure ? scopeSnap?.workspaceView : this.workspaceViewState,
+      workspaceView: viewFailure ? scopeSnap?.workspaceView : nextView,
       conclusionDraft: scopeSnap?.conclusionDraft,
       publicationAttempts: scopeSnap?.publicationAttempts?.map((attempt) => attempt.status === 'sending'
         ? { ...attempt, status: 'unknown', error: m().reviewCenter.publicationInterrupted } : attempt),
@@ -225,18 +216,31 @@ export class ReviewSession {
       contextFiles,
       analysisDependencies: scopeSnap?.analysisDependencies,
       globalReport: scopeSnap?.globalReport,
-      globalDone: scopeSnap?.globalDone ?? false,
+      globalDone: !requirementsChanged && (scopeSnap?.globalDone ?? false),
       globalFixDispositions: scopeSnap?.globalFixDispositions,
-      conclusion: scopeSnap?.conclusion,
+      conclusion: requirementsChanged ? undefined : scopeSnap?.conclusion,
       postedConclusions: scopeSnap?.postedConclusions,
       pendingComments: scopeSnap?.pendingComments,
       tokenUsage: scopeSnap?.tokenUsage,
       updatedAt: Date.now(),
     };
-    // Surface the panel immediately; persist migrated/initial state in the
-    // background so a large review set doesn't block opening.
+    if (generation !== this.startGeneration) return;
+    await this.persistScopeMeta(candidate);
+    if (generation !== this.startGeneration) return;
+    this.cwd = cwd;
+    this.repoLabel = label;
+    this.repoName = repo;
+    this.legacyArchive = legacyArchive;
+    this.reviewSet = { ...reviewSet, files: effectiveFiles };
+    this.reviewFilesByPath = new Map(effectiveFiles.map((file) => [file.path, file]));
+    this.deletedPaths = new Set(effectiveFiles.filter((file) => file.status === 'deleted').map((file) => file.path));
+    this.structureVersion++;
+    this.workspaceViewState = nextView;
+    this.workspaceViewFailure = viewFailure;
+    this.previewedConclusion = undefined;
+    this.snapshot = candidate;
     this._onDidChange.fire({ structureChanged: true });
-    void this.persistInBackground(this.snapshot, toMigrate);
+    if (toMigrate.length) void this.persistInBackground(candidate, toMigrate);
   }
 
   get requirements(): RequirementsDraft | undefined {
@@ -404,8 +408,9 @@ export class ReviewSession {
 
   recordBusinessNote(id: string, reason: string, expectedRunId?: string): void {
     const run = this.businessReview;
+    if (run?.status === 'running') throw new Error(m().businessReview.running);
     if (!run || (expectedRunId ? run.id !== expectedRunId : !this.businessReviewCurrent)
-      || run.status === 'running' || !run.findings.some((item) => item.id === id) || !reason.trim()) throw new Error(m().businessReview.staleReport);
+      || !run.findings.some((item) => item.id === id) || !reason.trim()) throw new Error(m().businessReview.staleReport);
     run.dispositions[id] = { kind: 'commented', reason, at: Date.now() };
     run.confirmed = false;
     if (this.snapshot) this.snapshot.conclusion = undefined;
@@ -424,9 +429,7 @@ export class ReviewSession {
     const previousConclusion = snapshot.conclusion;
     const previousGlobalReport = snapshot.globalReport;
     const invalidationVersion = this.businessInvalidationVersion;
-    const changed = !previous || requirementFingerprint(previous, key) !== requirementFingerprint(next, key)
-      || previous.confirmation?.fingerprint !== next.confirmation?.fingerprint
-      || previous.technicalOnly !== next.technicalOnly;
+    const changed = businessBindingKey(this.cwd, this.reviewSet, previous) !== businessBindingKey(this.cwd, this.reviewSet, next);
     snapshot.requirements = next;
     if (changed) {
       if (previousRun) {

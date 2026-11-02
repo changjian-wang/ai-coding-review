@@ -20,6 +20,21 @@ function services(): ReviewCenterServices {
 }
 
 describe('review center selection and versioning', () => {
+  it('includes the same finding only once for concurrent append requests and permits an explicit re-add after removal', async () => {
+    const { session, run } = await reviewCenterFixture();
+    await session.generateConclusionDraft('# Manual introduction');
+    const deps = services();
+    const controller = new ReviewCenterController(session, deps);
+    const message = { type: 'center' as const, action: 'appendFinding' as const, id: run.findings[0].id, contextKey: reviewCenterContextKey(session) };
+    await Promise.all([controller.handle(message), controller.handle(message)]);
+    expect(session.conclusionDraft?.body.split('Controlled finding.')).toHaveLength(2);
+    const draft = session.conclusionDraft!;
+    await session.saveConclusionDraft(draft.id, draft.revision, '# Manual introduction', draft.verdict);
+    await controller.handle(message);
+    expect(session.conclusionDraft?.body.split('Controlled finding.')).toHaveLength(2);
+    session.dispose();
+  });
+
   it('removes placeholder and planning navigation, obsolete analysis actions and redundant model cards from the live center', async () => {
     const { session } = await reviewCenterFixture();
     const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
@@ -316,6 +331,27 @@ describe('review center selection and versioning', () => {
     expect(busy.conclusion.canComment).toBe(false);
     expect(busy.conclusion.canRequestChanges).toBe(false);
     expect(busy.conclusion.canApprove).toBe(false);
+    session.dispose();
+  });
+
+  it('explains feedback permissions by verdict without presenting approval blockers as incomplete review', async () => {
+    const { session } = await reviewCenterFixture();
+    const input = { running: false, publishBusy: false, model: 'Controlled', language: 'en' };
+    await session.generateConclusionDraft('Controlled feedback.');
+    for (const verdict of ['request-changes', 'comment'] as const) {
+      const draft = session.conclusionDraft!;
+      await session.saveConclusionDraft(draft.id, draft.revision, draft.body, verdict);
+      const state = buildReviewCenterState(session, input);
+      expect(state.conclusion.blockers).toEqual([]);
+      expect(state.conclusion.canApprove).toBe(false);
+      expect(state.conclusion.canRequestChanges).toBe(true);
+      expect(state.conclusion.canComment).toBe(true);
+    }
+    const draft = session.conclusionDraft!;
+    await session.saveConclusionDraft(draft.id, draft.revision, draft.body, 'approve');
+    const state = buildReviewCenterState(session, input);
+    expect(state.conclusion.blockers.length).toBeGreaterThan(0);
+    expect(state.conclusion.blockers).not.toContain(m().businessReview.incomplete);
     session.dispose();
   });
 
