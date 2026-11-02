@@ -465,9 +465,7 @@ export class ReviewSession {
       if (verdict !== 'approve') return !!run.findings.length || !!run.requirements.length || run.unitSummaries.length > 0;
       return !businessBlockers(run).length && this.businessCoverageMatchesScope();
     }
-    if (!this.technicalGatePassed()) return false;
-    if (verdict !== 'approve') return true;
-    return this.requirements?.technicalOnly === true || !this.requirements?.materials.some((source) => source.selected);
+    return false;
   }
 
   private businessCoverageMatchesScope(): boolean {

@@ -13,6 +13,7 @@ import {
 export interface BusinessReviewServices {
   modelId: string;
   inputVersion?: string;
+  focusPath?: string;
   token: vscode.CancellationToken;
   now(): number;
   cancel(): void;
@@ -99,12 +100,12 @@ export async function runBusinessReview(
     current();
     return JSON.stringify(payload).length <= BUSINESS_REVIEW_LIMITS.inputCharacters && await wait(services.fits(phase, payload));
   };
-  const query = async <T>(phase: BusinessModelPhase, payload: unknown, parse: (value: unknown) => T): Promise<T> => {
+  const query = async <T>(phase: BusinessModelPhase, payload: unknown, parse: (value: unknown) => T, fresh = false): Promise<T> => {
     current();
     run.phase = phase;
     const key = businessHash(JSON.stringify([run.version, run.modelId, services.inputVersion ?? '', phase, payload]));
     const cached = run.cache.find((entry) => entry.key === key && entry.phase === phase);
-    if (cached) return parse(cached.value);
+    if (cached && !fresh) return parse(cached.value);
     if (!await fits(phase, payload)) throw new ReviewStop('budget', t.inputLimit);
     if (run.calls >= BUSINESS_REVIEW_LIMITS.modelCalls) throw new ReviewStop('budget', t.callLimit);
     run.calls++;
@@ -112,6 +113,7 @@ export async function runBusinessReview(
     const raw = await wait(services.request(phase, payload));
     current();
     const parsed = parse(raw);
+    run.cache = run.cache.filter((entry) => entry.key !== key);
     if (run.cache.length >= BUSINESS_REVIEW_LIMITS.modelCalls) run.cache.shift();
     run.cache.push({ key, phase, value: structuredClone(raw) });
     return parsed;
@@ -214,6 +216,7 @@ export async function runBusinessReview(
   };
 
   try {
+    if (services.focusPath && !roots.some((file) => file.path === services.focusPath)) throw new Error(t.invalidOutput);
     const reads = roots.flatMap((file, index) => {
       const sides: ('head' | 'base')[] = [
         ...(file.status !== 'deleted' ? ['head' as const] : []),
@@ -285,6 +288,8 @@ export async function runBusinessReview(
       }),
     }));
     run.units = await query('plan', { ...common, files: manifest }, (value) => parseBusinessPlan(value, readable, baseline));
+    const focusPath = services.focusPath;
+    if (focusPath) run.units.sort((a, b) => Number(b.files.includes(focusPath)) - Number(a.files.includes(focusPath)));
     await update();
     for (const unit of run.units) {
       const unitRoots = roots.filter((file) => unit.files.includes(file.path));
@@ -295,7 +300,8 @@ export async function runBusinessReview(
         current();
         const payload = { ...common, unit, evidence: evidencePayload(group) };
         try {
-          const result = await query('discover', payload, (value) => parseBusinessDiscovery(value, group, baseline, `${unit.id}-${index}`));
+          const result = await query('discover', payload, (value) => parseBusinessDiscovery(value, group, baseline, `${unit.id}-${index}`),
+            !!services.focusPath && unit.files.includes(services.focusPath));
           addDiscovery(result);
           group.forEach(reviewed);
           run.unitSummaries.push({ id: `${unit.id}-${index}`, text: result.summary, evidenceIds: group.map((source) => source.id) });
@@ -318,7 +324,7 @@ export async function runBusinessReview(
       }
       // This always runs, including when no local candidate was found.
       const result = await query('global', { ...body, evidence: evidencePayload(group) },
-        (value) => parseBusinessDiscovery(value, group, baseline, `global-${pass}`));
+        (value) => parseBusinessDiscovery(value, group, baseline, `global-${pass}`), !!services.focusPath);
       run.globalCompleted = true;
       addDiscovery(result);
       const before = Object.keys(run.dependencies).length;
@@ -348,7 +354,7 @@ export async function runBusinessReview(
       }
       try {
         const verified = await query('verify', { ...body, candidates: group, evidence: evidencePayload(evidence) },
-          (value) => parseBusinessVerification(value, group, evidence, baseline));
+          (value) => parseBusinessVerification(value, group, evidence, baseline), !!services.focusPath);
         run.findings.push(...verified);
       } catch (error) {
         if (error instanceof ReviewStop) throw error;
@@ -373,7 +379,7 @@ export async function runBusinessReview(
     Object.assign(run, await query('assess', {
       ...common, findings: run.findings, coverage: run.coverage, limitations: run.limitations, errors: run.errors,
       evidence: evidencePayload(assessmentEvidence),
-    }, (value) => parseBusinessAssessment(value, baseline, run.findings, assessmentEvidence, priorCritical)));
+    }, (value) => parseBusinessAssessment(value, baseline, run.findings, assessmentEvidence, priorCritical), !!services.focusPath));
     for (const [key, expected] of Object.entries(run.dependencies)) {
       current();
       const colon = key.indexOf(':');

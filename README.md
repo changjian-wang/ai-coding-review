@@ -82,23 +82,13 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 - Can be popped out into a separate window (like "Open in Agents Window")
 - **Token accounting (estimated)**: a HUD row shows estimated LLM tokens (↑input ↓output) with a per-operation breakdown on hover, accumulated over the review and persisted; estimated locally via `countTokens`, not the provider's billed counts
 
-### Per-file review (legacy technical tools)
+### One review workflow and source reading
 
-- PR and other diff-backed scopes open in an uncollapsed, full-file inline Diff by default, with
-  old/new line numbers and added/deleted rows; switch to the clean head file at any time
-- Per-line coverage tracking and "jump to next unseen line"
-- **Analyze from this file** recursively follows related definitions, callers, configuration, and tests under explicit depth/file/token/time budgets
-- Every candidate bug receives an independent second model review against the same repository context; only confirmed bugs are shown, while disproved or unverified candidates are reported only in the completion summary
-- Confirmed bugs may land in related files; out-of-scope bug locations are automatically added to the active review and must be reviewed normally
-- Every actionable finding must be disposed: **fixed / commented / ignored (reason required)**
-- Fix proposals: Copilot generates mutually-exclusive "multi-edit = one complete solution" candidates, one-click apply + one-click undo, with applied snapshots persisted
-- **Reviewer context before a fix**: when the model's read of a finding is off, add a supplementary note in the fix panel; it overrides the finding when generating proposals and is persisted per finding
-- Selection translation / code explanation annotations
-
-### Global analysis (legacy technical tools)
-
-- Cross-file logic analysis, optionally scoped to selected directories
-- A dedicated global-report webview
+- Scope review and **Recheck related business units** in the source toolbar use one business engine, findings set and conclusion gate. They no longer create separate active file/global reports.
+- The source action freshly prioritizes units containing that file while retaining the complete formal scope and rerunning necessary global discovery, candidate verification and requirement assessment. Other exact calls may be reused. Budget exhaustion remains partial, never a full-scope approval inferred from one file.
+- Full inline Diff, old/new line numbers, unread navigation, selection translation and explanation remain available. Related evidence is read-only and does not silently expand the formal scope.
+- Preparation lives in the top stage navigation. Conclusion scope details only display repository, snapshots and files; complete report export has one permanent entry in the lower-left navigation.
+- An explicit history command opens saved legacy technical reports read-only. Their original text cannot confirm, fix, comment on, ignore or approve the current review. Legacy records in a full export are clearly labeled as a historical appendix.
 
 ### Gate and conclusion
 
@@ -112,11 +102,9 @@ This is source/contract reasoning, not executed tests or production calls. Contr
 business approval = complete current coverage/workflow
                     && no confirmed defect / decisive unknown
                     && exact current preview + final human confirmation
-legacy technical gate = all files ready && global analysis confirmed
-legacy file ready = analysis done && every actionable finding disposed
 ```
 
-The legacy gate applies only when no business-review result is being used; it cannot verify requirement satisfaction. Per-line reading progress is an auxiliary signal, not proof of business correctness. Notes, comments or an applied but unverified patch do not clear a business-review defect.
+A new conclusion requires a current business-review result; old file completion and global confirmation are no longer substitute gates. Per-line reading progress is an auxiliary signal, not proof of business correctness. Notes, comments or an applied but unverified patch do not clear a business-review defect.
 
 ## Language (bilingual)
 
@@ -139,9 +127,10 @@ AI Coding Review is fully bilingual (简体中文 / English), **Simplified Chine
 | `codereview.openInNewWindow` | Open the review workbench in a separate window |
 | `codereview.startReview` | Pick a scope and start a review |
 | `codereview.openWorkbench` | Open the review workbench |
-| `codereview.analyzeFile` | Analyze repository behavior rooted at the current file |
-| `codereview.globalAnalysis` | Run global analysis |
-| `codereview.showGlobalReport` | Show the global report |
+| `codereview.analyzeFile` | Prioritize the current file's units while checking the full scope and global relationships |
+| `codereview.globalAnalysis` | Review the current scope using the unified business engine |
+| `codereview.showGlobalReport` | Compatibility alias for the unified conclusion center |
+| `codereview.viewLegacyReport` | Read saved legacy technical reports without modifying review state |
 | `codereview.submitConclusion` | Open the conclusion editor and exact publication preview |
 | `codereview.jumpToNextUnseen` | Jump to the next unseen line |
 | `codereview.pickModel` | Select the analysis model |
@@ -153,8 +142,8 @@ AI Coding Review is fully bilingual (简体中文 / English), **Simplified Chine
 |---------|---------|-------------|
 | `codereview.language` | `zh-CN` | Language for the whole experience (UI + new LLM output): `zh-CN` / `en` / `auto` |
 | `codereview.focusedWorkbench` | `false` | When opening the workbench, hide the side bar / activity bar so it takes over the main editor area; restored on close |
-| `codereview.repositoryAwareAnalysis` | `auto` | `auto` recursively builds related repository context and self-reviews candidate bugs; `off` keeps legacy single-file behavior |
-| `codereview.repositoryContextTokenBudget` | `28000` | Maximum estimated repository-context input tokens; lower-value related excerpts are removed first |
+| `codereview.repositoryAwareAnalysis` | `auto` | Deprecated legacy file-analysis option; does not control unified review |
+| `codereview.repositoryContextTokenBudget` | `28000` | Deprecated; unified review uses the engine limits and measured model capacity above |
 
 ## Architecture
 

@@ -346,6 +346,88 @@ describe('requirement-aware business review execution', () => {
     },
   );
 
+  it('prioritizes and freshly rechecks the selected business unit while preserving full-scope coverage and global verification', async () => {
+    const { set, baseline } = fixture();
+    const first = harness();
+    const baseRequest = first.services.request;
+    first.services.request = async (phase, payload) => phase === 'plan' ? {
+      units: [
+        { id: 'U-cancel', goal: 'Cancellation', files: ['cancel.ts'], requirementIds: [] },
+        { id: 'U-restore', goal: 'Restoration', files: ['restore.ts'], requirementIds: [] },
+      ],
+    } : baseRequest(phase, payload);
+    const previous = await runBusinessReview(set, baseline, first.services);
+    const focused = harness();
+    focused.services.focusPath = 'restore.ts';
+    const original = focused.services.request;
+    const freshRequest = vi.fn(async (phase: BusinessModelPhase, payload: unknown) => phase === 'discover'
+      ? { summary: 'Fresh restoration recheck.', candidates: [], requests: [] }
+      : original(phase, payload));
+    focused.services.request = freshRequest;
+    const result = await runBusinessReview(set, baseline, focused.services, previous);
+    expect(result.units.map((unit) => unit.id)).toEqual(['U-restore', 'U-cancel']);
+    expect(freshRequest.mock.calls.filter(([phase]) => phase === 'discover')).toHaveLength(1);
+    expect(freshRequest.mock.calls.find(([phase]) => phase === 'discover')?.[1]).toMatchObject({ unit: { id: 'U-restore' } });
+    expect(freshRequest).toHaveBeenCalledWith('global', expect.anything());
+    expect(freshRequest).toHaveBeenCalledWith('assess', expect.anything());
+    expect(result.status).toBe('completed');
+    expect(result.coverage.map((entry) => entry.path)).toEqual(['cancel.ts', 'restore.ts']);
+    expect(result.coverage.every(coverageComplete)).toBe(true);
+    expect(result.bindingKey).toBe(previous.bindingKey);
+    expect(new Set(result.cache.map((entry) => entry.key)).size).toBe(result.cache.length);
+    const resumed = harness();
+    const next = await runBusinessReview(set, baseline, resumed.services, result);
+    expect(next.unitSummaries.some((summary) => summary.text === 'Fresh restoration recheck.')).toBe(true);
+    expect(resumed.request.mock.calls.filter(([phase]) => phase === 'discover')).toHaveLength(0);
+  });
+
+  it('reverifies candidates and reassesses requirements after a prioritized recheck rather than reusing the old final judgment', async () => {
+    const { set, baseline } = fixture();
+    const first = harness({ globalDefect: true });
+    const previous = await runBusinessReview(set, baseline, first.services);
+    const next = harness({ globalDefect: true });
+    next.services.focusPath = 'restore.ts';
+    const result = await runBusinessReview(set, baseline, next.services, previous);
+    expect(next.request.mock.calls.filter(([phase]) => phase === 'global')).toHaveLength(1);
+    expect(next.request.mock.calls.filter(([phase]) => phase === 'verify')).toHaveLength(1);
+    expect(next.request.mock.calls.filter(([phase]) => phase === 'assess')).toHaveLength(1);
+    expect(result.findings.some((finding) => finding.status === 'confirmed')).toBe(true);
+    expect(businessBlockers(result).length).toBeGreaterThan(0);
+  });
+
+  it('does not make the rest of the scope complete when prioritized review reaches its actual budget', async () => {
+    const { set, baseline } = fixture();
+    const { services, request } = harness();
+    services.focusPath = 'restore.ts';
+    services.request = async (phase, payload) => phase === 'plan' ? {
+      units: [
+        { id: 'U-cancel', goal: 'Cancellation', files: ['cancel.ts'], requirementIds: [] },
+        { id: 'U-restore', goal: 'Restoration', files: ['restore.ts'], requirementIds: [] },
+      ],
+    } : request(phase, payload);
+    let clock = 100;
+    services.now = () => clock;
+    const runRequest = services.request;
+    services.request = async (phase, payload) => {
+      const result = await runRequest(phase, payload);
+      if (phase === 'discover') clock += BUSINESS_REVIEW_LIMITS.durationMs;
+      return result;
+    };
+    const result = await runBusinessReview(set, baseline, services);
+    expect(result.status).toBe('partial');
+    expect(result.globalCompleted).toBe(false);
+    expect(result.coverage.find((entry) => entry.path === 'cancel.ts')?.reviewed).toEqual([]);
+    expect(businessBlockers(result).length).toBeGreaterThan(0);
+  });
+
+  it('rejects a fabricated prioritized path rather than silently reviewing another file', async () => {
+    const { set, baseline } = fixture();
+    const { services, request } = harness();
+    services.focusPath = '../outside.ts';
+    expect((await runBusinessReview(set, baseline, services)).status).toBe('failed');
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('does not forget a previously known critical issue when switching to technical mode', async () => {
     const { set, baseline } = fixture();
     const { services } = harness();

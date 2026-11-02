@@ -79,7 +79,7 @@ describe('requirement baseline persistence and technical conclusions', () => {
     session.dispose(); reloaded.dispose();
   });
 
-  it('does not approve requirement satisfaction using the old technical analyzer, while allowing bounded feedback', async () => {
+  it('keeps legacy technical completion read-only instead of letting it submit a new business-review conclusion', async () => {
     const { store } = storeFixture();
     const session = new ReviewSession(store, 'repo');
     await session.start(set, cwd);
@@ -90,12 +90,12 @@ describe('requirement baseline persistence and technical conclusions', () => {
     expect(session.technicalGatePassed()).toBe(true);
     expect(session.gatePassed()).toBe(false);
     expect(session.canSubmitConclusion('approve')).toBe(false);
-    expect(session.canSubmitConclusion('comment')).toBe(true);
-    expect(session.canSubmitConclusion('request-changes')).toBe(true);
+    expect(session.canSubmitConclusion('comment')).toBe(false);
+    expect(session.canSubmitConclusion('request-changes')).toBe(false);
     session.dispose();
   });
 
-  it('requires an explicit technical-only choice to omit unprocessed material from a technical approval', async () => {
+  it('does not turn a legacy report into current approval merely by choosing technical-only mode', async () => {
     const { store } = storeFixture();
     const session = new ReviewSession(store, 'repo');
     await session.start(set, cwd);
@@ -106,7 +106,7 @@ describe('requirement baseline persistence and technical conclusions', () => {
     session.setFindings('a.ts', []);
     session.setGlobalReport({ conclusion: 'Technical scope checked', recommendation: 'approve', evidence: [], verdicts: [], fixSpots: [] });
     session.confirmGlobal();
-    expect(session.canSubmitConclusion('approve')).toBe(true);
+    expect(session.canSubmitConclusion('approve')).toBe(false);
     expect(session.requirementStatus).toMatch(/Requirement consistency not assessed/);
     session.setConclusion({ verdict: 'approve', label: 'Technical only', target: 'local', submittedAt: 1 });
     draft.technicalOnly = false;

@@ -38,6 +38,21 @@ describe('review center selection and versioning', () => {
     session.dispose();
   });
 
+  it('keeps only one preparation entry, one export and the contextual source recheck in the main review center', async () => {
+    const { session } = await reviewCenterFixture();
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    const html = reviewCenterView(state, [], 'unique-entry');
+    const body = html.slice(html.indexOf('<body>'), html.indexOf('<template id="source-template">'));
+    expect(body.match(/data-center-action="stage" data-value="prepare"/g)).toHaveLength(1);
+    expect(body.match(/data-center-action="export"/g)).toHaveLength(1);
+    expect(body).not.toContain('center-legacy-analyze');
+    expect(body).not.toContain('center-legacy-global');
+    expect(body).toContain('id="show-current-scope"');
+    expect(body).toContain('id="scope-dialog"');
+    expect(html.match(/id="act-analyze"/g)).toHaveLength(1);
+    session.dispose();
+  });
+
   it('hands preparation to the owning surface before changing the visible stage and preserves the previous conclusion', async () => {
     const { session } = await reviewCenterFixture();
     session.setWorkspaceView({ stage: 'conclusion' });

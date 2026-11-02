@@ -71,6 +71,7 @@ export interface DocModel {
   annotations: DocAnnotation[];
   /** True while this file is currently being analyzed (drives the topbar button). */
   analyzing: boolean;
+  analysisBlocked?: boolean;
   /** Persisted whole-document translation (rendered reading HTML) for the side-by-side view. */
   translationHtml?: string;
   contextKey?: string;
@@ -401,8 +402,10 @@ export class DocumentPanel {
    */
   static setAnalyzing(path: string, on: boolean, ok = true): void {
     const inst = DocumentPanel.current;
-    if (inst?.ready && inst.model?.path === path) {
-      void inst.panel.webview.postMessage({ type: 'analyzing', on, ok });
+    if (inst?.model?.path === path) {
+      inst.model.analyzing = on;
+      inst.model.analysisBlocked = on;
+      if (inst.ready) void inst.panel.webview.postMessage({ type: 'analyzing', on, ok });
     }
   }
 
@@ -1583,7 +1586,9 @@ function flushSeen() {
 }
 
 function render() {
-  for (const id of ['act-analyze','act-jump','m-bi']) $(id).disabled = !!model.readOnly;
+  for (const id of ['act-jump','m-bi']) $(id).disabled = !!model.readOnly;
+  $('act-analyze').disabled = !!model.readOnly || !!model.analysisBlocked;
+  $('act-analyze').title = T.reviewScopeBoundary;
   $('fname').textContent = model.name;
   $('source-description').textContent = model.sourceDescription || '';
   $('source-description').hidden = !model.sourceDescription;
@@ -1808,7 +1813,7 @@ $('m-bi').addEventListener('click', () => {
   renderReading();
 });
 $('act-next-diff').addEventListener('click', jumpToNextDiffChange);
-$('act-analyze').addEventListener('click', () => { setAnalyzing(true); vscode.postMessage({ type:'analyze' }); });
+$('act-analyze').addEventListener('click', () => { if ($('act-analyze').disabled) return; vscode.postMessage({ type:'analyze' }); });
 $('act-jump').addEventListener('click', () => vscode.postMessage({ type:'jumpNext' }));
 $('findbar-toggle').addEventListener('click', () => $('findbar').classList.toggle('collapsed'));
 
@@ -1820,14 +1825,17 @@ function setAnalyzing(on, ok, silent) {
   if (doneTimer) { clearTimeout(doneTimer); doneTimer = 0; }
   if (on) {
     btn.classList.add('analyzing');
+    btn.disabled = true;
     btn.classList.remove('done');
     if (label) label.textContent = T.analyzing;
   } else if (silent) {
+    btn.disabled = !!model?.readOnly || !!model?.analysisBlocked;
     // Silent reset (e.g. switching files): straight back to idle, no 完成 flash.
     btn.classList.remove('analyzing');
     btn.classList.remove('done');
     if (label) label.textContent = T.analyzeFile;
   } else {
+    btn.disabled = !!model?.readOnly || !!model?.analysisBlocked;
     btn.classList.remove('analyzing');
     if (ok !== false) {
       btn.classList.add('done');
@@ -1933,7 +1941,7 @@ window.addEventListener('message', (ev) => {
   else if (msg.type === 'aiBusy') { if (!msg.on) hideAiBusy(); }
   else if (msg.type === 'docNotice') { flashDocNotice(msg.message, msg.kind, msg.ms); }
   else if (msg.type === 'focusContent') { contentEl.setAttribute('tabindex', '-1'); contentEl.focus(); }
-  else if (msg.type === 'analyzing') { setAnalyzing(msg.on, msg.ok); }
+  else if (msg.type === 'analyzing') { if(model){model.analyzing=msg.on;model.analysisBlocked=msg.on;}setAnalyzing(msg.on, msg.ok); }
   else if (msg.type === 'analysisStage') {
     const btn = $('act-analyze');
     const label = btn && btn.querySelector('.btn-label');
@@ -2070,7 +2078,6 @@ root.addEventListener('keydown', (e) => {
     const btn = $('act-analyze');
     if (btn && !btn.disabled && !btn.classList.contains('analyzing')) {
       e.preventDefault();
-      setAnalyzing(true);
       vscode.postMessage({ type:'analyze' });
     }
   } else if (k === 'ArrowLeft' || k === 'Escape') {

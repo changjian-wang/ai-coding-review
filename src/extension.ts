@@ -9,13 +9,6 @@ import { WorkspaceStateReviewStore, type Annotation } from './review/reviewStore
 import { pickModel, listModels, type PickedModel } from './ai/modelPicker';
 import { ModelProvider } from './ai/modelProvider';
 import {
-  analyzeFile,
-  analyzeGlobal,
-  analyzeRootedRepository,
-  DEFAULT_REPOSITORY_CONTEXT_TOKEN_BUDGET,
-  fitRepositoryContextToTokenBudget,
-  finalizeFileAnalysis,
-  finalizeRootedRepositoryAnalysis,
   generateFixProposals,
   translateSelection,
   translateMarkdown,
@@ -24,17 +17,13 @@ import {
   draftReviewComment,
   AnalysisError,
   setTokenUsageSink,
-  verifyRootedRepositoryFindings,
   analyzeRequirementUnderstanding,
   analyzeBusinessReviewPhase,
   businessReviewInputFits,
-  type GlobalContextFile,
 } from './ai/analyzer';
 import {
   findingContentSignatures,
-  globalFixSpotSignatures,
   isActionableFinding,
-  type FileAnalysisSummary,
   type Finding,
   type GlobalReport,
 } from './ai/types';
@@ -78,10 +67,6 @@ import {
 } from './ui/ignoreReasonInput';
 import { DEFAULT_LANGUAGE, fmt, m, onLanguageChange, resolveLanguage, type Language } from './i18n';
 import { buildFullFileDiff } from './review/fullFileDiff';
-import {
-  collectRelatedRepositoryContext,
-  validateRepositoryAnalysisContext,
-} from './review/repositoryEvidence';
 
 let session: ReviewSession;
 let reviewStore: WorkspaceStateReviewStore;
@@ -169,6 +154,7 @@ export interface ReviewExtensionApi {
     openingPanel(): vscode.WebviewPanel | undefined;
     restorePanel(panel: vscode.WebviewPanel, state: unknown): Promise<void>;
     setLanguage(language: Language | 'auto'): Promise<void>;
+    useReviewModel(model?: vscode.LanguageModelChat): void;
     action(message: Omit<CenterAction, 'type' | 'contextKey'>): Promise<void>;
     recordLocal(): Promise<void>;
     document(): { path?: string; revision?: string; contextKey?: string; readOnly: boolean; embedded: boolean; loaded: boolean };
@@ -349,9 +335,6 @@ function getAppliedFix(
   return appliedFixes.get(fixKey(rel, findingId));
 }
 
-function deleteAppliedFixFor(rel: string, findingId: string): void {
-  deleteAppliedFixKeys(fixKey(rel, findingId));
-}
 
 function deleteAppliedFixKeys(key: string): void {
   appliedFixes.delete(key);
@@ -737,7 +720,7 @@ async function ensureGlobalReportLocalized(report: GlobalReport): Promise<void> 
       }
     }
     const changed = await ensureLocalizedTexts(target, items);
-    if (changed && session.globalReport) {
+    if (changed && session.globalReport && GlobalReportPanel.isOpen) {
       FixProposalPanel.refreshIfOpen({ kind: 'global' });
       showGlobalReport();
     }
@@ -794,35 +777,6 @@ function setAppliedFix(key: string, edit: { oldText: string; newText: string }):
   flushAppliedFixes();
 }
 
-/** Carries legacy positional global-fix snapshots onto stable content ids. */
-function migrateAppliedGlobalFixes(
-  previous: GlobalReport | undefined,
-  next: GlobalReport,
-): void {
-  if (!previous) {
-    return;
-  }
-  const stableIds = globalFixSpotSignatures(previous.fixSpots);
-  let changed = false;
-  for (let index = 0; index < previous.fixSpots.length; index++) {
-    const oldSpot = previous.fixSpots[index];
-    const newSpot = next.fixSpots.find((spot) => spot.id === stableIds[index]);
-    if (!newSpot) {
-      continue;
-    }
-    const oldKey = fixKey(oldSpot.file, oldSpot.id);
-    const newKey = fixKey(newSpot.file, newSpot.id);
-    const edit = getAppliedFix(oldSpot.file, oldSpot.id);
-    if (edit && oldKey !== newKey) {
-      appliedFixes.set(newKey, edit);
-      appliedFixes.delete(oldKey);
-      changed = true;
-    }
-  }
-  if (changed) {
-    flushAppliedFixes();
-  }
-}
 
 /** Forces every visible review surface to re-render in the current language. */
 function refreshUiForLanguageSwitch(): void {
@@ -839,7 +793,7 @@ function refreshUiForLanguageSwitch(): void {
   }
   FixProposalPanel.refreshIfOpen();
   BusinessReviewPanel.refreshIfOpen(session.businessReview);
-  if (session.globalReport) {
+  if (session.globalReport && GlobalReportPanel.isOpen) {
     showGlobalReport();
   } else {
     GlobalReportPanel.refreshIfOpen();
@@ -919,7 +873,8 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
     vscode.commands.registerCommand('codereview.businessReview', startBusinessReview),
     vscode.commands.registerCommand('codereview.showBusinessReview', showBusinessReview),
     vscode.commands.registerCommand('codereview.cancelBusinessReview', cancelBusinessReview),
-    vscode.commands.registerCommand('codereview.showGlobalReport', showGlobalReport),
+    vscode.commands.registerCommand('codereview.showGlobalReport', submitConclusion),
+    vscode.commands.registerCommand('codereview.viewLegacyReport', showGlobalReport),
     vscode.commands.registerCommand('codereview.submitConclusion', submitConclusion),
     vscode.commands.registerCommand('codereview.viewPendingComments', viewPendingComments),
     vscode.commands.registerCommand('codereview.locateFinding', locateInFile),
@@ -1014,6 +969,7 @@ export function activate(context: vscode.ExtensionContext): ReviewExtensionApi |
       openingPanel: () => openingWorkbenchPanel,
       restorePanel: restoreWorkbenchInto,
       setLanguage: applyLanguage,
+      useReviewModel: (model) => models.set(model ? { id: model.id, label: model.name, model } : undefined),
       action: (message) => handleCenterAction({ ...message, type: 'center', contextKey: reviewCenterContextKey(session) }),
       recordLocal: async () => {
         if (!session.reviewSet || /^pr-/.test(session.reviewSet.scopeId)) throw new Error('Host fixture permits local conclusions only.');
@@ -1410,11 +1366,19 @@ function requirementPreparationOptions(): ScopePreparationOptions {
   };
 }
 
-async function startBusinessReview(): Promise<void> {
+async function startBusinessReview(focusPath?: string): Promise<void> {
   const set = session.reviewSet;
   const snapshot = session.snapshot;
   const cwd = session.getCwd();
   if (!set || !snapshot || !cwd) { transientWarning(m().review.notStartedWarn); return; }
+  if (focusPath !== undefined && (typeof focusPath !== 'string' || !set.files.some((file) => !file.context && file.path === focusPath))) {
+    transientWarning(m().reviewCenter.recheckUnavailable);
+    return;
+  }
+  if (session.publicationInFlight) {
+    transientWarning(m().reviewCenter.checking);
+    return;
+  }
   if (businessContext || analyzingPaths.size || globalAnalysisInFlight) {
     transientWarning(m().businessReview.running);
     return;
@@ -1431,6 +1395,8 @@ async function startBusinessReview(): Promise<void> {
     const sameScope = () => businessContext === captured && session.reviewSet === set && session.snapshot === snapshot;
     const sameInputs = () => sameScope() && businessBindingKey(cwd, set, session.requirements) === baseline.bindingKey;
     WorkbenchPanel.refreshIfOpen();
+    if (DocumentPanel.currentPath) DocumentPanel.setAnalyzing(DocumentPanel.currentPath, true);
+    if (focusPath) WorkbenchPanel.flashNotice(fmt(m().reviewCenter.recheckPath, focusPath));
     try { await source.assertCurrent(draft); }
     catch (error) {
       if (sameInputs()) {
@@ -1468,7 +1434,7 @@ async function startBusinessReview(): Promise<void> {
       })),
     ];
     await runBusinessReview(set, baseline, {
-      modelId: model.id, inputVersion, token: cts.token, now: Date.now, cancel: () => cts.cancel(),
+      modelId: model.id, inputVersion, focusPath, token: cts.token, now: Date.now, cancel: () => cts.cancel(),
       isCurrent: () => sameInputs() && !captured.stale,
       read: source.read, readFresh: source.readFresh,
       resolve: (request) => source.resolve(request, cts.token),
@@ -1507,6 +1473,7 @@ async function startBusinessReview(): Promise<void> {
     if (context && businessContext === context) {
       businessContext = undefined;
       context.cts.dispose();
+      if (DocumentPanel.currentPath) DocumentPanel.setAnalyzing(DocumentPanel.currentPath, false, false);
       WorkbenchPanel.refreshIfOpen();
       BusinessReviewPanel.refreshIfOpen(session.businessReview);
     }
@@ -1527,6 +1494,7 @@ function cancelBusinessReview(): void {
     void session.setBusinessReview(cancelled).catch((error) => reportError(error));
   }
   WorkbenchPanel.refreshIfOpen();
+  if (DocumentPanel.currentPath) DocumentPanel.setAnalyzing(DocumentPanel.currentPath, false, false);
   WorkbenchPanel.flashNotice(m().businessReview.cancelled, 'warn');
 }
 
@@ -1553,60 +1521,12 @@ async function verifyBusinessInputsCurrent(): Promise<boolean> {
   }
 }
 
-function showBusinessReview(): void {
+async function showBusinessReview(): Promise<void> {
   const run = session.businessReview;
   if (!run) { transientWarning(m().businessReview.noResult); return; }
-  BusinessReviewPanel.show(run, {
-    recheck: () => void startBusinessReview(),
-    cancel: cancelBusinessReview,
-    prepare: () => void startReview(),
-    confirm: () => void (async () => {
-      const id = session.businessReview?.id;
-      if (!id || !await verifyBusinessInputsCurrent() || session.businessReview?.id !== id) return;
-      session.confirmBusinessReview();
-    })().catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
-    note: (id) => void (async () => {
-      const runId = session.businessReview?.id;
-      if (!runId) throw new Error(m().businessReview.staleReport);
-      const reason = await vscode.window.showInputBox({
-        title: m().businessReview.comment, prompt: m().businessReview.notePrompt, ignoreFocusOut: true,
-        validateInput: (value) => value.trim() ? undefined : m().businessReview.notePrompt,
-      });
-      if (!reason) return;
-      if (session.businessReview?.id !== runId || !await verifyBusinessInputsCurrent() || session.businessReview?.id !== runId) return;
-      session.recordBusinessNote(id, reason);
-    })().catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
-    source: (ref) => void showBusinessSource(ref).catch((error) => void vscode.window.showWarningMessage(m().review.error(String(error)))),
-  });
-}
-
-async function showBusinessSource(ref: BusinessCitation): Promise<void> {
-  const runId = session.businessReview?.id;
-  let text: string | undefined;
-  let error: unknown;
-  try {
-    if (ref.kind === 'material') {
-      const source = session.requirements?.materials.find((source) => source.id === ref.sourceId);
-      text = source?.versions.find((version) => version.version === ref.version)?.text;
-    } else {
-      const set = session.reviewSet;
-      const cwd = session.getCwd();
-      if (set && cwd && ref.side !== 'material') text = await new BusinessReviewSource(cwd, set).readFresh(ref.path, ref.side);
-    }
-  } catch (failure) { error = failure; }
-  if (session.businessReview?.id !== runId) { transientWarning(m().businessReview.staleReport); return; }
-  const full = text !== undefined && businessHash(text) === ref.sourceHash;
-  if (!full) {
-    void vscode.window.showWarningMessage(`${m().businessReview.quoteOnly}${error ? ` ${String(error)}` : ''}`);
-    text = `${m().businessReview.quoteOnly}\n\n${ref.path} [${ref.side}] · ${ref.sourceHash}\n\n${ref.quote}`;
-  }
-  const document = await vscode.workspace.openTextDocument({ content: text!, language: full ? languageIdFor(ref.path) : 'plaintext' });
-  if (session.businessReview?.id !== runId) { transientWarning(m().businessReview.staleReport); return; }
-  const start = full ? Math.min(ref.line - 1, document.lineCount - 1) : 0;
-  await vscode.window.showTextDocument(document, {
-    preview: false, viewColumn: DocumentPanel.viewColumn ?? vscode.ViewColumn.Active,
-    selection: new vscode.Range(start, 0, start, 0),
-  });
+  await openWorkbench();
+  await reviewCenterController().handle({ type: 'center', action: 'select', kind: 'overview', contextKey: reviewCenterContextKey(session) });
+  WorkbenchPanel.reveal();
 }
 
 /**
@@ -1836,7 +1756,7 @@ function workbenchActions(): import('./ui/workbenchPanel').WorkbenchActions {
     locate: (path, line) => void locateInFile(path, line),
     globalAnalysis: () => void runGlobalAnalysis(),
     cancelGlobalAnalysis: () => cancelGlobalAnalysis(),
-    showGlobal: showGlobalReport,
+    showGlobal: () => void submitConclusion(),
     businessReview: () => void startBusinessReview(),
     cancelBusinessReview,
     showBusinessReview,
@@ -1926,9 +1846,9 @@ function reviewCenterController(): ReviewCenterController {
     legacyAnalyze: async () => {
       const path = session.workspaceView.source;
       if (path?.kind !== 'file' || DocumentPanel.isReadOnly) throw new ConclusionDraftDataError(m().reviewCenter.readOnlyEvidence);
-      await analyzeByPath(path.path);
+      await startBusinessReview(path.path);
     },
-    legacyGlobal: async () => { if (globalAnalysisInFlight) cancelGlobalAnalysis(); else await runGlobalAnalysis(); },
+    legacyGlobal: async () => { if (businessContext) cancelBusinessReview(); else await startBusinessReview(); },
   });
   return centerController;
 }
@@ -2671,7 +2591,7 @@ function buildDocModel(
   const set = session.reviewSet;
   const cwd = session.getCwd();
   if (!set || !cwd) throw new Error(m().review.notStartedWarn);
-  const findings = localizeFindingsNow(relPath, session.findings(relPath), lang);
+  const findings = DocumentPanel.isEmbedded ? [] : localizeFindingsNow(relPath, session.findings(relPath), lang);
   const annotations = localizeAnnotationsNow(relPath, session.annotations(relPath), lang);
   const model: DocModel = {
     path: relPath,
@@ -2726,7 +2646,8 @@ function buildDocModel(
       sourceText: a.sourceText,
       content: a.content,
     })),
-    analyzing: analyzingPaths.has(relPath),
+    analyzing: !!businessContext,
+    analysisBlocked: !!businessContext || session.publicationInFlight || scopePickInFlight || !!session.reviewFile(relPath)?.context,
     translationHtml: workspaceMemento?.get<Record<string, string>>(DOC_TR_KEY)?.[relPath],
     readOnly: isDeletedReviewFile(relPath),
   };
@@ -2991,7 +2912,7 @@ function docActions() {
       void viewFixProposal(path, id, cachedOnly),
     locate: (path: string, line: number, endLine?: number, findingId?: string) =>
       void locateInFile(path, line, endLine, findingId),
-    analyze: (path: string) => void analyzeByPath(path),
+    analyze: (path: string) => void startBusinessReview(path),
     jumpNext: (path: string) => jumpToNextUnseen(path),
     focusTree: () => WorkbenchPanel.focusTree(),
     businessFinding: (id: string) => void handleCenterAction({
@@ -3412,242 +3333,15 @@ async function readReviewFileText(relPath: string, strict = false): Promise<stri
 }
 
 async function analyzeCurrentFile(): Promise<void> {
+  if (scopePickInFlight || workbenchOpenInFlight) { transientWarning(m().reviewCenter.preparePending); return; }
   const rel = DocumentPanel.currentPath ?? workbenchSelected;
   if (!rel) {
     transientWarning(m().analysis.pickFileToAnalyze);
     return;
   }
-  await analyzeByPath(rel);
+  await startBusinessReview(rel);
 }
 
-/** Analyzes a specific review file by its relative path. */
-async function analyzeByPath(rel: string): Promise<void> {
-  if (businessContext) { transientWarning(m().businessReview.running); return; }
-  if (!ensureReviewPath(rel, m().actions.analyze)) {
-    return;
-  }
-  if (isDeletedReviewFile(rel)) {
-    transientInfo(m().analysis.deletedFileHandled(rel));
-    return;
-  }
-  if (analyzingPaths.has(rel)) {
-    transientInfo(m().analysis.inProgress(rel));
-    return;
-  }
-  const cwd = activeCwd();
-  if (!cwd) {
-    return;
-  }
-  const reviewSet = session.reviewSet;
-  if (!reviewSet) {
-    return;
-  }
-  const model = await models.resolve();
-  if (session.reviewSet !== reviewSet || activeCwd() !== cwd) {
-    return;
-  }
-  if (!model) {
-    if (!DocumentPanel.flashNotice(rel, m().model.noModel, 'error')) {
-      void vscode.window.showErrorMessage(m().model.noModel);
-    }
-    return;
-  }
-
-  let document: vscode.TextDocument;
-  const source = currentCommitSource();
-  const evidenceServices = source?.evidenceServices();
-  try {
-    document = source
-      ? await vscode.workspace.openTextDocument({ content: await source.read(rel), language: languageIdFor(rel) })
-      : await vscode.workspace.openTextDocument(vscode.Uri.joinPath(vscode.Uri.file(cwd), rel));
-  } catch (error) {
-    const message = `${m().analysis.cannotOpen(rel)}: ${String(error)}`;
-    if (!DocumentPanel.flashNotice(rel, message, 'error')) {
-      void vscode.window.showWarningMessage(message);
-    }
-    return;
-  }
-  if (session.reviewSet !== reviewSet || activeCwd() !== cwd) {
-    return;
-  }
-
-  // Capture the review identity so a result computed against an older review set
-  // (the user may switch scope mid-analysis) is discarded instead of overwriting
-  // the current session's findings.
-  const documentVersion = document.version;
-  analyzingPaths.add(rel);
-  const cts = new vscode.CancellationTokenSource();
-  fileAnalysisCts.set(rel, cts);
-  WorkbenchPanel.refreshIfOpen(rel);
-  // Progress + result feedback lives in the document view (current window), not a
-  // parent-window notification that is invisible when the workbench is full-screen.
-  // The 「基于此文件分析」 button shows an indeterminate progress bar via setAnalyzing.
-  DocumentPanel.setAnalyzing(rel, true);
-  let ok = false;
-  try {
-    const repositoryAware =
-      vscode.workspace
-        .getConfiguration('codereview')
-        .get<'auto' | 'off'>('repositoryAwareAnalysis', 'auto') !== 'off';
-    const stillCurrent = () =>
-      !cts.token.isCancellationRequested
-      && session.reviewSet === reviewSet
-      && activeCwd() === cwd
-      && document.version === documentVersion
-      && fileAnalysisCts.get(rel) === cts;
-    let summary: FileAnalysisSummary;
-    let affectedFiles: string[];
-    if (repositoryAware) {
-      DocumentPanel.setAnalysisStage(rel, m().analysis.buildingRelatedContext);
-      let context = await collectRelatedRepositoryContext({
-        cwd,
-        sourcePath: rel,
-        sourceDocument: source ? {
-          uri: vscode.Uri.joinPath(vscode.Uri.file(cwd), rel),
-          getText: () => document.getText(),
-        } : document,
-        preferredPaths: reviewSet?.files.map((file) => file.path),
-        token: cts.token,
-      }, evidenceServices);
-      if (!stillCurrent()) {
-        return;
-      }
-      inFlightAnalysisDependencies.set(rel, new Set(context.files));
-      context = await fitRepositoryContextToTokenBudget(
-        model,
-        context,
-        cts.token,
-        vscode.workspace
-          .getConfiguration('codereview')
-          .get<number>(
-            'repositoryContextTokenBudget',
-            DEFAULT_REPOSITORY_CONTEXT_TOKEN_BUDGET,
-          ),
-      );
-      if (!stillCurrent()) {
-        return;
-      }
-      inFlightAnalysisDependencies.set(rel, new Set(context.files));
-      DocumentPanel.setAnalysisStage(rel, m().analysis.findingRelatedBugs);
-      const candidates = await analyzeRootedRepository(model, context, cts.token);
-      if (!stillCurrent()) {
-        return;
-      }
-      if (!await validateRepositoryAnalysisContext(context, cwd, cts.token, evidenceServices)) {
-        throw new AnalysisError(m().analysis.relatedCodeChanged);
-      }
-      if (!stillCurrent()) {
-        return;
-      }
-      DocumentPanel.setAnalysisStage(rel, m().analysis.selfReviewingCandidates);
-      const verifications = await verifyRootedRepositoryFindings(
-        model,
-        context,
-        candidates,
-        cts.token,
-        vscode.workspace
-          .getConfiguration('codereview')
-          .get<number>(
-            'repositoryContextTokenBudget',
-            DEFAULT_REPOSITORY_CONTEXT_TOKEN_BUDGET,
-          ),
-      );
-      if (!stillCurrent()) {
-        return;
-      }
-      const result = finalizeRootedRepositoryAnalysis(
-        context,
-        candidates,
-        verifications,
-      );
-      const invalidatesGlobal = !!session.globalReport;
-      const update = session.setRootedFindings(
-        rel,
-        result.findingsByFile,
-        result.summary,
-        context.files,
-      );
-      affectedFiles = [
-        ...new Set([rel, ...update.updatedFiles, ...update.removedFiles]),
-      ];
-      if (invalidatesGlobal) {
-        fixProposalOpenGeneration += 1;
-        FixProposalPanel.closeIfGlobal();
-      }
-      summary = result.summary;
-    } else {
-      DocumentPanel.setAnalysisStage(rel, m().analysis.analyzingCurrentFile);
-      const candidates = await analyzeFile(model, document, cts.token);
-      if (!stillCurrent()) {
-        return;
-      }
-      const result = finalizeFileAnalysis(candidates, [], false);
-      const invalidatesGlobal = !!session.globalReport;
-      const update = session.setRootedFindings(
-        rel,
-        { [rel]: result.findings },
-        result.summary,
-        [rel],
-      );
-      affectedFiles = [
-        ...new Set([rel, ...update.updatedFiles, ...update.removedFiles]),
-      ];
-      if (invalidatesGlobal) {
-        fixProposalOpenGeneration += 1;
-        FixProposalPanel.closeIfGlobal();
-      }
-      summary = result.summary;
-    }
-    GlobalReportPanel.closeIfOpen();
-    // Re-analysis replaces this file's findings (new ids), so any fix proposal
-    // open for THIS file is now tied to a finding that no longer exists — close
-    // it instead of leaving a stale proposal beside the fresh results.
-    fixProposalOpenGeneration += 1;
-    for (const file of affectedFiles) {
-      FixProposalPanel.closeIfFile(file);
-    }
-    await Promise.all(affectedFiles.map((file) => refreshDocPanel(file)));
-    ok = true;
-    DocumentPanel.flashNotice(
-      rel,
-      repositoryAware
-        ? m().analysis.rootedAnalysisSummary(
-            rel,
-            summary.contextFiles ?? 1,
-            summary.confirmed,
-            summary.dismissed,
-            summary.unresolved,
-            summary.contextTruncated
-              ? m().analysis.contextBudgetReached(
-                  (summary.contextLimitReasons ?? [])
-                    .map((reason) => m().analysis.contextLimitReason[reason])
-                    .join(', '),
-                )
-              : '',
-          )
-        : (summary.confirmed
-            ? m().analysis.foundIssues(rel, summary.confirmed)
-            : m().analysis.noIssues(rel)),
-      'info',
-      7000,
-    );
-  } catch (err) {
-    const message =
-      err instanceof AnalysisError ? err.message : String((err as Error)?.message ?? err);
-    if (!DocumentPanel.flashNotice(rel, m().review.error(message), 'error')) {
-      reportError(err);
-    }
-  } finally {
-    if (fileAnalysisCts.get(rel) === cts) {
-      fileAnalysisCts.delete(rel);
-      inFlightAnalysisDependencies.delete(rel);
-      analyzingPaths.delete(rel);
-      WorkbenchPanel.refreshIfOpen(rel);
-      DocumentPanel.setAnalyzing(rel, false, ok);
-    }
-    cts.dispose();
-  }
-}
 
 /**
  * Opens (or reveals) the fix-proposal panel for a finding. Cached proposals are
@@ -3992,111 +3686,13 @@ function recordLocalCommentNote(
 }
 
 async function runGlobalAnalysis(): Promise<void> {
-  if (businessContext) { transientWarning(m().businessReview.running); return; }
-  const reviewSet = session.reviewSet;
-  if (!reviewSet) {
-    WorkbenchPanel.setGlobalProgress(false);
-    transientWarning(m().review.notStartedWarn);
-    return;
-  }
-  if (globalAnalysisInFlight) {
-    // Already running — re-assert busy so the button stays disabled, then bail.
-    WorkbenchPanel.setGlobalProgress(true, m().global.inProgress);
-    transientInfo(m().global.inProgressWait);
-    return;
-  }
-  const unready = reviewSet.files.filter((f) => !session.fileFullySeen(f.path));
-  if (unready.length) {
-    // Do NOT run global analysis until everything is read. Surface this inside
-    // the workbench (current window) — a parent-window prompt is invisible when
-    // the workbench is in its own auxiliary window — and jump to the first
-    // unread file so the reviewer can see exactly what is left.
-    WorkbenchPanel.setGlobalProgress(false);
-    const shown = WorkbenchPanel.flashNotice(m().global.blockedUnready(unready.length), 'warn');
-    if (!shown) {
-      transientWarning(m().global.blockedUnready(unready.length));
-    }
-    void openFileInPanel(unready[0].path);
-    return;
-  }
-  const model = await models.resolve();
-  if (!model) {
-    WorkbenchPanel.setGlobalProgress(false);
-    if (!WorkbenchPanel.flashNotice(m().model.noModel, 'error')) {
-      void vscode.window.showErrorMessage(m().model.noModel);
-    }
-    return;
-  }
-
-  // Drive progress inline inside the workbench (where the reviewer is looking)
-  // instead of a parent-window notification, which is easy to miss when the
-  // workbench is in its own auxiliary window.
-  globalAnalysisInFlight = true;
-  WorkbenchPanel.refreshIfOpen();
-  const cts = new vscode.CancellationTokenSource();
-  globalAnalysisCts = cts;
-  const token = cts.token;
-  const total = reviewSet.files.length;
-  WorkbenchPanel.setGlobalProgress(true, m().global.preparing(total));
-  try {
-    const context: GlobalContextFile[] = [];
-    let read = 0;
-    for (const f of reviewSet.files) {
-      if (token.isCancellationRequested || session.reviewSet !== reviewSet) {
-        return;
-      }
-      read++;
-      WorkbenchPanel.setGlobalProgress(true, m().global.reading(read, total, f.path));
-      context.push({
-        path: f.path,
-        findings: session.findings(f.path),
-        content: await readReviewFileText(f.path),
-      });
-    }
-    WorkbenchPanel.setGlobalProgress(
-      true,
-      m().global.analyzing(total),
-    );
-    if (token.isCancellationRequested || session.reviewSet !== reviewSet) {
-      return;
-    }
-    const globalReport = await analyzeGlobal(model, context, token);
-    if (session.reviewSet !== reviewSet || token.isCancellationRequested) {
-      return;
-    }
-    migrateAppliedGlobalFixes(session.globalReport, globalReport);
-    session.setGlobalReport(globalReport);
-    const reconciledFiles = session.reconcileGlobalVerdicts(globalReport);
-    if (reconciledFiles.length > 0) {
-      fixProposalOpenGeneration += 1;
-    }
-    for (const file of reconciledFiles) {
-      FixProposalPanel.closeIfFile(file);
-    }
-    await Promise.all(reconciledFiles.map((file) => refreshDocPanel(file)));
-    showGlobalReport();
-  } catch (err) {
-    if (!token.isCancellationRequested) {
-      reportError(err);
-    }
-  } finally {
-    cts.dispose();
-    if (globalAnalysisCts === cts) {
-      globalAnalysisInFlight = false;
-      globalAnalysisCts = undefined;
-      WorkbenchPanel.setGlobalProgress(false);
-      WorkbenchPanel.refreshIfOpen();
-    }
-  }
+  if (scopePickInFlight || workbenchOpenInFlight) { transientWarning(m().reviewCenter.preparePending); return; }
+  await startBusinessReview();
 }
 
 /** Cancels the in-flight global analysis, if any. */
 function cancelGlobalAnalysis(): void {
-  if (globalAnalysisCts) {
-    globalAnalysisCts.cancel();
-    WorkbenchPanel.setGlobalProgress(false);
-    transientInfo(m().global.cancelled);
-  }
+  cancelBusinessReview();
 }
 
 /**
@@ -4131,29 +3727,9 @@ function showGlobalReport(): void {
     ? reviewSet.files.reduce((sum, f) => sum + session.findings(f.path).length, 0)
     : 0;
   GlobalReportPanel.show(localizedReport, session.globalConfirmed, {
-    onLocate: (file, line, spotId, findingRef) => {
-      const spot = spotId
-        ? session.globalReport?.fixSpots.find((item) => item.id === spotId)
-        : undefined;
-      const finding = findingRef
-        ? session.findingByContentRef(file, findingRef)
-        : undefined;
-      void locateInFile(
-        file,
-        line,
-        spot?.endLine ?? finding?.endLine,
-        spotId ?? finding?.id,
-        spot?.anchor ?? finding?.anchor,
-      );
-    },
-    onConfirm: () => {
-      session.confirmGlobal();
-      showGlobalReport();
-    },
-    onGlobalFix: (spotId, file, line) => void openGlobalFix(spotId, file, line),
-    onGlobalIgnore: (spotId, file, line) => void disposeGlobalFix(spotId, file, line, 'ignored'),
-    onGlobalComment: (spotId, file, line) => void disposeGlobalFix(spotId, file, line, 'commented'),
-    onGlobalRevert: (spotId, file, line) => void revertGlobalFix(spotId, file, line),
+    readOnly: true,
+    onLocate: () => {},
+    onConfirm: () => {},
     onGotoFiles: () => void switchToFileReview(),
     fixDisposition: (spotId, file, line) =>
       session.globalFixDisposition(spotId, file, line, globalFixAnchor(spotId))?.kind,
@@ -4175,262 +3751,8 @@ function globalFixAnchor(spotId: string): string | undefined {
   return session.globalReport?.fixSpots.find((s) => s.id === spotId)?.anchor;
 }
 
-/**
- * Opens the fix-proposal panel for a global fix spot and, when a proposal is
- * applied, records the disposition via design Y+X (reuse the mapped file-level
- * finding's disposition, else an independent global store). Lets cross-file
- * findings be fixed with the same one-click flow as file-level findings.
- */
-async function openGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
-  if (!ensureWorkingTreeReview()) return;
-  const openGeneration = ++fixProposalOpenGeneration;
-  if (!ensureReviewPath(file, m().actions.analyze)) {
-    return;
-  }
-  const baseReport = session.globalReport;
-  const spot = baseReport?.fixSpots.find((s) => s.id === spotId);
-  if (!spot) {
-    return;
-  }
-  const localizedSpot = baseReport
-    ? localizeGlobalReportNow(baseReport, resolveLanguage()).fixSpots.find((s) => s.id === spotId) ?? spot
-    : spot;
-  const cwd = activeCwd();
-  if (!cwd) {
-    return;
-  }
-  // Opening the fix panel must NOT move the document — only the report's explicit
-  // 「定位」 scrolls. Resolve the spot's current line via the shared authority
-  // (no side effects) so the panel header is right while the document stays put.
-  const { startLine: liveLine } = await resolveLiveRange(
-    file,
-    spot.line,
-    spot.endLine,
-    spotId,
-    spot.anchor,
-  );
-  if (openGeneration !== fixProposalOpenGeneration) {
-    return;
-  }
-  const fileUri = vscode.Uri.joinPath(vscode.Uri.file(cwd), file);
-  const appliedFixKey = fixKey(file, spotId);
-  const findingLike: Finding = {
-    id: spotId,
-    line: spot.line,
-    endLine: spot.endLine,
-    anchor: spot.anchor,
-    severity: spot.severity,
-    title: spot.title,
-    detail: spot.detail,
-    suggestion: spot.suggestion,
-  };
-  FixProposalPanel.show({
-    rel: file,
-    localizationScope: { kind: 'global' },
-    cacheKey: `global::${session.getRepoName()}::${file}::${hashString(spotId + spot.title + spot.detail)}`,
-    fileUri,
-    finding: {
-      id: spotId,
-      line: liveLine,
-      title: localizedSpot.title,
-      detail: localizedSpot.detail,
-      suggestion: localizedSpot.suggestion,
-    },
-    getDisplayFinding: () => {
-      const report = session.globalReport ?? baseReport;
-      const current = report
-        ? localizeGlobalReportNow(report, resolveLanguage()).fixSpots.find((item) => item.id === spotId)
-        : undefined;
-      const display = current ?? spot;
-      return {
-        title: display.title,
-        detail: display.detail,
-        suggestion: display.suggestion,
-      };
-    },
-    generate: async (token, userContext) => {
-      const model = await models.resolve();
-      if (!model) {
-        throw new Error(m().fix.noModelClipboard);
-      }
-      const content = await readReviewFileText(file);
-      return generateFixProposals(model, file, content, findingLike, token, userContext);
-    },
-    onApplied: (edit) => {
-      setAppliedFix(appliedFixKey, edit);
-      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, { kind: 'fixed', at: Date.now() });
-      WorkbenchPanel.refreshIfOpen();
-      GlobalReportPanel.refreshIfOpen();
-      void (async () => {
-        await reloadDocPanel(file);
-        await locateInFile(file, spot.line, spot.endLine, spotId, spot.anchor);
-      })();
-      transientInfo(m().fix.applied);
-    },
-    onSplices: (splices) => session.remapSeenAfterSplices(file, splices),
-    onWillChangeFile: () => beginInternalReviewEdit(fileUri),
-    onFileChangeFinished: () => endInternalReviewEdit(fileUri),
-    onFileChanged: () => {
-      reflectReviewInvalidation(
-        session.invalidateAfterFileChange(file),
-        file,
-        false,
-      );
-    },
-    onUndone: () => {
-      deleteAppliedFixKeys(appliedFixKey);
-      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, null);
-      WorkbenchPanel.refreshIfOpen();
-      GlobalReportPanel.refreshIfOpen();
-      void (async () => {
-        await reloadDocPanel(file);
-        await locateInFile(file, spot.line, spot.endLine, spotId, spot.anchor);
-      })();
-    },
-    canApply: () => !!session.globalReport?.fixSpots.some((item) => item.id === spotId),
-  });
-}
 
-/**
- * Disposes a global fix spot as `commented` or `ignored` (the `fixed` path goes
- * through {@link openGlobalFix}). Mirrors the file-level {@link disposeFinding}
- * side effects — PR line comment / local note for `commented`, an ignore reason
- * for `ignored` — but records the result via {@link ReviewSession.setGlobalFixDisposition}
- * so spots that map to no file-level finding still persist (design X).
- */
-async function disposeGlobalFix(
-  spotId: string,
-  file: string,
-  _line: number,
-  kind: 'commented' | 'ignored',
-): Promise<void> {
-  const reviewSet = session.reviewSet;
-  if (!reviewSet) {
-    return;
-  }
-  if (!ensureReviewPath(file, m().actions.disposeFinding)) {
-    return;
-  }
-  const baseReport = session.globalReport;
-  const spot = baseReport?.fixSpots.find((s) => s.id === spotId);
-  if (!spot) {
-    return;
-  }
-  const localizedSpot = baseReport
-    ? localizeGlobalReportNow(baseReport, resolveLanguage()).fixSpots.find((s) => s.id === spotId) ?? spot
-    : spot;
-  const cwd = activeCwd();
-  if (!cwd) {
-    return;
-  }
-  const findingLike = {
-    title: localizedSpot.title,
-    detail: localizedSpot.detail,
-    suggestion: localizedSpot.suggestion,
-  };
-  const liveRange = await resolveLiveRange(
-    file,
-    spot.line,
-    spot.endLine,
-    spotId,
-    spot.anchor,
-  );
-  if (session.globalReport !== baseReport) {
-    return;
-  }
 
-  if (kind === 'commented') {
-    const prMatch = reviewSet.scopeId.match(/^pr-(\d+)$/);
-    const body = composeCommentBody(findingLike);
-    if (prMatch) {
-      // Accumulate into the pending review, posted together on conclusion.
-      const commentId = `cmt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      session.addPendingComment({
-        id: commentId,
-        path: file,
-        startLine: liveRange.startLine,
-        endLine: liveRange.stopLine,
-        body,
-        source: 'finding',
-        createdAt: Date.now(),
-      });
-      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
-        kind: 'commented',
-        ref: commentId,
-        at: Date.now(),
-      });
-      transientInfo(`${m().documentPanel.commentAdded} (${session.pendingComments.length})`);
-    } else {
-      const annotationId = recordLocalCommentNote(file, {
-        line: liveRange.startLine,
-        endLine: liveRange.stopLine,
-        anchor: spot.anchor,
-        title: spot.title,
-        detail: spot.detail,
-        suggestion: spot.suggestion,
-      });
-      session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
-        kind: 'commented',
-        ref: annotationId,
-        at: Date.now(),
-      });
-      transientInfo(m().finding.recordedInlineNote);
-    }
-  } else {
-    const reason = await showIgnoreReasonInput(localizedSpot.title);
-    if (!reason) {
-      return;
-    }
-    session.setGlobalFixDisposition(spotId, file, spot.line, spot.anchor, {
-      kind: 'ignored',
-      reason: reason.trim(),
-      at: Date.now(),
-    });
-    transientInfo(m().finding.ignored);
-  }
-  WorkbenchPanel.refreshIfOpen();
-  GlobalReportPanel.refreshIfOpen();
-}
-
-/**
- * Clears a global fix spot's disposition (the "revert" action in the handled
- * list). If the spot was `fixed` and we still hold the applied edit, also revert
- * the file change — matching the file-level undo semantics.
- */
-async function revertGlobalFix(spotId: string, file: string, _line: number): Promise<void> {
-  if (!ensureReviewPath(file, m().actions.disposeFinding)) {
-    return;
-  }
-  const spot = session.globalReport?.fixSpots.find((s) => s.id === spotId);
-  const anchor = spot?.anchor;
-  const current = spot
-    ? session.globalFixDisposition(spotId, file, spot.line, anchor)
-    : undefined;
-  if (current?.kind === 'fixed') {
-    await revertAppliedFix(file, spotId);
-    deleteAppliedFixFor(file, spotId);
-  } else if (current?.kind === 'commented' && current.ref) {
-    if (/^pr-\d+$/.test(session.reviewSet?.scopeId ?? '')) {
-      // Draft PR comment lives in the pending review; drop it on revert.
-      session.removePendingComment(current.ref);
-    } else {
-      // Local comment was stored as an inline note; remove it on revert.
-      session.removeAnnotation(file, current.ref);
-    }
-  }
-  if (spot) {
-    session.setGlobalFixDisposition(spotId, file, spot.line, anchor, null);
-  }
-  transientInfo(m().finding.dispositionReverted(file));
-  WorkbenchPanel.refreshIfOpen();
-  GlobalReportPanel.refreshIfOpen();
-  if (spot) {
-    void (async () => {
-      await reloadDocPanel(file);
-      await locateInFile(file, spot.line, spot.endLine, spotId, spot.anchor);
-    })();
-  }
-}
 
 async function localizeReportData(data: ReportData, target: Language): Promise<ReportData> {
   const items: Array<{ cacheKey: string; text: string }> = [];
@@ -4566,7 +3888,10 @@ async function exportReviewReport(): Promise<void> {
     transientWarning(m().businessReview.staleReport);
     return;
   }
-  const markdown = `${buildReviewReportMarkdown(localized, m().report)}${business ? `\n\n---\n\n${businessReportMarkdown(business)}` : ''}`;
+  const legacy = localized.globalReport || localized.files.some((file) => file.findings.length || file.annotations.length);
+  const markdown = business
+    ? `# ${m().report.title}\n\n${businessReportMarkdown(business)}${legacy ? `\n\n---\n\n## ${m().reviewCenter.legacyReportTitle}\n\n> ${m().reviewCenter.legacyReportBoundary}\n\n${buildReviewReportMarkdown({ ...localized, requirements: undefined, conclusion: undefined }, m().report)}` : ''}`
+    : `# ${m().reviewCenter.legacyReportTitle}\n\n> ${m().reviewCenter.legacyReportBoundary}\n\n${buildReviewReportMarkdown(localized, m().report)}`;
   const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: markdown });
   await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
   transientInfo(m().report.exported);

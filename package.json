@@ -80,9 +80,9 @@
         "icon": "$(graph)"
       },
       {
-        "command": "codereview.showGlobalReport",
-        "title": "%cmd.showGlobalReport%",
-        "icon": "$(output)"
+        "command": "codereview.viewLegacyReport",
+        "title": "%cmd.viewLegacyReport%",
+        "icon": "$(history)"
       },
       {
         "command": "codereview.submitConclusion",
@@ -170,14 +170,16 @@
             "%config.repositoryAwareAnalysis.off%"
           ],
           "default": "auto",
-          "description": "%config.repositoryAwareAnalysis.description%"
+          "description": "%config.repositoryAwareAnalysis.description%",
+          "deprecationMessage": "%config.legacyAnalysis.deprecated%"
         },
         "codereview.repositoryContextTokenBudget": {
           "type": "number",
           "default": 28000,
           "minimum": 8000,
           "maximum": 64000,
-          "description": "%config.repositoryContextTokenBudget.description%"
+          "description": "%config.repositoryContextTokenBudget.description%",
+          "deprecationMessage": "%config.legacyAnalysis.deprecated%"
         },
         "codereview.autoAccount": {
           "type": "boolean",

@@ -30,6 +30,12 @@ interface ScrollReport {
   referenceClickable: boolean;
   toolbarContained: boolean;
   placeholderHidden: boolean;
+  preparationEntries: number;
+  exportEntries: number;
+  recheckEntries: number;
+  scopeReadOnly: boolean;
+  optimisticBusy: boolean;
+  recheckBlocked: boolean;
 }
 
 async function waitFor(test: () => boolean, label: string): Promise<void> {
@@ -59,7 +65,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     diffLines: raw.map((_, i): DocDiffLine => ({
       kind: i % 31 === 0 ? 'added' : 'context', oldLine: i + 1, newLine: i + 1,
     })),
-    seen: [], findings: [], annotations: [], analyzing: false, readOnly: true,
+    seen: [], findings: [], annotations: [], analyzing: false, readOnly: false,
   };
   const token = 'source-scroll-layout-test';
   const panel = vscode.window.createWebviewPanel('codereview.sourceScrollTest', 'Source scroll layout',
@@ -67,6 +73,8 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
   let loaded = false;
   let error: string | undefined;
   let selectedPath: string | undefined;
+  let analysisRequests = 0;
+  let preparationRequests = 0;
   const reports = new Map<number, ScrollReport>();
   const subscription = panel.webview.onDidReceiveMessage((message: {
     type: string;
@@ -85,11 +93,23 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     if (message.type === 'document' && message.message?.type === 'loadError') error = message.message.message;
     if (message.type === 'sourceScrollReport' && message.report) reports.set(message.report.id, message.report);
     if (message.type === 'center' && message.action === 'file') selectedPath = message.path;
+    if (message.type === 'center' && message.action === 'stage') preparationRequests++;
+    if (message.type === 'document' && message.message?.type === 'analyze') analysisRequests++;
   });
   const automation = `
     window.addEventListener('message',async event=>{
       const message=event.data;if(message.type!=='sourceScrollProbe')return;
       const host=document.getElementById('review-source'),root=host.shadowRoot,scroll=root.getElementById('content');
+      const analyze=root.getElementById('act-analyze');let optimisticBusy=false,scopeReadOnly=true;
+      if(message.id===1){
+        analyze.click();optimisticBusy=analyze.disabled;
+        const stage=document.querySelector('.stages [aria-current="step"]')?.dataset.value;
+        document.getElementById('show-current-scope').click();
+        const dialog=document.getElementById('scope-dialog');
+        scopeReadOnly=dialog.open&&dialog.querySelectorAll('li').length>0&&!dialog.querySelector('input,textarea,select,[data-center-action]');
+        document.getElementById('close-scope-dialog').click();
+        scopeReadOnly=scopeReadOnly&&!dialog.open&&stage===document.querySelector('.stages [aria-current="step"]')?.dataset.value;
+      }
       if(message.mode)host.style.width=message.width?message.width+'px':'';
       const inspector=document.querySelector('.inspector'),details=document.getElementById('center-inspector');
       if(getComputedStyle(inspector).display==='none')document.getElementById('toggle-inspector').click();
@@ -112,6 +132,9 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
       }
       window.__reviewCenterApi.postMessage({type:'sourceScrollReport',report:{
         id:message.id,mode:message.mode||'',sourceLeft:source.left,sourceRight:source.right,sourceWidth:source.width,
+        preparationEntries:document.querySelectorAll('[data-center-action="stage"][data-value="prepare"]').length,
+        exportEntries:document.querySelectorAll('[data-center-action="export"]').length,
+        recheckEntries:root.querySelectorAll('#act-analyze').length,scopeReadOnly,optimisticBusy,recheckBlocked:analyze.disabled,
         contentRight:content.right,contentBottom:content.bottom,contentHeight:content.height,mainLeft:main.left,mainRight:main.right,mainBottom:main.bottom,
         scrollTop:scroll.scrollTop,scrollLeft:scroll.scrollLeft,horizontalRange:scroll.scrollWidth-scroll.clientWidth,
         diffRows:root.querySelectorAll('.diff-row').length,inspectorUncovered:!!hit?.closest('.inspector'),
@@ -122,7 +145,12 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
       }});
     });
   `;
-  panel.webview.html = reviewCenterView(center, [], token).replace('</body>', `<script nonce="${token}">${automation}</script></body>`);
+  const files = session.reviewSet!.files.map((file) => ({
+    path: file.path, name: file.path.split('/').pop()!, dir: file.path.split('/').slice(0, -1).join('/'),
+    seen: 0, total: raw.length, analyzed: false, ready: false, fullySeen: false, unconfirmed: 0, findings: 0,
+    active: file.path === model.path, analyzing: false,
+  }));
+  panel.webview.html = reviewCenterView(center, files, token).replace('</body>', `<script nonce="${token}">${automation}</script></body>`);
   const probe = async (input: { mode?: 'diff' | 'file'; width?: number; top?: number; left?: number; reference?: boolean }): Promise<ScrollReport> => {
     const id = reports.size + 1;
     await panel.webview.postMessage({ type: 'sourceScrollProbe', id, ...input });
@@ -132,6 +160,18 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
   try {
     await waitFor(() => loaded || error !== undefined, 'native long-source render');
     assert.equal(error, undefined);
+    const chrome = await probe({});
+    assert.equal(chrome.preparationEntries, 1);
+    assert.equal(chrome.exportEntries, 1);
+    assert.equal(chrome.recheckEntries, 1);
+    assert.equal(chrome.scopeReadOnly, true, 'Scope details must be a read-only modal that does not change the stage');
+    assert.equal(chrome.optimisticBusy, false, 'A refused/undelivered analysis action must not leave the source button permanently busy');
+    await waitFor(() => analysisRequests === 1, 'single contextual source action');
+    assert.equal(preparationRequests, 0, 'Opening scope details must not navigate to preparation');
+    await panel.webview.postMessage({ type: 'document', message: { type: 'analyzing', on: true } });
+    assert.equal((await probe({})).recheckBlocked, true, 'Host busy state must disable the shared analysis action');
+    await panel.webview.postMessage({ type: 'document', message: { type: 'analyzing', on: false } });
+    assert.equal((await probe({})).recheckBlocked, false, 'Completion/cancellation must restore the analysis action');
     for (const width of [undefined, 320]) {
       for (const mode of ['diff', 'file'] as const) {
         for (const [top, left] of [[0, 0], [1400, 0], [2600, 900]]) {
@@ -158,6 +198,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     return [
       'native full-width/320px source file/diff scrolling stays inside the middle column, with visible controls and unobscured inspector text/tabs',
       'native source and inspector scroll independently; the long-path reference remains clickable after scrolling',
+      'native center has one preparation/export/source-recheck entry; scope details stay read-only and host-controlled source busy state recovers without optimistic stuck loading',
     ];
   } finally {
     subscription.dispose();

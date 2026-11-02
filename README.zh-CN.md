@@ -78,22 +78,13 @@ VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 - 可弹出到独立窗口（类似 “Open in Agents Window”）
 - **Token 统计（估算）**：HUD 一行展示估算的 LLM token（↑输入 ↓输出），hover 看按操作分桶明细，随审查累计并持久化；由 `countTokens` 本地估算，非服务商计费 token
 
-### 逐文件审查（旧技术工具）
+### 单一审查流程与文件阅读
 
-- PR 等差异范围默认打开不折叠的完整文件行内 Diff，显示新旧双行号和新增/删除行；可随时切回干净的 HEAD 文件
-- 逐行覆盖追踪与「跳到下一处未读行」
-- **基于此文件分析**：在明确的递归深度、文件数、Token 和时间预算内，递归追踪相关实现、调用方、配置与测试
-- 每个候选 Bug 都会基于同一份仓库上下文再由模型独立复核；只有确认 Bug 会显示，已推翻或证据不足的候选只进入完成统计
-- 确认 Bug 可落在相关文件；若该文件不在当前范围，会自动加入审查并要求正常完成审查
-- 每条可操作 finding 必须处置：**已修复 / 已评论 / 已忽略（需理由）**
-- 修复方案：Copilot 生成互斥的「多处编辑 = 一个完整方案」候选，一键应用 + 一键撤销，应用快照持久化
-- **修复前补充信息**：当模型对某条 finding 判断偏了，在修复面板里写一段补充说明；生成方案时它优先于原 finding，且按 finding 持久化
-- 选区翻译 / 代码讲解标注
-
-### 全局分析（旧技术工具）
-
-- 跨文件逻辑分析，可限定到选定目录
-- 独立的全局报告 Webview
+- 顶部范围审查和源码的**复核此文件相关链路**使用同一个业务引擎、结果与结论门禁，不再生成独立的逐文件/全局活跃报告。
+- 文件入口优先重新检查包含该文件的业务单元，仍核对完整正式范围并重新执行必要的全局发现、候选复核和需求评估。其余精确相同的调用可以复用；达到预算仍是部分结果，不把单文件完成当成整个范围通过。
+- 源码保留完整 Diff、旧/新双行号、未读行导航及选区翻译/讲解；关联证据文件只读，不因阅读自动扩张正式范围。
+- 准备入口统一在顶部阶段导航，结论里的范围详情仅只读查看仓库、快照和文件列表；完整报告导出统一在左下导航。
+- 旧版技术报告通过显式历史命令查看，保留原始文字但不能确认、修复、评论或忽略，也不能批准本轮审查。完整导出中的旧记录明确归入历史附录。
 
 ### 门禁与结论
 
@@ -107,11 +98,9 @@ VS Code 扩展 · 由 GitHub CLI 与 Copilot 模型驱动
 业务批准 = 当前源码覆盖与流程完整
            && 没有确认缺陷 / 决定性未知
            && 当前准确预览 + 最终人工确认
-旧技术门禁 = 所有文件就绪 && 全局分析已确认
-旧文件就绪 = 已分析 && 所有可操作 finding 已处置
 ```
 
-旧技术门禁仅用于尚未采用业务审查结果的情况，不能证明需求已满足。逐行阅读进度只是辅助信号，不证明业务正确；处置说明、评论或未经验证的补丁不会消除业务缺陷。
+无当前业务审查结果时不能提交新结论，旧逐文件完成和全局确认不再作为替代门禁。逐行阅读进度只是辅助信号，不证明业务正确；处置说明、评论或未经验证的补丁不会消除业务缺陷。
 
 ## 语言（双语）
 
@@ -134,9 +123,10 @@ AI Coding Review 全面双语（简体中文 / English），**默认简体中文
 | `codereview.openInNewWindow` | 在独立窗口打开审查工作台 |
 | `codereview.startReview` | 选择范围并开始审查 |
 | `codereview.openWorkbench` | 打开审查工作台 |
-| `codereview.analyzeFile` | 以当前文件为入口分析相关仓库行为 |
-| `codereview.globalAnalysis` | 运行全局分析 |
-| `codereview.showGlobalReport` | 查看全局报告 |
+| `codereview.analyzeFile` | 优先复核当前文件关联业务单元，仍检查完整范围和全局关系 |
+| `codereview.globalAnalysis` | 使用统一业务引擎审查当前范围 |
+| `codereview.showGlobalReport` | 兼容别名：打开统一结论中心 |
+| `codereview.viewLegacyReport` | 只读查看已保存的旧版技术报告 |
 | `codereview.submitConclusion` | 打开结论编辑和实际发布预览 |
 | `codereview.jumpToNextUnseen` | 跳到下一处未读行 |
 | `codereview.pickModel` | 选择分析模型 |
@@ -148,8 +138,8 @@ AI Coding Review 全面双语（简体中文 / English），**默认简体中文
 |--------|------|------|
 | `codereview.language` | `zh-CN` | 整体体验（UI + 新 LLM 输出）的语言：`zh-CN` / `en` / `auto` |
 | `codereview.focusedWorkbench` | `false` | 打开工作台时隐藏侧栏 / 活动栏占满主编辑区，关闭后恢复 |
-| `codereview.repositoryAwareAnalysis` | `auto` | `auto` 递归构建相关仓库上下文并自行复核候选 Bug；`off` 保留旧单文件行为 |
-| `codereview.repositoryContextTokenBudget` | `28000` | 仓库上下文最大估算输入 Token；超限时优先移除较低价值的相关片段 |
+| `codereview.repositoryAwareAnalysis` | `auto` | 已弃用：旧文件分析设置，不控制统一业务审查 |
+| `codereview.repositoryContextTokenBudget` | `28000` | 已弃用：统一业务审查使用前述引擎预算与实际模型容量 |
 
 ## 架构分层
 

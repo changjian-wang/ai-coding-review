@@ -1,5 +1,5 @@
 import { m, fmt } from '../i18n';
-import { findingContentSignature, isActionableFinding, type Finding } from '../ai/types';
+import { findingContentSignature, type Finding } from '../ai/types';
 import { businessBindingKey, businessHash, businessBlockers, coverageComplete, type BusinessCitation, type BusinessFinding } from '../review/businessReview';
 import type { BusinessReviewStatus } from '../review/businessReview';
 import { conclusionDraftText, ConclusionDraftDataError, type ConclusionDraft, type ConclusionVerdict } from '../review/conclusionDraft';
@@ -238,10 +238,10 @@ export function buildReviewCenterState(
       const { path, finding } = item;
       validSelection = true;
       inspector = {
-        title: finding.title, subtitle: `${t.moreTools} · ${m().severity[finding.severity]}`,
-        html: `<div class="markdown">${renderRequirementMarkdown(finding.detail)}</div><p>${esc(finding.verification?.rationale ?? b.legacyUnverified)}</p>
+        title: finding.title, subtitle: t.legacyReportTitle,
+        html: `<p class="boundary">${esc(t.legacyReportBoundary)}</p><div class="markdown">${renderRequirementMarkdown(finding.detail)}</div><p>${esc(finding.verification?.rationale ?? b.legacyUnverified)}</p>
           ${(finding.verification?.evidence ?? []).map((ref) => sourceLink({ kind: 'legacy', path: ref.file, line: ref.line, endLine: ref.endLine })).join('')}`,
-        primaryFile: { path, line: finding.line }, legacy: isActionableFinding(finding) ? { path, id: finding.id } : undefined,
+        primaryFile: { path, line: finding.line },
       };
     }
   }
@@ -279,7 +279,7 @@ export function buildReviewCenterState(
       publishBusy: input.publishBusy,
       target: pr ? `${set?.repositoryIdentity ?? session.getRepoLabel()} · PR #${pr[1]}` : `${session.getRepoLabel()} · ${t.localTarget}`,
       blockers: input.running || input.analysisBusy ? [b.incomplete] : draft?.verdict === 'approve'
-        ? run ? businessBlockers(run) : session.technicalGatePassed() ? [] : [b.incomplete]
+        ? run ? businessBlockers(run) : [b.incomplete]
         : session.canSubmitConclusion(draft?.verdict ?? 'comment') ? [] : [stale ? b.stale : b.incomplete],
       confirmed: run?.confirmed ?? false,
       openItems: findings.filter((row) => row.kind === 'finding'
