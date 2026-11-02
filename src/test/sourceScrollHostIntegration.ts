@@ -24,8 +24,15 @@ interface ScrollReport {
   scrollLeft: number;
   horizontalRange: number;
   diffRows: number;
-  inspectorUncovered: boolean;
-  tabsUncovered: boolean;
+  judgmentAboveSource: boolean;
+  sourceInitiallyClosed: boolean;
+  sourceClosed: boolean;
+  workspaceColumns: number;
+  judgmentFullWidth: boolean;
+  issueContentVisible: boolean;
+  judgmentText: string;
+  pendingVisible: boolean;
+  dismissedVisible: boolean;
   independent: boolean;
   referenceClickable: boolean;
   toolbarContained: boolean;
@@ -49,13 +56,16 @@ async function waitFor(test: () => boolean, label: string): Promise<void> {
 export async function runSourceScrollHostChecks(): Promise<string[]> {
   const { session } = await reviewCenterFixture();
   const run = session.businessReview!;
+  const finding = run.findings[0];
+  run.findings.push({ ...structuredClone(finding), id: 'dismissed-control', status: 'dismissed', kind: 'reasonable' });
   run.units[0].goal = 'Validate end-to-end UI test baselines, cross-browser visual snapshots and assertion-tool contracts';
   const lastPath = 'tests/e2e/visual.spec.ts-snapshots/detail-paragraphs-content-understanding-chrome-win32-14.png';
   run.units[0].files.push(...Array.from({ length: 15 }, (_, i) => lastPath.replace('-14.png', `-${i}.png`)));
-  session.setWorkspaceView({ selection: { kind: 'unit', id: run.units[0].id }, inspector: 'judgment' });
-  const center = buildReviewCenterState(session, {
+  session.setWorkspaceView({ navigator: 'findings', selection: { kind: 'finding', id: finding.id }, inspector: 'judgment' });
+  const input = {
     running: false, publishBusy: false, model: 'Controlled scroll fixture', language: resolveLanguage(),
-  });
+  };
+  const center = buildReviewCenterState(session, input);
   const raw = Array.from({ length: 400 }, (_, i) =>
     `export const sourceLine${i} = "${'controlled-long-source-value/'.repeat(i % 7 === 0 ? 45 : 3)}";`);
   const model: DocModel = {
@@ -80,6 +90,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     type: string;
     message?: { type: string; message?: string };
     action?: string;
+    value?: string;
     path?: string;
     report?: ScrollReport;
   }) => {
@@ -94,15 +105,23 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     if (message.type === 'sourceScrollReport' && message.report) reports.set(message.report.id, message.report);
     if (message.type === 'center' && message.action === 'file') selectedPath = message.path;
     if (message.type === 'center' && message.action === 'stage') preparationRequests++;
+    if (message.type === 'center' && message.action === 'navigator'
+      && (message.value === 'business' || message.value === 'files' || message.value === 'findings' || message.value === 'feedback')) {
+      session.setWorkspaceView({ navigator: message.value });
+      void panel.webview.postMessage({ type: 'centerState', center: buildReviewCenterState(session, input) });
+    }
     if (message.type === 'document' && message.message?.type === 'analyze') analysisRequests++;
   });
   const automation = `
     window.addEventListener('message',async event=>{
       const message=event.data;if(message.type!=='sourceScrollProbe')return;
-      const host=document.getElementById('review-source'),root=host.shadowRoot,scroll=root.getElementById('content');
+      const host=document.getElementById('review-source'),root=host.shadowRoot,scroll=root.getElementById('content'),pane=document.getElementById('source-main'),mainElement=document.querySelector('.main');
+      const inspector=document.querySelector('.inspector');
+      const sourceInitiallyClosed=!pane.open,initialJudgment=inspector.getBoundingClientRect();
+      const judgmentFullWidth=Math.abs(mainElement.clientWidth-initialJudgment.width)<=2;
+      const workspaceColumns=getComputedStyle(document.querySelector('.workspace')).gridTemplateColumns.split(' ').length;
       const analyze=root.getElementById('act-analyze');let optimisticBusy=false,scopeReadOnly=true;
       if(message.id===1){
-        analyze.click();optimisticBusy=analyze.disabled;
         const stage=document.querySelector('.stages [aria-current="step"]')?.dataset.value;
         document.getElementById('show-current-scope').click();
         const dialog=document.getElementById('scope-dialog');
@@ -110,23 +129,24 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
         document.getElementById('close-scope-dialog').click();
         scopeReadOnly=scopeReadOnly&&!dialog.open&&stage===document.querySelector('.stages [aria-current="step"]')?.dataset.value;
       }
+      if(message.action==='closed')document.querySelector('[data-lens="closed"]').click();
+      if(message.action==='pending')document.querySelector('[data-lens="open"]').click();
       if(message.mode)host.style.width=message.width?message.width+'px':'';
-      const inspector=document.querySelector('.inspector'),details=document.getElementById('center-inspector');
-      if(getComputedStyle(inspector).display==='none')document.getElementById('toggle-inspector').click();
-      const previous=details.scrollTop;
+      if(message.action==='back'){pane.scrollIntoView({block:'start'});document.getElementById('back-to-judgment').click();}
+      else if(!message.reference){pane.open=true;pane.scrollIntoView({block:'end'});}
+      await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+      const previous=mainElement.scrollTop;
+      if(message.id===1){analyze.click();optimisticBusy=analyze.disabled;}
       if(message.mode){root.getElementById(message.mode==='diff'?'m-diff':'m-file').click();scroll.scrollTop=message.top;scroll.scrollLeft=message.left;}
       const sourceTop=scroll.scrollTop,sourceLeft=scroll.scrollLeft;
-      if(message.reference)details.scrollTop=details.scrollHeight;
+      const link=message.reference?[...document.querySelectorAll('#inspector-body .reference-link')].at(-1):undefined;
+      if(link)link.scrollIntoView({block:'center'});
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
-      const main=document.querySelector('.main').getBoundingClientRect(),source=host.getBoundingClientRect(),content=scroll.getBoundingClientRect();
-      const title=document.getElementById('inspector-title').getBoundingClientRect(),edge=inspector.getBoundingClientRect();
-      const tab=document.querySelector('#inspector-tabs button'),tabRect=tab.getBoundingClientRect();
+      const main=mainElement.getBoundingClientRect(),source=host.getBoundingClientRect(),content=scroll.getBoundingClientRect(),edge=inspector.getBoundingClientRect(),paneRect=pane.getBoundingClientRect();
       const toolbar=[root.getElementById('fname'),...root.querySelectorAll('.topbar button')].filter(element=>element.getClientRects().length);
-      const hit=document.elementFromPoint(edge.left+24,Math.min(title.top+8,edge.bottom-20));
-      const tabHit=document.elementFromPoint(tabRect.left+tabRect.width/2,tabRect.top+tabRect.height/2);
       let referenceClickable=false;
-      if(message.reference){
-        const links=[...document.querySelectorAll('#inspector-body .reference-link')],link=links.at(-1),rect=link.getBoundingClientRect();
+      if(link){
+        const rect=link.getBoundingClientRect();
         const target=document.elementFromPoint(rect.left+Math.min(20,rect.width/2),rect.top+rect.height/2);
         referenceClickable=!!target&&target.closest('.reference-link')===link;if(referenceClickable)link.click();
       }
@@ -134,12 +154,15 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
         id:message.id,mode:message.mode||'',sourceLeft:source.left,sourceRight:source.right,sourceWidth:source.width,
         preparationEntries:document.querySelectorAll('[data-center-action="stage"][data-value="prepare"]').length,
         exportEntries:document.querySelectorAll('[data-center-action="export"]').length,
+        sourceInitiallyClosed,sourceClosed:!pane.open,workspaceColumns,judgmentFullWidth,judgmentText:inspector.innerText,
+        issueContentVisible:inspector.innerText.includes(${JSON.stringify(finding.impact)})&&inspector.innerText.includes(${JSON.stringify(finding.trigger)})&&inspector.innerText.includes('await order.restore();'),
+        pendingVisible:!!document.querySelector('#center-list [data-id="'+${JSON.stringify(finding.id)}+'"]'),
+        dismissedVisible:!!document.querySelector('#center-list [data-id="dismissed-control"]'),
         recheckEntries:root.querySelectorAll('#act-analyze').length,scopeReadOnly,optimisticBusy,recheckBlocked:analyze.disabled,
         contentRight:content.right,contentBottom:content.bottom,contentHeight:content.height,mainLeft:main.left,mainRight:main.right,mainBottom:main.bottom,
         scrollTop:scroll.scrollTop,scrollLeft:scroll.scrollLeft,horizontalRange:scroll.scrollWidth-scroll.clientWidth,
-        diffRows:root.querySelectorAll('.diff-row').length,inspectorUncovered:!!hit?.closest('.inspector'),
-        tabsUncovered:!!tabHit?.closest('#inspector-tabs'),
-        independent:message.reference?scroll.scrollTop===sourceTop&&scroll.scrollLeft===sourceLeft:details.scrollTop===previous,
+        diffRows:root.querySelectorAll('.diff-row').length,judgmentAboveSource:edge.bottom<=paneRect.top+1,
+        independent:message.reference?scroll.scrollTop===sourceTop&&scroll.scrollLeft===sourceLeft:mainElement.scrollTop===previous,
         referenceClickable,placeholderHidden:document.getElementById('source-placeholder').hidden,
         toolbarContained:toolbar.every(element=>{const rect=element.getBoundingClientRect();return rect.left>=source.left-1&&rect.right<=source.right+1;})
       }});
@@ -151,7 +174,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     active: file.path === model.path, analyzing: false,
   }));
   panel.webview.html = reviewCenterView(center, files, token).replace('</body>', `<script nonce="${token}">${automation}</script></body>`);
-  const probe = async (input: { mode?: 'diff' | 'file'; width?: number; top?: number; left?: number; reference?: boolean }): Promise<ScrollReport> => {
+  const probe = async (input: { mode?: 'diff' | 'file'; width?: number; top?: number; left?: number; reference?: boolean; action?: 'back' | 'closed' | 'pending' }): Promise<ScrollReport> => {
     const id = reports.size + 1;
     await panel.webview.postMessage({ type: 'sourceScrollProbe', id, ...input });
     await waitFor(() => reports.has(id), 'native source scroll geometry');
@@ -161,6 +184,12 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     await waitFor(() => loaded || error !== undefined, 'native long-source render');
     assert.equal(error, undefined);
     const chrome = await probe({});
+    assert.equal(chrome.workspaceColumns, 2, 'The review workspace must be an issue list plus judgment, not three competing panes');
+    assert.equal(chrome.sourceInitiallyClosed, true, 'Code must not take over the initial issue view');
+    assert.equal(chrome.judgmentFullWidth, true, JSON.stringify(chrome));
+    assert.equal(chrome.issueContentVisible, true, 'The default judgment must show actual impact, trigger and code evidence');
+    assert.equal(chrome.pendingVisible, true, JSON.stringify(chrome));
+    assert.equal(chrome.dismissedVisible, false);
     assert.equal(chrome.preparationEntries, 1);
     assert.equal(chrome.exportEntries, 1);
     assert.equal(chrome.recheckEntries, 1);
@@ -168,6 +197,12 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
     assert.equal(chrome.optimisticBusy, false, 'A refused/undelivered analysis action must not leave the source button permanently busy');
     await waitFor(() => analysisRequests === 1, 'single contextual source action');
     assert.equal(preparationRequests, 0, 'Opening scope details must not navigate to preparation');
+    const closed = await probe({ action: 'closed' });
+    assert.equal(closed.pendingVisible, false, JSON.stringify(closed));
+    assert.equal(closed.dismissedVisible, true, JSON.stringify(closed));
+    const pending = await probe({ action: 'pending' });
+    assert.equal(pending.pendingVisible, true, JSON.stringify(pending));
+    assert.equal(pending.dismissedVisible, false, JSON.stringify(pending));
     await panel.webview.postMessage({ type: 'document', message: { type: 'analyzing', on: true } });
     assert.equal((await probe({})).recheckBlocked, true, 'Host busy state must disable the shared analysis action');
     await panel.webview.postMessage({ type: 'document', message: { type: 'analyzing', on: false } });
@@ -181,7 +216,7 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
           assert.ok(report.contentBottom <= report.mainBottom + 1, JSON.stringify(report));
           assert.ok(report.contentHeight > 0 && report.placeholderHidden, 'The regression must scroll a visible source viewport');
           assert.ok(report.horizontalRange > 1000, 'Long code must remain horizontally scrollable, not truncated');
-          assert.ok(report.inspectorUncovered && report.tabsUncovered, 'Code must not paint over the inspector or its tabs');
+          assert.equal(report.judgmentAboveSource, true, 'The optional reader must remain below, not over, the judgment');
           assert.equal(report.independent, true);
           assert.equal(report.diffRows > 0, mode === 'diff');
           assert.equal(report.toolbarContained, true, 'Source controls must wrap instead of being clipped');
@@ -191,13 +226,20 @@ export async function runSourceScrollHostChecks(): Promise<string[]> {
         }
       }
     }
+    const back = await probe({ action: 'back' });
+    assert.equal(back.sourceClosed, true, 'Returning to the issue must collapse the optional source reader');
+    assert.equal(back.issueContentVisible, true, JSON.stringify(back));
+    await probe({});
+    session.setWorkspaceView({ navigator: 'business', selection: { kind: 'unit', id: run.units[0].id } });
+    await panel.webview.postMessage({ type: 'centerState', center: buildReviewCenterState(session, input) });
     const reference = await probe({ reference: true });
     assert.equal(reference.independent, true, 'Inspector scrolling must not move the code viewport');
     assert.equal(reference.referenceClickable, true, 'Long file references must remain visible and clickable');
     await waitFor(() => selectedPath === lastPath, 'native inspector reference action after scrolling');
     return [
-      'native full-width/320px source file/diff scrolling stays inside the middle column, with visible controls and unobscured inspector text/tabs',
-      'native source and inspector scroll independently; the long-path reference remains clickable after scrolling',
+      'native issues-first layout has two columns, defaults to pending issues and actual judgment/evidence, and keeps code collapsed until requested',
+      'native full-width/320px optional source scrolling is contained below the judgment; returning collapses code without losing the issue',
+      'native pending/ruled-out issue filters stay distinct; auxiliary long-path references remain clickable without changing source scroll position',
       'native center has one preparation/export/source-recheck entry; scope details stay read-only and host-controlled source busy state recovers without optimistic stuck loading',
     ];
   } finally {

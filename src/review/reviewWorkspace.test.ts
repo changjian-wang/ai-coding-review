@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ReviewSession } from './reviewSession';
 import { ReviewCenterController, type ReviewCenterServices } from './reviewCenterController';
-import { captureReviewFileAction, createWorkspaceView, restoreWorkspaceView } from './reviewWorkspace';
+import { captureReviewFileAction, createWorkspaceView, openReviewProblems, restoreWorkspaceView } from './reviewWorkspace';
 import { buildReviewCenterState, centerReferenceId, centerReferences, reviewCenterContextKey } from '../ui/reviewCenterState';
 import { businessConclusionSummary } from '../ui/businessReviewPanel';
 import { businessHash } from './businessReview';
@@ -21,6 +21,74 @@ function services(): ReviewCenterServices {
 }
 
 describe('review center selection and versioning', () => {
+  it('lands on review issues and migrates the old business-first layout without losing an explicitly selected finding or source', () => {
+    const view = createWorkspaceView('scope');
+    expect(view.navigator).toBe('findings');
+    const { layout, ...old } = view;
+    expect(layout).toBe('issues-first');
+    expect(restoreWorkspaceView({ ...old, navigator: 'business', selection: { kind: 'unit', id: 'U-1' }, focus: true }, 'scope'))
+      .toMatchObject({ layout: 'issues-first', navigator: 'findings', selection: { kind: 'overview' }, focus: false });
+    expect(restoreWorkspaceView({ ...old, selection: { kind: 'finding', id: 'F-1' }, source: { kind: 'reference', id: 'source' } }, 'scope'))
+      .toMatchObject({ selection: { kind: 'finding', id: 'F-1' }, source: { kind: 'reference', id: 'source' } });
+    expect(restoreWorkspaceView({ ...view, navigator: 'business', selection: { kind: 'unit', id: 'U-1' } }, 'scope').navigator).toBe('business');
+  });
+
+  it('shows a bounded no-issue result only for complete current coverage, never for partial, stale or missing coverage', async () => {
+    const { session } = await reviewCenterFixture({ defect: false });
+    const run = session.businessReview!;
+    const input = { running: false, publishBusy: false, model: 'Controlled', language: 'en' };
+    expect(buildReviewCenterState(session, input).outcome.title).toBe(m().reviewCenter.outcomeClear);
+    run.status = 'partial';
+    const partial = buildReviewCenterState(session, input);
+    expect(partial.outcome.title).toBe(m().reviewCenter.outcomeIncomplete);
+    expect(partial.outcome.tone).toBe('warning');
+    expect(partial.outcome.limitations.length).toBeGreaterThan(0);
+    run.status = 'completed';
+    run.coverage.pop();
+    const missing = buildReviewCenterState(session, input);
+    expect(missing.outcome.title).toBe(m().reviewCenter.outcomeIncomplete);
+    expect(missing.sourceCoverage).toEqual({ reviewed: 3, total: 4 });
+    session.invalidateBusinessReview();
+    expect(buildReviewCenterState(session, input).outcome.title).toBe(m().reviewCenter.outcomeStale);
+    session.snapshot!.businessReview = undefined;
+    expect(buildReviewCenterState(session, input).outcome.title).toBe(m().reviewCenter.outcomeNotStarted);
+    expect(buildReviewCenterState(session, { ...input, running: true }).outcome.title).toBe(m().reviewCenter.outcomeRunning);
+    session.dispose();
+  });
+
+  it('puts impact, trigger, cause and quotable evidence in the default finding judgment instead of a planning goal', async () => {
+    const { session, run } = await reviewCenterFixture();
+    session.setWorkspaceView({ selection: { kind: 'finding', id: run.findings[0].id }, inspector: 'judgment' });
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    for (const text of [run.findings[0].impact, run.findings[0].trigger, run.findings[0].cause, run.findings[0].counterRationale, 'await order.restore();']) {
+      expect(state.inspector.html).toContain(text);
+    }
+    expect(state.inspector.html.indexOf(run.findings[0].impact)).toBeLessThan(state.inspector.html.indexOf(run.findings[0].cause));
+    expect(state.inspector.html).toContain('class="reference-card" open');
+    expect(state.inspector.canFix).toBe(false);
+    expect(state.outcome.title).toContain('1');
+    expect(state.conclusion.canApprove).toBe(false);
+    session.dispose();
+  });
+
+  it('uses the same pending issue order for the list and next action without revisiting dismissed findings', async () => {
+    const { session } = await reviewCenterFixture();
+    const run = session.businessReview!;
+    run.findings[0].severity = 'medium';
+    run.findings.push({ ...structuredClone(run.findings[0]), id: 'dismissed', status: 'dismissed', kind: 'reasonable' });
+    run.findings.push({ ...structuredClone(run.findings[0]), id: 'unverified', status: 'unresolved', severity: 'high' });
+    const original = run.findings.map((finding) => finding.id);
+    expect(openReviewProblems(run).map((item) => item.id)).toEqual([run.findings[0].id, 'unverified']);
+    expect(run.findings.map((finding) => finding.id)).toEqual(original);
+    const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });
+    expect(state.conclusion.dismissedItems.map((item) => item.id)).toEqual(['dismissed']);
+    session.setWorkspaceView({ selection: { kind: 'finding', id: run.findings[0].id } });
+    const controller = new ReviewCenterController(session, services());
+    await controller.handle({ type: 'center', action: 'next', contextKey: reviewCenterContextKey(session) });
+    expect(session.workspaceView.selection).toEqual({ kind: 'finding', id: 'unverified' });
+    session.dispose();
+  });
+
   it('clears the preparation-only restore marker on handoff while keeping saved review editor state', async () => {
     const { session } = await reviewCenterFixture();
     const state = buildReviewCenterState(session, { running: false, publishBusy: false, model: 'Controlled', language: 'en' });

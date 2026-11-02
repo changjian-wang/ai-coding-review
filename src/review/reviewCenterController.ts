@@ -2,6 +2,7 @@ import { m } from '../i18n';
 import type { BusinessCitation } from './businessReview';
 import type { ReviewSession } from './reviewSession';
 import { ConclusionDraftDataError } from './conclusionDraft';
+import { openReviewProblems } from './reviewWorkspace';
 import {
   centerLegacyFindings, centerReferenceId, centerReferences, reviewCenterContextKey,
   type CenterAction, type CenterReference,
@@ -139,7 +140,10 @@ export class ReviewCenterController {
           || kind === 'critical' && run?.priorCritical.some((item) => item.id === id)
           || kind === 'legacy' && centerLegacyFindings(this.session).has(id))) throw new ConclusionDraftDataError(m().reviewCenter.staleSelection);
         if (kind !== 'finding' && kind !== 'unit' && kind !== 'critical' && kind !== 'legacy') throw new ConclusionDraftDataError();
-        this.session.setWorkspaceView({ stage: 'review', selection: { kind, id } });
+        this.session.setWorkspaceView({
+          stage: 'review', selection: { kind, id },
+          navigator: kind === 'finding' || kind === 'critical' ? 'findings' : this.session.workspaceView.navigator,
+        });
         await this.primary();
         break;
       }
@@ -152,12 +156,12 @@ export class ReviewCenterController {
         await this.reference(message.id);
         break;
       case 'next': {
-        const findings = this.session.businessReview?.findings ?? [];
+        const findings = openReviewProblems(this.session.businessReview);
         if (!findings.length) throw new ConclusionDraftDataError(m().reviewCenter.emptyFindings);
         const selected = this.session.workspaceView.selection;
-        const at = selected.kind === 'finding' ? findings.findIndex((finding) => finding.id === selected.id) : -1;
+        const at = selected.kind === 'finding' || selected.kind === 'critical' ? findings.findIndex((finding) => finding.kind === selected.kind && finding.id === selected.id) : -1;
         const next = findings[(at + 1) % findings.length];
-        this.session.setWorkspaceView({ stage: 'review', navigator: 'findings', selection: { kind: 'finding', id: next.id } });
+        this.session.setWorkspaceView({ stage: 'review', navigator: 'findings', selection: next });
         await this.primary();
         break;
       }

@@ -9,6 +9,15 @@ import { repositoryStorageId } from '../review/repositoryIdentity';
 
 interface NavigationReport { cards: number; reviewEnabled: boolean; conclusionEnabled: boolean; materials: number; hasReview: boolean }
 
+async function step<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), 10_000);
+    })]);
+  } finally { clearTimeout(timer!); }
+}
+
 async function waitFor(test: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (!test()) {
@@ -30,6 +39,16 @@ async function inspect(panel: vscode.WebviewPanel): Promise<NavigationReport> {
   const anchor = "rememberPreparation();api.postMessage({type:'ready'});";
   assert.ok(panel.webview.html.includes(anchor), 'Returning to prepare must render the complete production form in the workbench');
   panel.webview.html = panel.webview.html.replace(anchor, `
+    let queuedNavigation;
+    function returnWhenReady(){
+      if(!queuedNavigation)return;
+      const stage=queuedNavigation,disabled=$('preparation-shell').inert||(stage!=='escape'&&$('return-'+stage).disabled);
+      api.postMessage({type:'requirementsRendered',navigationAttempt:{stage,disabled,inert:$('preparation-shell').inert}});
+      if(disabled)return;
+      queuedNavigation=undefined;
+      if(stage==='escape')window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+      else $('return-'+stage).click();
+    }
     window.addEventListener('message',event=>{
       const message=event.data;
       if(message.type==='requirements')api.postMessage({type:'requirementsRendered',navigationState:{
@@ -41,12 +60,13 @@ async function inspect(panel: vscode.WebviewPanel): Promise<NavigationReport> {
           navigationCheck:{cards:document.querySelectorAll('main>section').length,
             reviewEnabled:!$('return-review').disabled,conclusionEnabled:!$('return-conclusion').disabled,
             materials:message.state.materials.length,hasReview:api.getState().preparationHasReview===true}});
-      }else if(message.type==='navigationReturn')$('return-'+message.stage).click();
-      else if(message.type==='navigationEscape')window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+      }else if(message.type==='navigationReturn'){queuedNavigation=message.stage;returnWhenReady();}
+      else if(message.type==='navigationEscape'){queuedNavigation='escape';returnWhenReady();}
       else if(message.type==='navigationExclude'){
         const material=document.querySelector('[data-material]');
         material.checked=false;material.dispatchEvent(new Event('change',{bubbles:true}));
       }
+      if(message.type==='requirements')returnWhenReady();
     });
     ${anchor}`);
   try { await waitFor(() => !!report, 'same-panel preparation render'); return report!; }
@@ -70,14 +90,14 @@ export async function runStageNavigationHostChecks(
   await api.loadBranch(cwd, 'feature', 'main');
   await api.session.setRequirements(business.draft);
   await api.session.setBusinessReview(business.run);
-  await api.open();
+  await step(api.open(), 'open issue-first workbench before stage navigation');
   await waitFor(() => api.document().loaded && api.document().embedded, 'initial navigation source');
   const original = api.session.snapshot;
   const originalSet = api.session.reviewSet;
   const originalRequirements = structuredClone(api.session.requirements);
   const originalRun = api.session.businessReview!.id;
   const findingId = api.session.businessReview!.findings[0].id;
-  await api.action({ action: 'select', kind: 'finding', id: findingId });
+  await step(api.action({ action: 'select', kind: 'finding', id: findingId }), 'select finding before stage navigation');
   const groups = vscode.window.tabGroups.all.length;
   const tab = tabs()[0];
   let owner: vscode.WebviewPanel | undefined;
@@ -100,8 +120,16 @@ export async function runStageNavigationHostChecks(
     return { panel, pending };
   };
   const leave = async (entry: Awaited<ReturnType<typeof enter>>, stage: 'review' | 'conclusion' | 'escape') => {
-    await entry.panel.webview.postMessage(stage === 'escape' ? { type: 'navigationEscape' } : { type: 'navigationReturn', stage });
-    await entry.pending;
+    const observations: unknown[] = [];
+    const subscription = entry.panel.webview.onDidReceiveMessage((message: { type: string; navigationAttempt?: unknown }) => {
+      if (message.navigationAttempt || message.type === 'error' || message.type === 'operationError') observations.push(message);
+    });
+    try {
+      await entry.panel.webview.postMessage(stage === 'escape' ? { type: 'navigationEscape' } : { type: 'navigationReturn', stage });
+      await step(entry.pending, `return from preparation to ${stage}`);
+    } catch (error) {
+      throw new Error(`${String(error)}; view=${api.session.workspaceView.stage}; opening=${!!api.openingPanel()}; preparation=${entry.panel.webview.html.includes('id="repository"')}; ${JSON.stringify(observations)}`);
+    } finally { subscription.dispose(); }
     await waitFor(() => !api.openingPanel() && entry.panel.webview.html.includes('id="review-source"'), 'same-panel review restoration');
     assert.equal(tabs().length, 1);
     assert.equal(vscode.window.tabGroups.all.length, groups);
@@ -122,7 +150,7 @@ export async function runStageNavigationHostChecks(
   await waitFor(() => api.document().loaded && api.document().embedded, 'source after review round trip');
 
   await api.session.setBusinessReview(business.run);
-  await api.action({ action: 'stage', value: 'conclusion' });
+  await step(api.action({ action: 'stage', value: 'conclusion' }), 'enter conclusion before preparation round trip');
   const saved = api.session.conclusionDraft!;
   await api.session.saveConclusionDraft(saved.id, saved.revision, '# Kept exact draft\n\nNo tests were executed.', 'comment');
   const draftId = api.session.conclusionDraft!.id;

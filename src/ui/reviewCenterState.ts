@@ -3,7 +3,7 @@ import { findingContentSignature, type Finding } from '../ai/types';
 import { businessBindingKey, businessHash, businessBlockers, coverageComplete, type BusinessCitation, type BusinessFinding } from '../review/businessReview';
 import type { BusinessReviewStatus } from '../review/businessReview';
 import { conclusionDraftText, ConclusionDraftDataError, type ConclusionDraft, type ConclusionVerdict } from '../review/conclusionDraft';
-import { legacySelectionId, type ReviewWorkspaceView } from '../review/reviewWorkspace';
+import { legacySelectionId, openReviewProblems, type ReviewWorkspaceView } from '../review/reviewWorkspace';
 import type { ReviewSession } from '../review/reviewSession';
 import type { RequirementItem } from '../review/requirements';
 import { businessReportReferences } from './businessReviewPanel';
@@ -79,6 +79,7 @@ export interface ReviewCenterState {
   conclusion: CenterConclusion;
   status: string;
   sourceCoverage: { reviewed: number; total: number };
+  outcome: { title: string; detail: string; tone: 'normal' | 'warning'; limitations: string[] };
   tokens?: { label: string; tooltip: string };
 }
 
@@ -123,9 +124,9 @@ function sourceLink(ref: CenterReference): string {
   return `<button class="reference-link" data-center-action="reference" data-id="${centerReferenceId(ref)}">${esc(path)} · L${line}</button>`;
 }
 
-function citations(refs: readonly BusinessCitation[]): string {
-  return refs.map((citation) => `<details class="reference-card"><summary>${esc(citation.path)} [${citation.side}] · L${citation.line}–${citation.endLine}</summary>
-    <pre>${esc(citation.quote)}</pre><small>sha256 ${esc(citation.sourceHash)}</small>${sourceLink({ kind: 'business', citation })}</details>`).join('');
+function citations(refs: readonly BusinessCitation[], open = false): string {
+  return refs.map((citation) => `<details class="reference-card"${open ? ' open' : ''}><summary title="sha256 ${escAttr(citation.sourceHash)}">${esc(citation.path)} [${citation.side}] · L${citation.line}–${citation.endLine}</summary>
+    <pre>${esc(citation.quote)}</pre>${open ? '' : `<small>sha256 ${esc(citation.sourceHash)}</small>`}${sourceLink({ kind: 'business', citation })}</details>`).join('');
 }
 
 function rulesHtml(session: ReviewSession, rules: readonly RequirementItem[]): string {
@@ -155,16 +156,20 @@ function findingInspector(session: ReviewSession, finding: BusinessFinding): Cen
     ? `<h3>${esc(b.evidenceLabel)}</h3>${citations(finding.evidence)}<h3>${esc(b.counterEvidence)}</h3>${citations(finding.counterEvidence)}<p>${esc(finding.counterRationale)}</p>`
     : tab === 'handling'
       ? `<p class="boundary">${esc(t.history)}</p>${note ? `<article class="markdown">${renderRequirementMarkdown(note.reason)}</article><small>${new Date(note.at).toISOString()}</small>` : `<p>${esc(t.notPublished)}</p>`}`
-      : `<h3>${esc(t.requirements)}</h3>${rules.length ? rulesHtml(session, rules) : `<p>${esc(run.mode === 'technical' ? b.modeTechnical : b.evidenceLabel)}</p>`}
-        <h3>${esc(t.cause)}</h3><div class="markdown">${renderRequirementMarkdown(finding.cause)}</div>
-        <h3>${esc(t.trigger)}</h3><div class="markdown">${renderRequirementMarkdown(finding.trigger)}</div>
-        <h3>${esc(t.impact)}</h3><div class="markdown">${renderRequirementMarkdown(finding.impact)}</div>
+      : `<div class="finding-impact"><h3>${esc(t.impact)}</h3><div class="markdown">${renderRequirementMarkdown(finding.impact)}</div></div>
+        <div class="finding-facts"><section><h3>${esc(t.trigger)}</h3><div class="markdown">${renderRequirementMarkdown(finding.trigger)}</div></section>
+        <section><h3>${esc(t.cause)}</h3><div class="markdown">${renderRequirementMarkdown(finding.cause)}</div></section></div>
+        <h3>${esc(t.primaryFindingEvidence)}</h3>${finding.evidence.length ? citations(finding.evidence.slice(0, 1), true) : `<p class="boundary warning">${esc(t.noFindingEvidence)}</p>`}
+        <button class="secondary" data-center-action="inspector" data-value="evidence">${esc(t.moreFindingEvidence)}</button>
         <h3>${esc(b.counterRationale)}</h3><p>${esc(finding.counterRationale)}</p>
+        ${citations(finding.counterEvidence)}
+        ${rules.length ? `<details class="rule"><summary>${esc(t.requirements)}</summary>${rulesHtml(session, rules)}</details>` : ''}
         ${finding.critical ? `<div class="boundary warning"><strong>${esc(b.criticalBlocked)}</strong><p>${esc(finding.critical.dependsOn)}</p><p>${esc(finding.critical.impact)}</p><p>${esc(finding.critical.missingEvidence)}</p><p>${esc(finding.critical.question)}</p></div>` : ''}`;
   return {
-    title: finding.title, subtitle: `${b[finding.kind]} · ${b[finding.status]} · ${b[finding.severity]} · ${b[finding.attribution]}`,
+    title: finding.title, subtitle: `${b[finding.kind]} · ${b[finding.status]} · ${b[finding.severity]} · ${t.changeAttribution}: ${b[finding.attribution]}`,
     html, primaryReference: primary ? centerReferenceId({ kind: 'business', citation: primary }) : undefined, findingId: finding.id,
-    canFix: finding.kind === 'implementation' && finding.status === 'confirmed',
+    canFix: finding.kind === 'implementation' && finding.status === 'confirmed' && !session.reviewSet?.source
+      && session.businessReviewCurrent && run.status !== 'running',
   };
 }
 
@@ -184,26 +189,46 @@ export function buildReviewCenterState(
     id: finding.id, kind: 'finding', title: finding.title,
     detail: finding.evidence.filter((ref) => ref.kind === 'code').map((ref) => ref.path).join(' · '),
     summary: finding.impact,
-    badge: `${b[finding.kind]} · ${b[finding.status]}`, tone: finding.status === 'confirmed' ? 'error' : finding.status === 'unresolved' ? 'warning' : 'ok',
+    badge: `${b[finding.status]} · ${b[finding.severity]} · ${b[finding.kind]}`, tone: finding.status === 'confirmed' ? 'error' : finding.status === 'unresolved' ? 'warning' : 'ok',
   }));
   findings.push(...(run?.priorCritical ?? []).map((item): CenterRow => ({
     id: item.id, kind: 'critical', title: item.title, detail: b.priorCritical,
-    badge: b[run?.priorCriticalVerdicts.find((verdict) => verdict.id === item.id)?.status ?? 'unknown'], tone: 'warning',
+    badge: b[run?.priorCriticalVerdicts.find((verdict) => verdict.id === item.id)?.status ?? 'unknown'],
+    tone: run?.priorCriticalVerdicts.some((verdict) => verdict.id === item.id && verdict.status === 'cleared') ? 'ok' : 'warning',
   })));
   const legacyRows: CenterRow[] = [...legacy].map(([id, { path, finding }]) => ({
     id, kind: 'legacy', title: finding.title, detail: `${path} · L${finding.line}`, badge: m().severity[finding.severity],
   }));
   const reviewed = run?.coverage.filter(coverageComplete).length ?? 0;
-  const total = run?.coverage.length ?? 0;
+  const expectedCoverage = set?.files.filter((file) => !file.context).reduce((count, file) =>
+    count + Number(file.status !== 'deleted') + Number(!!set.comparison && file.status !== 'added'), 0) ?? 0;
+  const total = Math.max(run?.coverage.length ?? 0, expectedCoverage);
+  const openItems = openReviewProblems(run).flatMap((selection) => findings.filter((row) => row.kind === selection.kind && row.id === selection.id));
+  const dismissedItems = findings.filter((row) => !openItems.some((open) => open.kind === row.kind && open.id === row.id));
+  const current = session.businessReviewCurrent;
+  const incomplete = !!run && (run.status !== 'completed' || !run.globalCompleted || !total || reviewed !== total || !!run.errors.length || !!run.blockingLimitations?.length);
+  const eligible = session.canSubmitConclusion('approve');
+  const outcome = {
+    title: input.running || run?.status === 'running' ? t.outcomeRunning : !run ? t.outcomeNotStarted
+      : !current || run.status === 'stale' ? t.outcomeStale : incomplete ? t.outcomeIncomplete
+        : openItems.length ? fmt(t.outcomeFindings, openItems.length) : eligible ? t.outcomeClear : t.outcomeBlocked,
+    detail: !run ? input.running ? b.read : t.noRun : `${fmt(t.coverageSummary, reviewed, total)} · ${fmt(t.outcomeCounts,
+      run.findings.filter((finding) => finding.status === 'confirmed').length,
+      run.findings.filter((finding) => finding.status === 'unresolved').length,
+      openItems.filter((row) => row.kind === 'critical').length)}. ${t.outcomeCaution}`,
+    tone: !input.running && run?.status !== 'running' && run && (!current || incomplete) ? 'warning' as const : 'normal' as const,
+    limitations: run ? [...new Set([...businessBlockers(run), ...run.limitations, ...run.errors])] : [],
+  };
   let inspector: CenterInspector = {
     title: t.overview, subtitle: session.requirementStatus,
-    html: `<p class="boundary">${esc(b.boundary)}</p><h3>${esc(b.coverage)}</h3><p>${reviewed}/${total}</p>
+    html: `<p class="overview-next">${esc(openItems.length ? t.overviewNext : !run ? t.noRunAction : eligible ? t.outcomeCaution : t.incompleteNext)}</p>${openItems.slice(0, 3).map((item) => `<button class="overview-issue" data-center-action="select" data-kind="${item.kind}" data-id="${escAttr(item.id)}"><strong>${esc(item.title)}</strong><p>${esc(item.summary || item.detail)}</p><small>${esc(item.badge ?? '')}</small></button>`).join('')}
+      <details class="review-audit"><summary>${esc(t.inspectionDetails)}</summary><p class="boundary">${esc(b.boundary)}</p><h3>${esc(b.coverage)}</h3><p>${reviewed}/${total}</p>
       <h3>${esc(b.limits)}</h3>${run ? [...businessBlockers(run), ...run.limitations, ...run.errors].map((reason) => `<p>${esc(reason)}</p>`).join('') : `<p>${esc(t.noRun)}</p>`}
       <h3>${esc(t.evidenceRequests)}</h3>${(run?.requests ?? []).map((result) => `<details><summary>${esc(result.request.symbol)} · ${esc(result.request.kind)}</summary><p>${esc(result.request.question)}</p><p>${esc(result.paths.join(', '))}</p>${result.error ? `<p class="error-text">${esc(result.error)}</p>` : ''}</details>`).join('')}
       <h3>${esc(b.requirementStatus)}</h3>${(run?.requirements ?? []).map((verdict) => {
         const rule = [...run!.baseline.requirements, ...run!.baseline.excluded].find((rule) => rule.id === verdict.id);
         return `<details><summary>${esc(verdict.id)} · ${esc(b[verdict.status])} · ${esc(rule?.title ?? '')}</summary><p>${esc(verdict.rationale)}</p>${rule ? rulesHtml(session, [rule]) : ''}${citations(verdict.evidence)}</details>`;
-      }).join('')}`,
+      }).join('')}</details>`,
   };
   const selected = view.selection;
   let validSelection = selected.kind === 'overview';
@@ -266,7 +291,7 @@ export function buildReviewCenterState(
     model: input.model, language: input.language,
     progress: input.running && run?.status !== 'running' ? b.read : run ? fmt(b.progress, b[run.phase], reviewed, total, run.calls) : t.noRun,
     units, findings, legacy: legacyRows, inspector,
-    status: input.running ? b.running : run ? `${b[run.status]} · ${run.modelId}` : t.noRun, sourceCoverage: { reviewed, total },
+    status: input.running ? b.running : run ? `${b[run.status]} · ${run.modelId}` : t.noRun, sourceCoverage: { reviewed, total }, outcome,
     tokens: tokens ? { label: `${m().workbench.tokens}: ${tokenSummary(tokens, m().workbench)}`, tooltip: tokenTooltip(tokens, m().workbench) } : undefined,
     conclusion: {
       draft, error: draftError, stale: stale && !published, published,
@@ -282,10 +307,7 @@ export function buildReviewCenterState(
         ? run ? businessBlockers(run) : [b.incomplete]
         : session.canSubmitConclusion(draft?.verdict ?? 'comment') ? [] : [stale ? b.stale : b.incomplete],
       confirmed: run?.confirmed ?? false,
-      openItems: findings.filter((row) => row.kind === 'finding'
-        ? run?.findings.some((finding) => finding.id === row.id && finding.status !== 'dismissed')
-        : row.kind === 'critical' && !run?.priorCriticalVerdicts.some((verdict) => verdict.id === row.id && verdict.status === 'cleared')),
-      dismissedItems: findings.filter((row) => row.kind === 'finding' && run?.findings.some((finding) => finding.id === row.id && finding.status === 'dismissed')),
+      openItems, dismissedItems,
     },
   };
 }

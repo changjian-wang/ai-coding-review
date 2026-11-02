@@ -14,6 +14,7 @@ export type ReviewSourceSelection =
 
 export interface ReviewWorkspaceView {
   version: 1;
+  layout?: 'issues-first';
   scopeKey: string;
   runId?: string;
   stage: ReviewStage;
@@ -29,7 +30,7 @@ export class ReviewWorkspaceDataError extends Error {
 }
 
 export function createWorkspaceView(scopeKey: string): ReviewWorkspaceView {
-  return { version: 1, scopeKey, stage: 'review', navigator: 'business', selection: { kind: 'overview' }, inspector: 'judgment', focus: false };
+  return { version: 1, layout: 'issues-first', scopeKey, stage: 'review', navigator: 'findings', selection: { kind: 'overview' }, inspector: 'judgment', focus: false };
 }
 
 export function restoreWorkspaceView(value: unknown, scopeKey: string): ReviewWorkspaceView {
@@ -40,7 +41,8 @@ export function restoreWorkspaceView(value: unknown, scopeKey: string): ReviewWo
     || !['prepare', 'review', 'conclusion'].includes(String(v.stage))
     || !['business', 'findings', 'feedback', 'files'].includes(String(v.navigator))
     || !['judgment', 'evidence', 'handling'].includes(String(v.inspector))
-    || typeof v.focus !== 'boolean' || v.runId !== undefined && typeof v.runId !== 'string') throw new ReviewWorkspaceDataError();
+    || typeof v.focus !== 'boolean' || v.runId !== undefined && typeof v.runId !== 'string'
+    || v.layout !== undefined && v.layout !== 'issues-first') throw new ReviewWorkspaceDataError();
   if (!v.selection || typeof v.selection !== 'object' || Array.isArray(v.selection)) throw new ReviewWorkspaceDataError();
   const selection = v.selection as Record<string, unknown>;
   if (!['overview', 'unit', 'finding', 'critical', 'legacy'].includes(String(selection.kind))
@@ -52,17 +54,37 @@ export function restoreWorkspaceView(value: unknown, scopeKey: string): ReviewWo
       || source.kind === 'file' && (typeof source.path !== 'string' || !source.path)
       || source.kind === 'reference' && (typeof source.id !== 'string' || !source.id)) throw new ReviewWorkspaceDataError();
   }
-  return structuredClone(value) as ReviewWorkspaceView;
+  const restored = structuredClone(value) as ReviewWorkspaceView;
+  if (!restored.layout) {
+    restored.layout = 'issues-first';
+    restored.navigator = 'findings';
+    restored.focus = false;
+    if (restored.selection.kind === 'unit') restored.selection = { kind: 'overview' };
+  }
+  return restored;
 }
 
 export function reconcileWorkspaceView(view: ReviewWorkspaceView, run: BusinessReviewRun | undefined): ReviewWorkspaceView {
   const next = structuredClone(view);
   if (next.runId !== run?.id) {
     if (next.selection.kind !== 'legacy') next.selection = { kind: 'overview' };
+    next.navigator = 'findings';
     if (next.source?.kind === 'reference') next.source = undefined;
     next.runId = run?.id;
   }
   return next;
+}
+
+export function openReviewProblems(run: BusinessReviewRun | undefined): { kind: 'finding' | 'critical'; id: string }[] {
+  if (!run) return [];
+  const severity = { high: 0, medium: 1, low: 2 };
+  return [
+    ...run.priorCritical.filter((item) => !run.priorCriticalVerdicts.some((verdict) => verdict.id === item.id && verdict.status === 'cleared'))
+      .map((item) => ({ kind: 'critical' as const, id: item.id })),
+    ...run.findings.filter((finding) => finding.status !== 'dismissed')
+      .sort((a, b) => Number(a.status === 'unresolved') - Number(b.status === 'unresolved') || severity[a.severity] - severity[b.severity])
+      .map((finding) => ({ kind: 'finding' as const, id: finding.id })),
+  ];
 }
 
 export function legacySelectionId(path: string, signature: string): string {
