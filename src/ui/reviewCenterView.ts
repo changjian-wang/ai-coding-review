@@ -6,6 +6,8 @@ import type { WorkbenchFile } from './workbenchPanel';
 import { reviewBrand, reviewCenterChrome, reviewStageLabel } from './reviewCenterChrome';
 
 const json = (value: unknown) => JSON.stringify(value).replace(/</g, '\\u003c');
+const FILE_ROW_HEIGHT = 52;
+const ISSUE_ROW_HEIGHT = 112;
 
 export function reviewCenterView(center: ReviewCenterState, files: readonly WorkbenchFile[], token: string): string {
   const t = m().reviewCenter;
@@ -32,8 +34,8 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   .tabs button.active{background:var(--review-accent-soft);color:var(--review-accent)}
   .nav-count{font-size:9px;opacity:.85}
   .navigator-head input{width:100%;margin-top:12px;padding:7px 9px;border:1px solid var(--review-border);border-radius:4px;background:var(--review-canvas);font-size:11px}
-  .list{flex:1;min-height:0;overflow:auto;position:relative;padding:0 9px}
-  .nav-row{display:block;width:100%;height:112px;padding:11px 10px;text-align:left;border:1px solid transparent;border-radius:5px;background:transparent;color:var(--vscode-foreground);overflow:hidden}
+  .list{flex:1;min-height:0;overflow:auto;overflow-x:hidden;position:relative;padding:0 9px}
+  .nav-row{display:block;width:100%;height:${ISSUE_ROW_HEIGHT}px;padding:11px 10px;text-align:left;border:1px solid transparent;border-radius:5px;background:transparent;color:var(--vscode-foreground);overflow:hidden}
   .nav-row:hover{background:var(--vscode-list-hoverBackground)}
   .nav-row.active{background:var(--review-accent-soft);border-color:var(--review-accent-border)}
   .nav-row strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;font-weight:500;line-height:1.5}
@@ -42,6 +44,13 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   .nav-row .row-impact{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;white-space:normal;font-size:11px;line-height:1.6;margin:4px 0}
   .nav-row.error .badge{color:var(--vscode-errorForeground)}
   .nav-row.warning .badge{color:var(--vscode-editorWarning-foreground)}
+  .file-row{display:grid;grid-template-columns:minmax(0,1fr) 18px;grid-template-rows:18px 16px;align-content:center;column-gap:8px;height:${FILE_ROW_HEIGHT}px;padding:7px 10px}
+  .file-row strong{display:block;grid-column:1;grid-row:1;min-width:0;font-size:12px;line-height:18px;white-space:nowrap;text-overflow:ellipsis}
+  .file-row .file-directory{grid-column:1;grid-row:2;min-width:0;font-size:10px;line-height:16px}
+  .file-change{grid-column:2;grid-row:1/3;align-self:center;text-align:center;color:var(--review-muted);font:12px var(--vscode-editor-font-family,monospace)}
+  .file-change[data-change=add]{color:var(--vscode-gitDecoration-addedResourceForeground,var(--review-green))}
+  .file-change[data-change=del]{color:var(--vscode-gitDecoration-deletedResourceForeground,var(--vscode-errorForeground))}
+  .file-change[data-change=role]{color:var(--vscode-gitDecoration-modifiedResourceForeground,var(--review-accent))}
   .empty{padding:24px 12px;color:var(--review-muted);font-size:11px;line-height:1.9;overflow-wrap:anywhere}
   .empty h3{color:var(--vscode-foreground);margin-bottom:9px}
   .navigator-foot{padding:12px;border-top:1px solid var(--review-border);background:var(--review-subtle)}
@@ -58,10 +67,11 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   #review-limit-items{max-height:180px;overflow:auto;padding:6px 0}
   #review-limit-items p{margin:6px 0;line-height:1.7;overflow-wrap:anywhere}
   #source-main{flex:none;margin:0 24px 24px;border:1px solid var(--review-border);border-radius:5px;min-width:0;overflow:hidden}
-  .source-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;background:var(--review-subtle);font-size:11px;color:var(--review-muted);min-width:0;list-style:none}
-  .source-heading::before{content:'+';color:var(--review-accent)}
-  #source-main[open]>.source-heading{border-bottom:1px solid var(--review-border)}
-  #source-main[open]>.source-heading::before{content:'-'}
+  .source-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;background:var(--review-subtle);font-size:11px;color:var(--review-muted);min-width:0}
+  .source-toggle{flex:1;min-width:0;min-height:24px;padding:0;border:0;background:transparent;color:inherit;text-align:left;justify-content:flex-start}
+  .source-toggle::before{content:'+';color:var(--review-accent);flex:none}
+  #source-main[data-open=true]>.source-heading{border-bottom:1px solid var(--review-border)}
+  #source-main[data-open=true] .source-toggle::before{content:'-'}
   .source-viewport{height:min(60vh,560px);min-height:320px;position:relative;overflow:hidden}
   .source-heading strong{font-weight:500;color:var(--vscode-foreground);flex:none}
   #source-finding{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -136,6 +146,15 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   .shell.conclusion #conclusion-main{grid-column:1;grid-row:1}
   .shell.prepare .workspace{display:block}
   .shell.prepare .navigator,.shell.prepare .inspector{display:none}
+  .shell.source-browse .main{overflow:hidden}
+  .shell.source-browse .inspector{display:none}
+  .shell.source-browse #review-summary{padding:12px 20px;max-height:40%;min-height:0;overflow:auto}
+  .shell.source-browse #review-summary .eyebrow{display:none}
+  .shell.source-browse #center-status{font-size:15px}
+  .shell.source-browse #center-progress{font-size:11px;margin:4px 0}
+  .shell.source-browse #center-boundary{font-size:10px;margin-top:4px}
+  .shell.source-browse #source-main{display:flex;flex-direction:column;flex:1;min-height:0;margin:12px 16px 16px}
+  .shell.source-browse .source-viewport{flex:1;height:auto;min-height:0}
   .shell.focus:not(.conclusion) .workspace{grid-template-columns:minmax(0,1fr)}
   .shell.focus:not(.conclusion) .navigator{display:none}
   .shell.focus:not(.conclusion) .inspector,.shell.focus:not(.conclusion) #review-summary{display:none}
@@ -143,6 +162,7 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   .shell.focus:not(.conclusion) .source-viewport{flex:1;height:auto;min-height:0}
   @media(max-width:1120px){.workspace{grid-template-columns:244px minmax(0,1fr)}.shell.conclusion .main{display:block}.shell.conclusion .inspector{display:none;position:absolute;inset:0 0 0 auto;width:min(354px,94%);z-index:20;box-shadow:-8px 0 22px #0003}.shell.conclusion.inspector-open .inspector{display:flex}.mobile-inspector,.decision-toggle{display:inline-flex}.brand small{max-width:200px}#center-model{max-width:140px}.finding-facts{grid-template-columns:minmax(0,1fr);gap:0}}
   @media(max-width:690px){.workspace{grid-template-columns:minmax(0,1fr)}.navigator{display:none;position:absolute;inset:0 auto 0 0;width:min(280px,90%);height:100%;z-index:20;box-shadow:8px 0 22px #0003}.shell.nav-open .navigator{display:flex}.contextbar{padding:7px 10px;gap:7px;flex-wrap:wrap}.contextbar .scope{min-width:130px}.conclusion-main{padding:21px 16px}.mobile-nav{display:inline-flex}.inspector-scroll,#review-summary{padding:16px}#source-main{margin:0 12px 16px}.source-heading{flex-wrap:wrap}.summary-row{flex-wrap:wrap}.brand small{max-width:140px}.command-actions{flex-wrap:wrap}#center-model{max-width:125px}}
+  @media(max-width:690px) and (max-height:650px){.shell.source-browse .main{overflow:auto}.shell.source-browse #source-main{flex:none;min-height:360px}}
   [hidden]{display:none!important}
   </style></head><body>
   <div class="shell" id="center-shell">
@@ -158,7 +178,7 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
       <div class="verdict-options" role="radiogroup" aria-label="${esc(t.verdict)}">${(['approve','request-changes','comment'] as const).map((verdict) => `<label class="verdict-option"><input type="radio" name="draft-verdict-choice" value="${verdict}"><span><strong>${esc(verdict === 'approve' ? m().conclusion.approve : verdict === 'request-changes' ? m().conclusion.requestChanges : m().conclusion.comment)}</strong><small>${esc(verdict === 'approve' ? t.approveHint : verdict === 'request-changes' ? t.requestChangesHint : t.commentHint)}</small></span></label>`).join('')}</div>
       </div></div>
       <div class="inspector-actions" id="inspector-actions"></div><div class="conclusion-actions" id="conclusion-actions" hidden><button id="publish-draft" class="primary"></button><button data-center-action="stage" data-value="review">${esc(t.reopenReview)}</button><p class="hint">${esc(t.submitHint)}</p></div></aside>
-    <details id="source-main"><summary class="source-heading"><strong>${esc(t.sourceScene)}</strong><span id="source-finding"></span><button data-center-action="focus" class="secondary" id="center-focus">${esc(t.focus)}</button><button class="secondary" id="back-to-judgment">${esc(t.backToJudgment)}</button></summary><div class="source-viewport"><div id="review-source"></div><div id="source-placeholder" class="source-placeholder">${esc(t.chooseSource)}</div></div></details>
+    <section id="source-main" data-open="false"><div class="source-heading"><button class="source-toggle" id="toggle-source" aria-expanded="false" aria-controls="source-viewport"><strong>${esc(t.sourceScene)}</strong><span id="source-finding"></span></button><button data-center-action="focus" class="secondary" id="center-focus">${esc(t.focus)}</button><button class="secondary" id="back-to-judgment">${esc(t.backToJudgment)}</button></div><div class="source-viewport" id="source-viewport" hidden><div id="review-source"></div><div id="source-placeholder" class="source-placeholder">${esc(t.chooseSource)}</div></div></section>
     <section id="prepare-main" class="prepare-main" hidden><h1>${esc(t.prepare)}</h1><p class="boundary">${esc(t.preparePending)}</p></section>
     <section id="conclusion-main" class="conclusion-main" hidden><div class="eyebrow">${esc(t.conclusionEyebrow)}<span>${esc(t.conclusionHint)}</span></div><h1>${esc(t.conclusionTitle)}</h1><p class="stage-description">${esc(t.conclusionDescription)}</p><div id="conclusion-error" class="notice error-text" hidden></div><button id="check-publication" data-center-action="checkPublication" hidden>${esc(t.checkPublication)}</button>
       <section class="review-card"><div class="section-heading"><h2>${esc(t.openItems)}</h2><span class="badge" id="conclusion-open-count"></span></div><div id="conclusion-open"></div></section>
@@ -188,8 +208,9 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   const persisted=api.getState()?.center||{},buffers=persisted.buffers||{},conflicts=persisted.conflicts||{};let editorId;
   let sourceOpen=!!data.view.source&&persisted.sourceKey===data.contextKey&&persisted.sourceOpen===true,showClosed=persisted.sourceKey===data.contextKey&&persisted.showClosed===true;
   function store(){api.setState({...api.getState(),center:{buffers,conflicts,filter,previewMode,sourceOpen,sourceKey:data.contextKey,showClosed}})}
-  function revealSource(){sourceOpen=true;$('source-main').open=true;store();requestAnimationFrame(()=>$('source-main').scrollIntoView({block:'start'}));}
-  function closeSource(){sourceOpen=false;$('source-main').open=false;if(data.view.focus)send('focus',{value:'false'});store();}
+  function sourceLayout(){const browse=data.view.stage==='review'&&data.view.navigator==='files'&&data.view.selection.kind==='overview'&&!!data.view.source&&sourceOpen&&!data.view.focus;$('center-shell').classList.toggle('source-browse',browse);$('source-main').dataset.open=String(sourceOpen);$('source-viewport').hidden=!sourceOpen;$('toggle-source').setAttribute('aria-expanded',String(sourceOpen));$('back-to-judgment').hidden=!sourceOpen;$('back-to-judgment').textContent=data.view.selection.kind==='overview'?T.overview:T.backToJudgment;}
+  function revealSource(){sourceOpen=true;sourceLayout();store();requestAnimationFrame(()=>{if(!$('center-shell').classList.contains('source-browse'))$('source-main').scrollIntoView({block:'start'});});}
+  function closeSource(){sourceOpen=false;sourceLayout();if(data.view.focus)send('focus',{value:'false'});store();}
   function draftEdit(){const draft=data.conclusion.draft;if(!draft||editorId!==draft.id)return;return{id:draft.id,revision:draft.revision,body:$('draft-body').value,verdict:$('draft-verdict').value}}
   function dirty(){const d=data.conclusion.draft,e=draftEdit();return!!d&&!!e&&(e.body!==d.body||e.verdict!==d.verdict)}
   function send(action,fields={},bodyOperation=false){if(bodyOperation&&pendingBody)return;window.clearTimeout(saveTimer);const id=++request;const message={type:'center',action,contextKey:data.contextKey,clientId:CLIENT,requestId:id,...fields};
@@ -235,12 +256,17 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
     if(data.view.stage==='conclusion'&&!d.previewKey&&!pendingBody&&!state.stale&&!state.published&&!dirty())saveSoon(true);
   }
   function rows(){const query=filter.toLowerCase();let result;
-    if(data.view.navigator==='findings')result=showClosed?data.conclusion.dismissedItems:data.conclusion.openItems;else result=files.map(f=>({id:f.path,kind:'file',title:f.name||f.path.split('/').pop(),detail:f.path,badge:f.change==='add'?T.added:f.change==='del'?T.deleted:f.change==='role'?T.changed:''}));
+    if(data.view.navigator==='findings')result=showClosed?data.conclusion.dismissedItems:data.conclusion.openItems;else result=files.map(f=>({id:f.path,kind:'file',title:f.name||f.path.split('/').pop(),detail:f.path,directory:f.dir||'.',change:f.change,badge:f.change==='add'?T.added:f.change==='del'?T.deleted:f.change==='role'?T.changed:''}));
     return query?result.filter(r=>(r.title+' '+r.detail+' '+(r.summary||'')+' '+r.id).toLowerCase().includes(query)):result;}
   function renderList(){const list=$('center-list');
-    const result=rows();if(!result.length){list.innerHTML='<div class="empty">'+(data.view.navigator==='findings'&&showClosed?T.noDismissedItems:T.emptyFindings)+'</div>';return}
-    const height=112,start=Math.max(0,Math.floor(list.scrollTop/height)-3),end=Math.min(result.length,start+Math.ceil((list.clientHeight||600)/height)+6);
-    const active=data.view.selection;list.innerHTML='<div style="height:'+start*height+'px"></div>'+result.slice(start,end).map(r=>'<button class="nav-row '+(r.tone||'')+' '+(r.kind==='file'?data.view.source?.kind==='file'&&data.view.source.path===r.id?'active':'':active.kind===r.kind&&active.id===r.id?'active':'')+'" data-center-action="'+(r.kind==='file'?'file':'select')+'" data-id="'+esc(r.id)+'" data-kind="'+r.kind+'" data-path="'+(r.kind==='file'?esc(r.id):'')+'"><strong>'+esc(r.title)+'</strong><small class="row-impact">'+esc(r.summary||r.detail)+'</small><small class="badge">'+esc(r.badge||'')+'</small></button>').join('')+'<div style="height:'+(result.length-end)*height+'px"></div>';}
+    const result=rows();$('center-file-count').textContent=String(result.length);$('center-file-count').hidden=!filter;if(!result.length){list.innerHTML='<div class="empty">'+(filter?T.noSearchMatches:data.view.navigator==='files'?T.emptyFiles:showClosed?T.noDismissedItems:T.emptyFindings)+'</div>';return}
+    const height=data.view.navigator==='files'?${FILE_ROW_HEIGHT}:${ISSUE_ROW_HEIGHT},top=Math.min(list.scrollTop,Math.max(0,result.length*height-list.clientHeight));if(list.scrollTop!==top)list.scrollTop=top;
+    const start=Math.max(0,Math.floor(top/height)-3),end=Math.min(result.length,start+Math.ceil((list.clientHeight||600)/height)+6);
+    const active=data.view.selection;list.innerHTML='<div style="height:'+start*height+'px"></div>'+result.slice(start,end).map(r=>{
+      const file=r.kind==='file',selected=file?data.view.source?.kind==='file'&&data.view.source.path===r.id:active.kind===r.kind&&active.id===r.id;
+      const content=file?'<strong>'+esc(r.title)+'</strong><small class="file-directory">'+esc(r.directory)+'</small>'+(r.change?'<span class="file-change" data-change="'+esc(r.change)+'" title="'+esc(r.badge)+'" aria-label="'+esc(r.badge)+'">'+({add:'+',del:'-',role:'~'}[r.change])+'</span>':''):'<strong>'+esc(r.title)+'</strong><small class="row-impact">'+esc(r.summary||r.detail)+'</small><small class="badge">'+esc(r.badge||'')+'</small>';
+      return '<button class="nav-row '+(file?'file-row ':r.tone||'')+' '+(selected?'active':'')+'" title="'+esc(file?r.id:r.title)+'" aria-current="'+selected+'" data-center-action="'+(file?'file':'select')+'" data-id="'+esc(r.id)+'" data-kind="'+r.kind+'" data-path="'+(file?esc(r.id):'')+'">'+content+'</button>';
+    }).join('')+'<div style="height:'+(result.length-end)*height+'px"></div>';}
   function inspector(){const item=data.inspector,concluding=data.view.stage==='conclusion';$('inspector-heading').textContent=concluding?T.decisionTitle:T.context;$('inspector-title').textContent=concluding?T.verdict:item.title;$('inspector-subtitle').textContent=concluding?data.status:item.subtitle;
     $('inspector-tabs').hidden=concluding||!item.findingId;$('next-finding').hidden=concluding;$('next-finding').disabled=!data.conclusion.openItems.length;$('judgment-help').hidden=true;
     const warning=data.viewError||(data.runStatus==='stale'?B.stale:'');$('inspector-notice').hidden=!warning;$('inspector-notice').textContent=warning;
@@ -254,10 +280,10 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
   function paint(previous){const shell=$('center-shell');shell.classList.toggle('prepare',data.view.stage==='prepare');shell.classList.toggle('conclusion',data.view.stage==='conclusion');shell.classList.toggle('focus',data.view.focus);
     $('source-main').hidden=data.view.stage!=='review';$('prepare-main').hidden=data.view.stage!=='prepare';$('conclusion-main').hidden=data.view.stage!=='conclusion';
     $('review-summary').hidden=data.view.stage!=='review';$('toggle-inspector').hidden=data.view.stage!=='conclusion';
-    if(data.view.focus)sourceOpen=true;$('source-main').open=sourceOpen;$('back-to-judgment').hidden=!sourceOpen;
+    if(data.view.focus)sourceOpen=true;sourceLayout();
     $('center-repository').textContent=data.repository;$('center-repository').title=data.repository;$('center-scope').textContent=data.scope+' · '+data.head.slice(0,12)+(data.base?' / '+data.base.slice(0,12):'');$('center-scope').title=data.scope+' · head '+data.head+(data.base?' / base '+data.base:'');$('center-boundary').textContent=data.requirementStatus;$('center-boundary').title=data.requirementStatus;
     $('center-model').textContent=T.model+': '+data.model;$('center-model').title=[data.model,data.tokens?.tooltip].filter(Boolean).join('\\n');$('center-run').textContent=data.running?T.cancel:['partial','cancelled','interrupted','failed'].includes(data.runStatus)?T.continueReview:T.start;$('center-run').title=data.running?B.cancel:B.start;$('center-run').dataset.centerAction=data.running?'cancel':'run';
-    $('center-navigation-title').textContent=data.view.navigator==='findings'?T.issueNavigation:T[data.view.navigator];
+    $('center-navigation-title').textContent=data.view.navigator==='findings'?T.issueNavigation:T.navigationTitle;
     $('center-file-count').textContent=String(rows().length);$('count-findings').textContent=String(data.conclusion.openItems.length);$('count-closed').textContent=String(data.conclusion.dismissedItems.length);$('count-files').textContent=String(files.length);$('center-focus').hidden=data.view.stage==='conclusion';
     $('center-run').disabled=!data.running&&(data.analysisBusy||data.conclusion.publishBusy);
     $('center-overview').setAttribute('aria-pressed',String(data.view.selection.kind==='overview'));
@@ -270,8 +296,8 @@ export function reviewCenterView(center: ReviewCenterState, files: readonly Work
     const limits=data.outcome.limitations.map(reason=>'<p>'+esc(reason)+'</p>').join('');if($('review-limit-items').innerHTML!==limits)$('review-limit-items').innerHTML=limits;}
   $('center-search').value=filter=persisted.filter||'';$('center-search').addEventListener('input',event=>{filter=event.target.value;$('center-list').scrollTop=0;store();renderList()});
   $('center-list').addEventListener('scroll',()=>requestAnimationFrame(renderList));
-  $('source-main').addEventListener('toggle',()=>{sourceOpen=$('source-main').open;$('back-to-judgment').hidden=!sourceOpen;store();});
-  $('back-to-judgment').addEventListener('click',event=>{event.preventDefault();event.stopPropagation();closeSource();requestAnimationFrame(()=>$('inspector-title').scrollIntoView({block:'start'}));});
+  $('toggle-source').addEventListener('click',()=>{if(sourceOpen)closeSource();else revealSource();});
+  $('back-to-judgment').addEventListener('click',event=>{event.preventDefault();event.stopPropagation();closeSource();requestAnimationFrame(()=>(data.view.selection.kind==='overview'?$('review-summary'):$('inspector-title')).scrollIntoView({block:'start'}));});
   $('toggle-nav').addEventListener('click',()=>{$('center-shell').classList.remove('inspector-open');$('center-shell').classList.toggle('nav-open');});
   $('toggle-inspector').addEventListener('click',()=>{$('center-shell').classList.remove('nav-open');$('center-shell').classList.toggle('inspector-open');});
   $('open-conclusion-decision').addEventListener('click',()=>{$('center-shell').classList.remove('nav-open');$('center-shell').classList.add('inspector-open');});
