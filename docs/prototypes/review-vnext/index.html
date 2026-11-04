@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Review vNext 极简审查原型：左侧选择对象并切换文件/问题，代码占据其余空间；需求、问题详情和修复按需打开。未连接模型或真实仓库。">
-  <title>Review vNext · 审查中心</title>
+  <meta name="description" content="Review vNext Repo 审查工作区：同时打开多个 Repo，分别创建审查任务，准备参考材料与 Skill，定位问题、预览修复并模拟验证。未连接模型或真实仓库。">
+  <title>Review vNext · Repo 审查工作区</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23182226'/%3E%3Cpath d='m8 16 5 5 11-12' fill='none' stroke='%2376d6b7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./center.css">
   <script defer src="./app.js"></script>
@@ -55,9 +55,11 @@
         <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
         <button id="center-theme" class="icon-button" data-action="theme" aria-label="切换为浅色主题" title="切换主题"></button>
         <button id="review-opinion-toggle" class="button" data-action="opinion" hidden>审查意见</button>
+        <button class="button" data-action="new-review">新建审查</button>
         <button id="run-review" class="button primary" data-action="run"></button>
       </div>
     </header>
+    <div id="workspace-navigation"></div>
     <div class="center-workspace">
       <main id="review-main" tabindex="-1"></main>
     </div>

@@ -6,7 +6,7 @@ const demo = require('./app.js');
 const sources = require('./sources.js');
 const {
   createCenterState, currentFinding, currentChain, problemGroups, findingLocation, selectFile, switchMode, selectFinding,
-  completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, statusLabel,
+  completeReview, applySampleFix, undoSampleFix, recordFixValidation, sourceFiles, summaryText, statusLabel,
   preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, approvalGate, submitVerdict,
   scopeState, changeScope, fileNavigation, comparisonChanges, gitStatusLabels, coverageLimits, understandingChecks,
   beginRequirementEdit, saveRequirementEdit, conclusionState, requestApproval, confirmApproval, updateNotes,
@@ -60,14 +60,16 @@ test('切换问题保留当前页设置与意见，只重置关联阅读内容',
   assert.equal(state.notes, '保留人工说明。');
 });
 
-test('工作区只保留文件问题导航和代码，不混入设置、结果卡或判断栏', () => {
+test('工作区区分任务准备和代码审查，问题详情按需展开而不挤入准备页', () => {
   const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
   assert.doesNotMatch(html, /id="stage-navigation"|id="review-navigator"|id="review-inspector"/);
   const renderer = controller.slice(controller.indexOf('  function render(preserve'), controller.indexOf('  function stage(id)'));
   for (const id of ['linked-workspace', 'review-code', 'problem-list']) assert.ok(renderer.includes(id));
   assert.doesNotMatch(renderer, /id="review-settings"|class="review-result"|id="review-opinion"|class="judgment-pane"|result-heading/);
-  assert.doesNotMatch(renderer, /stage === 'prepare'|stage === 'conclusion'/);
+  assert.match(renderer, /renderRepositoryOverview\(\)/);
+  assert.match(renderer, /renderTaskPreparation\(\)/);
+  assert.match(renderer, /class="issue-inspector"/);
   const navigation = controller.slice(controller.indexOf('  function renderNavigator()'), controller.indexOf('  function renderTop()'));
   assert.match(navigation, /data-tab="files"/);
   assert.match(navigation, /data-tab="findings"/);
@@ -156,11 +158,13 @@ test('需求与比较基线都不能改写同一个头提交的代码', () => {
   assert.equal(text(withRequirements, 'restore'), original);
 });
 
-test('不提供关注点或额外对比分支选项，需求与意见通过现有弹窗按需查看', () => {
+test('任务绑定Repo，分支提供明确比较基线与全量选项，需求与意见按需查看', () => {
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
   assert.doesNotMatch(controller, /changeReviewFocus|review-focus|reviewFocuses|optional-focus/);
   const controls = controller.slice(controller.indexOf('  function renderScopeSelection()'), controller.indexOf('  function understandingExtras('));
-  assert.doesNotMatch(controls, /id="scope-base"|id="scope-mode"/);
+  assert.match(controls, /id="scope-base"/);
+  assert.match(controls, /id="scope-mode"/);
+  assert.doesNotMatch(controls, /id="scope-repository"/);
   assert.match(controller, /function openRequirements\(\)/);
   assert.match(controller, /function openOpinion\(\)/);
   assert.match(controller, /modalRenderer = renderer/);
@@ -231,6 +235,7 @@ test('应用示例补丁先使判断过期，预设复审后才可处理，撤�
   assert.equal(state.findings.find((finding) => finding.id === 'F-02').resolved, false);
   assert.equal(approvalGate(state).eligible, false);
   assert.ok(sourceFiles(state).restore.lines.some((line) => line.text.includes('reserveForOrder')));
+  recordFixValidation(state, 'F-02', true);
   completeReview(state);
   assert.equal(state.stale, false);
   assert.equal(approvalGate(state).eligible, true);
@@ -289,9 +294,12 @@ test('完整路径需处理需求、契约、实现，最后人工确认', () =>
   assert.equal(demo.approvalGate(state).eligible, false);
   applySampleFix(state, 'F-01');
   assert.equal(demo.approvalGate(state).eligible, false);
+  recordFixValidation(state, 'F-01', true);
   completeReview(state);
   applySampleFix(state, 'F-02');
   assert.equal(demo.approvalGate(state).eligible, false);
+  recordFixValidation(state, 'F-01', true);
+  recordFixValidation(state, 'F-02', true);
   completeReview(state);
   assert.equal(demo.approvalGate(state).eligible, true);
   assert.throws(() => demo.submitVerdict(state, 'approve'), /人工确认/);
@@ -334,6 +342,7 @@ test('颜色区分已排除、人工已处理、确认缺陷和必要前提，�
   applySampleFix(state, 'F-02');
   assert.deepEqual(statusLabel(state.findings.find((item) => item.id === 'F-02')), ['已应用 · 待复审', 'amber']);
   assert.equal(state.findings.find((item) => item.id === 'F-02').resolved, false);
+  recordFixValidation(state, 'F-02', true);
   completeReview(state);
   assert.deepEqual(statusLabel(state.findings.find((item) => item.id === 'F-02')), ['示例已处理', 'blue']);
   assert.equal(state.findings.find((item) => item.id === 'F-02').disposition, 'demo-rechecked');
@@ -981,7 +990,7 @@ test('源码沿用14px等宽字号与行高，响应式规则不再压小主工�
 });
 
 test('窄屏导航允许整体滚动，不因较大字号把文件列表压成不可操作区域', () => {
-  const mobile = stylesheet.slice(stylesheet.lastIndexOf('@media (max-width: 620px)'));
+  const mobile = stylesheet.slice(stylesheet.indexOf('@media (max-width: 620px)'));
   assert.match(mobile, /\.problem-list\s*\{[^}]*overflow:\s*auto;/);
   assert.match(mobile, /\.code-linked \.problem-list \.navigator-scroll\s*\{[^}]*flex:\s*none;[^}]*overflow:\s*visible;/);
 });
