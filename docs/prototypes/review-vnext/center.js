@@ -9,7 +9,7 @@
   if (!feedback) throw new Error('PR 反馈模块未加载');
 
   const scenarioLabels = {
-    standard: '关键问题未闭合', fresh: '从需求确认开始', technical: '无需求的技术审查',
+    standard: '关键问题未闭合', fresh: '选择对象与可选需求', technical: '无需求的整仓 Bug 审查',
     partial: '证据受限、部分完成', ready: '已处理的独立示例',
   };
   const primaryFiles = { 'F-01': 'submit', 'F-02': 'restore', 'F-03': 'callback', 'F-04': 'service', 'F-05': 'status' };
@@ -23,11 +23,11 @@
   const verdictLabels = { approve: '通过', 'request-changes': '要求修改', comment: '仅评论' };
   const runLabels = { idle: '未开始', running: '模拟审查中', cancelled: '已取消', partial: '部分完成', completed: '预设流程完成' };
   const repositories = [
-    { id: 'checkout', name: 'demo/checkout-service', prs: [
+    { id: 'checkout', name: 'demo/checkout-service', defaultBranch: 'main', prs: [
       { id: '104', title: '支付超时与订单恢复', head: 'feat/payment-timeout', base: 'main' },
       { id: '105', title: '展示缓存与重试边界', head: 'feat/status-cache', base: 'main' },
     ] },
-    { id: 'sandbox', name: 'demo/checkout-sandbox', prs: [{ id: '207', title: '订单恢复验证', head: 'feat/payment-timeout', base: 'main' }], comparisons: { 'feat/payment-timeout|main': ['restore'] } },
+    { id: 'sandbox', name: 'demo/checkout-sandbox', defaultBranch: 'main', prs: [{ id: '207', title: '订单恢复验证', head: 'feat/payment-timeout', base: 'main' }], comparisons: { 'feat/payment-timeout|main': ['restore'] } },
   ];
   const branches = [
     { name: 'feat/payment-timeout', version: 'demo-head-v3' },
@@ -37,6 +37,7 @@
   ];
   const changedFiles = ['submit', 'callback', 'restore'];
   const snapshotFiles = [...changedFiles, 'cancel', 'status', 'service', 'job', 'api', 'gateway', 'decision', 'payments', 'orders'];
+  const repositoryFiles = { checkout: snapshotFiles, sandbox: ['restore', 'cancel', 'api', 'orders'] };
   const comparisons = {
     'feat/payment-timeout|main': changedFiles,
     'feat/payment-timeout|release/2026.10': ['submit', 'restore'],
@@ -45,6 +46,25 @@
     'feat/payment-timeout|feat/status-cache': [...changedFiles, 'status', 'job'],
     'main|release/2026.10': [],
   };
+  const gitStatusLabels = { M: '修改', A: '新增', D: '删除', R: '重命名' };
+
+  function comparisonChanges(repository, head, base) {
+    if (head.name === base.name) return [];
+    const direct = `${head.name}|${base.name}`, reverse = `${base.name}|${head.name}`;
+    const key = [direct, reverse].find((item) => Object.hasOwn(repository.comparisons ?? {}, item) || Object.hasOwn(comparisons, item));
+    if (!key) throw new Error('此演示比较尚未提供文件清单，不能声称没有变更');
+    return (repository.comparisons?.[key] ?? comparisons[key]).map((entry) => {
+      const change = typeof entry === 'string' ? { key: entry, status: 'M' } : { ...entry };
+      if (!change.key || !Object.hasOwn(gitStatusLabels, change.status)) throw new Error('演示文件的 Git 状态无效');
+      if (change.status === 'R' && (!change.previousPath || !change.path)) throw new Error('重命名必须保留原路径与新路径');
+      if (key === reverse) {
+        if (change.status === 'A') change.status = 'D';
+        else if (change.status === 'D') change.status = 'A';
+        else if (change.status === 'R') [change.path, change.previousPath] = [change.previousPath, change.path];
+      }
+      return change;
+    });
+  }
 
   function scopeForSelection(selection) {
     const repository = repositories.find((item) => item.id === selection.repository);
@@ -59,27 +79,41 @@
     if (!head || (mode === 'changes' && !base)) throw new Error('所选分支或比较基线不存在');
     if (!Number.isInteger(selection.snapshot) || selection.snapshot < 1) throw new Error('代码快照版本无效');
     const errors = base?.name === head.name ? ['比较基线不能与被审查分支相同。'] : [];
-    let files = [...snapshotFiles];
+    const files = [...repositoryFiles[repository.id]];
+    let comparedFiles = [];
     if (mode === 'changes') {
-      files = [];
       if (!errors.length) {
-        const comparison = [`${head.name}|${base.name}`, `${base.name}|${head.name}`].find((key) => Object.hasOwn(comparisons, key));
-        if (!comparison) throw new Error('此演示比较尚未提供文件清单，不能声称没有变更');
-        files = [...(repository.comparisons?.[comparison] || comparisons[comparison])];
+        comparedFiles = comparisonChanges(repository, head, base).map((change) => change.key);
       }
-      if (!files.length && !errors.length) errors.push('演示比较中没有变更文件，可选择其他比较范围或分支全量代码。');
     }
-    const label = pr ? `PR ${pr.id} · ${pr.title}` : `${head.name} · ${mode === 'full' ? '全量代码' : `相对 ${base.name} 的变更`}`;
+    const label = pr ? `PR ${pr.id} · ${pr.title} · 整仓快照` : `${head.name} · 整仓快照`;
     return {
-      repository, pr, head, base, mode, files, errors, label,
-      reason: pr ? `PR ${pr.id} 的变更文件` : mode === 'full' ? '所选分支的全量演示文件清单' : `分支相对 ${base.name} 的变更文件`,
+      repository, pr, head, base, mode, files, changedFiles: comparedFiles, errors, label,
+      reason: '所选分支 / PR 头提交的完整仓库文件；比较基线只标记变更，不缩小审查范围',
       key: JSON.stringify([repository.id, selection.kind, pr?.id, head.version, base?.version, mode, selection.snapshot]),
-      supportsFindings: repository.id === 'checkout' && head.name === 'feat/payment-timeout' && base?.name === 'main' && selection.snapshot === 1,
+      supportsFindings: repository.id === 'checkout' && head.name === 'feat/payment-timeout' && selection.snapshot === 1,
     };
   }
 
   function scopeState(state) {
     return scopeForSelection(state.scopeReview.selection);
+  }
+
+  function fileNavigation(state) {
+    const scope = scopeState(state);
+    const base = scope.pr ? scope.base : branches.find((branch) => branch.name === scope.repository.defaultBranch);
+    if (!base) throw new Error('仓库默认分支不存在，不能标注文件状态');
+    const changes = comparisonChanges(scope.repository, scope.head, base);
+    const files = sourceFiles(state), byKey = new Map(changes.map((change) => [change.key, change]));
+    const keys = scope.pr ? changes.map((change) => change.key) : [...new Set([...scope.files, ...changes.filter((change) => change.status === 'D').map((change) => change.key)])];
+    return {
+      base, changes, label: scope.pr ? 'Changes' : '文件',
+      rows: keys.map((key) => {
+        const file = files[key], change = byKey.get(key);
+        if (!file) throw new Error('文件状态对应的演示源码不存在');
+        return { key, kind: file.kind, path: change?.path ?? file.path, previousPath: change?.previousPath, status: change?.status ?? '' };
+      }),
+    };
   }
 
   function coverageLimits(state) {
@@ -132,7 +166,7 @@
     state.completedStages = 0;
     state.pending = {};
     const linkedFeedbackPr = !previous.pr && selection.kind === 'branch' && previous.repository.id === next.repository.id && previous.head.name === next.head.name ? state.center.linkedFeedbackPr : null;
-    Object.assign(state.center, { stage: 'prepare', file: next.files[0], patches: {}, fixSnapshots: {}, stageIndex: 0, requirementEdit: null, feedbackId: null, feedbackReadSource: false, linkedFeedbackPr });
+    Object.assign(state.center, { stage: 'prepare', settingsOpen: true, sourceOpen: false, opinionOpen: false, navigator: 'files', targetLine: null, file: next.files[0], patches: {}, fixSnapshots: {}, stageIndex: 0, requirementEdit: null, feedbackId: null, feedbackReadSource: false, linkedFeedbackPr });
     state.baselineConfirmed = false;
     state.baselineDirty = true;
     sources.organize(state);
@@ -168,6 +202,28 @@
 
   function currentFinding(state) {
     return state.findings.find((finding) => finding.id === state.selectedFinding);
+  }
+
+  function problemGroups(state) {
+    const findings = state.hasResults ? state.findings : [];
+    const closed = (finding) => finding.resolved || finding.status === 'dismissed' || finding.type === 'reasonable';
+    return { open: findings.filter((finding) => !closed(finding)), closed: findings.filter(closed) };
+  }
+
+  function findingLocation(state, id = state.selectedFinding) {
+    const finding = state.findings.find((item) => item.id === id);
+    if (!finding) throw new Error('当前快照没有这个问题');
+    const key = primaryFiles[id], file = sourceFiles(state)[key];
+    if (!file || !scopeState(state).files.includes(key)) throw new Error('问题对应文件不在当前仓库快照');
+    return { file: key, path: file.path, line: file.lines?.find((line) => line.highlighted)?.number ?? Number(file.highlight) };
+  }
+
+  function selectFile(state, key) {
+    const allowed = scopeState(state).files.includes(key) || fileNavigation(state).rows.some((row) => row.key === key) || sources.selectedSources(state).some((source) => source.id === key);
+    const file = sourceFiles(state)[key];
+    if (!allowed || !file) throw new Error('这个文件不属于当前仓库快照或已选材料');
+    state.center.file = key;
+    state.center.targetLine = file.lines?.find((line) => line.highlighted)?.number ?? Number(file.highlight);
   }
 
   function currentChain(state) {
@@ -252,6 +308,7 @@
       preset: preset && id === 'RQ-02', preview: false,
     };
     state.center.stage = 'prepare';
+    state.center.settingsOpen = true;
     return state.center.requirementEdit;
   }
 
@@ -271,7 +328,10 @@
     state.selectedFinding = 'F-02';
     state.center = {
       stage: scenario === 'fresh' ? 'prepare' : scenario === 'ready' ? 'conclusion' : 'review',
-      navigator: 'business', search: '', inspector: 'judgment', file: 'restore', codeView: 'diff',
+      navigator: scenario === 'fresh' ? 'files' : 'findings', search: '', inspector: 'judgment', file: scenario === 'fresh' ? 'submit' : 'restore', codeView: 'diff',
+      targetLine: null,
+      settingsOpen: scenario === 'fresh', opinionOpen: scenario === 'ready', sourceOpen: false, contextExpanded: true,
+      closedOpen: false, evidenceOpen: false, basisOpen: false, historyOpen: false,
       focus: false, patches: {}, fixSnapshots: {}, stageIndex: 0, requirementEdit: null,
       findingMode: state.mode, patchRevision: 0, feedbackId: null, feedbackReadSource: false, feedbackFilter: 'open', linkedFeedbackPr: null,
     };
@@ -321,8 +381,14 @@
     state.center.file = primaryFiles[id];
     state.center.stage = 'review';
     state.center.feedbackId = null;
-    if (state.center.navigator === 'feedback') state.center.navigator = 'findings';
+    if (state.center.navigator !== 'findings') state.center.search = '';
+    state.center.navigator = 'findings';
     state.center.inspector = 'judgment';
+    state.center.sourceOpen = false;
+    state.center.evidenceOpen = false;
+    state.center.basisOpen = false;
+    state.center.historyOpen = false;
+    state.center.targetLine = findingLocation(state, id).line;
   }
 
   function switchMode(state, mode) {
@@ -338,7 +404,7 @@
     state.mode = mode;
     state.stale = state.hasResults;
     invalidate(state);
-    state.history.push(`切换为${mode === 'technical' ? '有限技术审查' : '需求驱动审查'}；已知且仍相关的关键问题不会消失。`);
+    state.history.push(`切换为${mode === 'technical' ? '整仓 Bug 审查（无需求）' : '整仓 Bug 与需求一致性审查'}；审查范围不缩小，已知关键问题不会消失。`);
   }
 
   function completeReview(state) {
@@ -391,7 +457,16 @@
         counter: [{ title: '能否推广到任意支付通道？', text: '不能。这是当前示例契约的适用条件，不代表其他通道或新版本也满足。' }],
       });
     }
+    for (const id of Object.keys(state.center.patches)) {
+      const finding = state.findings.find((item) => item.id === id);
+      if (!finding || finding.type !== 'implementation') continue;
+      Object.assign(finding, { resolved: true, status: 'resolved', disposition: 'demo-rechecked' });
+      const requirement = state.requirements.find((item) => item.id === finding.requirement);
+      if (requirement) requirement.check = 'supported';
+      state.history.push(`${id} 已走过预设复审分支；仅是状态演示，没有执行真实测试。`);
+    }
     state.scopeReview.lastRunKey = scope.key;
+    if (state.selectedFinding) selectFinding(state, state.selectedFinding);
     if (state.center.findingMode !== state.mode || sources.selectedSources(state).some(sources.needsAnalysis)) state.sourceReview.limited = true;
     if (state.sourceReview.limited) {
       state.runStatus = 'partial';
@@ -468,15 +543,19 @@
     const finding = state.findings.find((item) => item.id === id);
     if (!finding || finding.type !== 'implementation') throw new Error('只能对已澄清的实现问题展示示例修复');
     if (state.center.patches[id]) throw new Error('这份示例修复已经应用');
+    if (!state.hasResults || state.stale || state.runStatus === 'running') throw new Error('请先完成当前快照的有效审查，再应用示例修复');
     state.center.fixSnapshots[id] = {
       finding: JSON.parse(JSON.stringify(finding)),
       check: state.requirements.find((item) => item.id === finding.requirement)?.check,
     };
-    demo.markFixed(state, id, '人工接受预设修复，修改的只是浏览器内虚构代码；没有执行测试。');
+    finding.disposition = 'patch-applied';
+    finding.resolved = false;
+    state.stale = true;
+    invalidate(state);
     state.center.patches[id] = true;
     state.center.patchRevision += 1;
     state.center.file = primaryFiles[id];
-    state.history.push(`${id} 仅应用示例补丁，可撤销；未修改真实源码。`);
+    state.history.push(`${id} 仅应用示例补丁，结果过期、等待复审；未修改真实源码或执行验证。`);
   }
 
   function undoSampleFix(state, id) {
@@ -490,6 +569,7 @@
     delete state.center.fixSnapshots[id];
     delete state.center.patches[id];
     state.center.patchRevision += 1;
+    state.stale = state.hasResults;
     invalidate(state);
     state.history.push(`${id} 已撤销本次示例修复；原问题恢复，旧结论失效。`);
   }
@@ -505,13 +585,9 @@
     const restored = !!state.center.patches['F-02'];
     const technical = state.center.findingMode === 'technical';
     const timeoutFixed = !!state.center.patches['F-01'];
-    const restoreBody = technical
-      ? restored
-        ? ['  const reservation = await inventory.reserveForOrder(order);', '  await order.restore();', '  return { reservationId: reservation.id };']
-        : ['  await order.restore();', '  const reservation = await inventory.findByOrder(order.id);', '  return { reservationId: reservation.id };']
-      : restored
-        ? ['  await inventory.reserveForOrder(order);', '  await order.restore();', '  return { status: "awaiting_payment" };']
-        : ['  await order.restore();', '  return { status: "awaiting_payment" };'];
+    const restoreBody = restored
+      ? ['  const reservation = await inventory.reserveForOrder(order);', '  await order.restore();', '  return { reservationId: reservation.id };']
+      : ['  await order.restore();', '  const reservation = await inventory.findByOrder(order.id);', '  return { reservationId: reservation.id };'];
     const restore = code('restore', 'src/orders/restore.ts', 16, [
       'import { permissions } from "../auth/permissions";',
       'import { inventory } from "../inventory/reservations";',
@@ -653,6 +729,7 @@
   function summaryText(state, verdict = state.verdict) {
     const gate = approvalGate(state);
     const scope = scopeState(state);
+    const navigation = fileNavigation(state);
     const understanding = understandingChecks(state.requirements, state.hasResults && !state.stale ? state.findings : []);
     const sourceSummary = (sources.selectedSources(state).map((source) => `- [${sources.kindLabels[source.kind]} / ${sources.purposeLabels[source.purpose]}] ${source.location} · 原文 v${source.version}`).join('\n') || '未提供需求来源。') + (state.sourceReview.excluded.length ? `\n排除记录：\n${state.sourceReview.excluded.map((item) => `- ${item.id}：${item.reason}`).join('\n')}` : '');
     const origins = state.requirements.map((item) => `- ${item.id}${state.baselineConfirmed && state.mode === 'requirements' ? '' : '（非本次已确认需求）'}：${item.origins?.map((origin) => `${sources.labelOrigin(state, origin)} [${sources.originStatus(state, origin)}]`).join('；') || '缺少原文引用'}${item.manualRevision ? '；人工修订与原文分别保存' : ''}`).join('\n');
@@ -660,9 +737,9 @@
     return [
       `Review vNext · 审查中心原型 · ${verdictLabels[verdict]}`, '',
       `Repository：${scope.repository.name}`,
-      `范围：${scope.label}；${scope.files.length} 个审查文件及按需关联核查。`,
-      `代码快照：${scope.head.version}${scope.base ? ` / 比较基线 ${scope.base.name} (${scope.base.version})` : ' / 全量快照，不以 Diff 定义范围'}；演示快照 ${state.scopeReview.selection.snapshot}。`,
-      `需求：${state.mode === 'technical' ? '有限技术审查，需求一致性未评审；不代表业务需求已满足。' : `基线 v${state.baselineVersion}，${state.baselineConfirmed ? '已人工确认理解' : '待确认'}。确认不等于需求正确或其假设已证实。`}`,
+      `范围：${scope.label}；整仓 ${scope.files.length} 个文件；${navigation.changes.length} 个变更文件只用于定位和归因。`,
+      `代码快照：${scope.head.version} / 文件状态基线 ${navigation.base.name} (${navigation.base.version})；全量快照，不以 Diff 定义范围；演示快照 ${state.scopeReview.selection.snapshot}。`,
+      `需求：${state.mode === 'technical' ? '无需求，整仓综合 Bug 审查；需求一致性未评审，不代表业务需求已满足。' : `基线 v${state.baselineVersion}，${state.baselineConfirmed ? '已人工确认理解' : '待确认'}。同时整仓查 Bug；需求仅约束适用业务链，不缩小代码范围。`}`,
       `执行：${runLabels[state.runStatus]}${state.stale ? '；依据已变化，旧结果待重审。' : '。'}`, '',
       '本次材料：', sourceSummary, '',
       '需求出处：', origins || '无已确认需求。', '',
@@ -680,6 +757,7 @@
   }
 
   function statusLabel(finding) {
+    if (finding.disposition === 'patch-applied') return ['已应用 · 待复审', 'amber'];
     if (finding.status === 'dismissed') return ['已排除', 'green'];
     if (finding.resolved) return ['示例已处理', 'blue'];
     if (finding.status === 'unresolved') return ['尚未确认', 'amber'];
@@ -992,7 +1070,7 @@
   }
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { createCenterState, currentFinding, currentChain, switchMode, selectFinding, completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, approvalGate, confirmBaseline, submitVerdict, statusLabel, preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, repositories, branches, scopeState, changeScope, coverageLimits, understandingChecks, beginRequirementEdit, saveRequirementEdit, conclusionState, requestApproval, confirmApproval, updateNotes, linkFeedbackPr, selectFeedback, importFeedbackRequirement, syncFeedbackContext };
+    module.exports = { createCenterState, currentFinding, currentChain, problemGroups, findingLocation, selectFile, fileNavigation, comparisonChanges, gitStatusLabels, switchMode, selectFinding, completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, approvalGate, confirmBaseline, submitVerdict, statusLabel, preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, repositories, branches, scopeState, changeScope, coverageLimits, understandingChecks, beginRequirementEdit, saveRequirementEdit, conclusionState, requestApproval, confirmApproval, updateNotes, linkFeedbackPr, selectFeedback, importFeedbackRequirement, syncFeedbackContext };
     return;
   }
 
@@ -1079,8 +1157,6 @@
   }
 
   const main = document.getElementById('review-main');
-  const navigator = document.getElementById('review-navigator');
-  const inspector = document.getElementById('review-inspector');
   const modal = document.getElementById('center-modal');
   const toast = document.getElementById('center-toast');
   const runStages = ['建立相关业务链', '检查需求与实现', '寻找反证与保障', '形成有边界的结论'];
@@ -1089,6 +1165,8 @@
   let fileReadGeneration = 0;
   let toastTimer;
   let pendingApproval = null;
+  let pendingFix = null;
+  let modalRenderer = null;
 
   function notify(message, warning = false) {
     clearTimeout(toastTimer);
@@ -1112,42 +1190,35 @@
     return `<button class="issue-nav ${finding.id === state.selectedFinding ? 'active' : ''}" data-action="finding" data-id="${finding.id}" aria-pressed="${finding.id === state.selectedFinding}"><span class="issue-dot ${tone}"></span><span><strong>${escape(finding.title)}</strong><small>${finding.id} · ${typeLabels[finding.type]}${finding.resolved ? ' · 已处理/排除' : finding.critical ? ' · 关键' : ''}</small></span></button>`;
   }
 
+  function renderContextControls() {
+    const preparation = preparationState(state), running = state.runStatus === 'running';
+    const scope = scopeState(state);
+    const summary = `${scope.repository.name} · ${scope.pr ? `PR ${scope.pr.id}` : scope.head.name}`;
+    const status = running ? runStages[Math.min(state.center.stageIndex, 3)] : state.stale ? '判断已过期，请重新审查' : state.runStatus === 'partial' ? '结果受限' : runLabels[state.runStatus];
+    return `<details id="context-bar" class="context-bar" aria-label="审查对象与需求" ${state.center.contextExpanded ? 'open' : ''}><summary class="context-toggle" title="点击展开或收起审查对象：${escape(summary)}">${icon('chevron')}<span>${escape(summary)}</span></summary><div class="context-controls">${renderScopeSelection()}<button class="button" data-action="requirements">${state.center.requirementEdit ? '需求 · 修订未保存' : preparation.requirements.length ? `需求 ${preparation.requirements.length}${preparation.needsConfirmation ? ' · 待确认' : ''}` : '需求（可选）'}</button><span id="review-status" class="${state.stale ? 'status-warning' : ''}" role="status" title="${escape([...coverageLimits(state), ...preparation.reasons].join('；'))}">${escape(status)}</span></div></details>`;
+  }
+
   function renderNavigator() {
-    const activeChain = currentChain(state);
     const search = state.center.search.toLowerCase();
-    const findings = getFindings().filter((finding) => `${finding.title} ${finding.source} ${finding.id}`.toLowerCase().includes(search));
-    const sources = sourceFiles(state);
-    let content;
-    if (state.center.navigator === 'feedback') {
-      content = renderFeedbackList();
-    } else if (state.center.navigator === 'files') {
-      const scope = scopeState(state);
-      const matches = (file) => `${file.path} ${file.name}`.toLowerCase().includes(search);
-      const primary = new Set(scope.files);
-      const row = (file) => `<button class="file-nav ${state.center.file === file.key ? 'active' : ''}" data-action="source" data-source="${file.key}" title="${escape(file.path)} · ${primary.has(file.key) ? escape(scope.reason) : '关联材料，按需核查'}">${icon(file.kind === 'code' ? 'code' : 'file')}<span>${escape(file.path)}</span><small class="file-role">${primary.has(file.key) ? scope.mode === 'changes' ? '变更' : '快照' : '参考'}</small></button>`;
-      content = `<div class="nav-group-title">本次审查 · ${scope.files.length} 个文件</div>${scope.files.map((key) => sources[key]).filter(matches).map(row).join('') || '<div class="small-copy">没有匹配的审查文件。</div>'}<div class="nav-group-title">关联材料 · 按需核查</div>${Object.values(sources).filter((file) => !primary.has(file.key) && matches(file)).map(row).join('') || '<div class="small-copy">没有匹配的关联材料。</div>'}<p class="form-hint">关联材料的读取不计作整文件审查完成。</p>`;
-    } else if (state.center.navigator === 'findings') {
-      content = `<div class="nav-group-title">待判断与确认缺陷 <span>${findings.filter((finding) => finding.type !== 'reasonable').length}</span></div>${findings.filter((finding) => finding.type !== 'reasonable').map(issueNav).join('') || '<div class="small-copy">没有匹配的有效结果。</div>'}<div class="nav-group-title" style="margin-top:18px">已排除的局部疑点</div>${findings.filter((finding) => finding.type === 'reasonable').map(issueNav).join('')}`;
-    } else {
-      content = `<div class="nav-group-title">围绕行为，而非文件 <span>${chains.filter((chain) => state.findings.some((finding) => chain.findings.includes(finding.id))).length} 条链路</span></div>${chains.map((chain) => {
-        const members = findings.filter((finding) => chain.findings.includes(finding.id));
-        if (search && !members.length && !chain.title.includes(search)) return '';
-        const unresolved = members.filter((finding) => !finding.resolved).length;
-        const defaultFinding = chain.findings.find((id) => state.findings.some((finding) => finding.id === id));
-        if (!defaultFinding) return '';
-        return `<button class="chain-card ${activeChain.id === chain.id ? 'active' : ''}" data-action="finding" data-id="${defaultFinding}" aria-pressed="${activeChain.id === chain.id}"><div class="chain-card-top">${icon('flow')}<span>${chain.title}</span>${badge(state.hasResults ? `${unresolved || members.length}` : '—', unresolved ? 'amber' : members.length && members.every((finding) => finding.status === 'dismissed') ? 'green' : '')}</div><p>${chain.description}</p></button>${activeChain.id === chain.id && state.hasResults ? `<div class="chain-members">${members.map(issueNav).join('')}</div>` : ''}`;
-      }).join('')}`;
-    }
-    return `<div class="navigator-heading"><span>审查导航</span><span class="muted">工作区</span></div><div class="nav-segments has-feedback" role="tablist" aria-label="导航方式">${[['business', '业务', 'flow'], ['findings', '发现', 'bug'], ['feedback', 'PR 反馈', 'message'], ['files', '文件', 'file']].map(([id, label, symbol]) => `<button class="nav-segment ${state.center.navigator === id ? 'active' : ''}" role="tab" aria-selected="${state.center.navigator === id}" data-action="navigator" data-tab="${id}">${icon(symbol)}${label}</button>`).join('')}</div><div class="navigator-search">${icon('search')}<input id="center-search" type="search" placeholder="搜索业务、问题或文件" aria-label="搜索导航内容" value="${escape(state.center.search)}"></div><div class="navigator-scroll ${state.center.navigator === 'business' ? 'business-nav' : ''}">${content}</div><div class="navigator-footer"><button class="baseline-link" data-action="stage" data-stage="prepare">${icon('file')}<div><strong>${state.mode === 'technical' ? '有限技术审查' : `需求基线 v${state.baselineVersion}`}</strong><small>${state.mode === 'technical' ? '需求一致性未评审' : `${state.requirements.length} 条需求 · ${state.baselineConfirmed ? '已确认' : '待人工确认'}`}</small></div>${icon('chevron')}</button>${feedbackScopeLink()}</div>`;
+    const groups = problemGroups(state);
+    const matches = (finding) => `${finding.title} ${finding.source} ${finding.id}`.toLowerCase().includes(search);
+    const navigation = fileNavigation(state), fileView = state.center.navigator === 'files';
+    const fileList = navigation.rows.filter((file) => `${file.path} ${file.previousPath ?? ''}`.toLowerCase().includes(search)).map((file) => {
+      const path = file.previousPath ? `${file.previousPath} → ${file.path}` : file.path;
+      const status = file.status ? `${gitStatusLabels[file.status]} · 相对 ${navigation.base.name}` : `未变化 · 相对 ${navigation.base.name}`;
+      return `<button class="file-nav ${state.center.file === file.key ? 'active' : ''}" data-action="source" data-source="${file.key}" aria-pressed="${state.center.file === file.key}" title="${escape(path)} · ${escape(status)}">${icon(file.kind === 'code' ? 'code' : 'file')}<span>${escape(path)}</span>${file.status ? `<small class="file-role git-status git-${file.status.toLowerCase()}" aria-label="${escape(status)}">${file.status}</small>` : ''}</button>`;
+    }).join('');
+    return `${renderContextControls()}<div class="navigator-heading"><h2>审查导航</h2></div>
+      <div class="nav-segments" role="tablist" aria-label="问题与文件"><button class="nav-segment ${!fileView ? 'active' : ''}" role="tab" aria-selected="${!fileView}" data-action="navigator" data-tab="findings">问题 ${groups.open.length}</button><button class="nav-segment ${fileView ? 'active' : ''}" role="tab" aria-selected="${fileView}" data-action="navigator" data-tab="files" title="状态相对 ${escape(navigation.base.name)}">${navigation.label} ${navigation.rows.length}</button></div>
+      <div class="navigator-search">${icon('search')}<input id="center-search" type="search" placeholder="${fileView ? `搜索${navigation.label === 'Changes' ? '变更文件' : '仓库文件'}` : '搜索问题'}" aria-label="搜索导航" value="${escape(state.center.search)}"></div>
+      <div class="navigator-scroll">${fileView ? fileList || '<p class="small-copy">没有匹配的仓库文件。</p>' : groups.open.filter(matches).map(issueNav).join('') || `<p class="small-copy">${search ? '没有匹配的问题。' : state.hasResults ? '本次没有待处理问题。' : '尚未开始审查，可以先浏览代码。'}</p>`}
+      ${!fileView && groups.closed.length ? `<details id="closed-problems" ${state.center.closedOpen ? 'open' : ''}><summary>已处理 / 排除 · ${groups.closed.length}</summary>${groups.closed.filter(matches).map(issueNav).join('')}</details>` : ''}</div>`;
   }
 
   function renderTop() {
-    const gate = approvalGate(state);
-    const scope = scopeState(state);
-    const preparing = state.center.stage === 'prepare';
-    document.getElementById('stage-navigation').innerHTML = stages.map(([id, label], index) => `${index ? '<span class="stage-divider" aria-hidden="true"></span>' : ''}<button class="stage-button ${state.center.stage === id ? 'active' : ''}" data-action="stage" data-stage="${id}" ${state.center.stage === id ? 'aria-current="step"' : ''}><span class="stage-index">${index === 0 && state.baselineConfirmed ? icon('check') : index + 1}</span>${label}</button>`).join('');
+    const preparation = preparationState(state);
     document.getElementById('product-mark').innerHTML = icon('shield');
-    document.getElementById('repository-context').textContent = `${scope.repository.name} · 演示 Repository`;
+    document.getElementById('repository-context').textContent = '离线演示 · 未连接模型与真实仓库';
     document.querySelector('.command-actions [data-action="help"]').innerHTML = icon('info');
     const dark = document.documentElement.dataset.theme === 'dark';
     document.getElementById('center-theme').innerHTML = icon(dark ? 'sun' : 'moon');
@@ -1163,21 +1234,18 @@
     sourcePicker.innerHTML = state.sources.map((item) => `<option value="${escape(item.id)}" ${item.id === selectedSource ? 'selected' : ''}>${escape(item.name)} · v${item.version}</option>`).join('');
     sourcePicker.disabled = toolsDisabled;
     const run = document.getElementById('run-review');
-    run.hidden = preparing;
-    run.disabled = running;
-    run.innerHTML = `${icon(running ? 'refresh' : 'play', running ? 'spin' : '')}${running ? '模拟审查中' : ['partial', 'cancelled'].includes(state.runStatus) && !state.stale ? '继续审查' : state.runStatus === 'idle' ? '开始审查' : '重新审查'}`;
-    const scopeSummary = `${scope.pr ? `PR ${scope.pr.id}` : scope.head.name} · ${scope.files.length} 个${scope.mode === 'changes' ? '变更' : '审查'}文件 · ${scope.base ? `对比 ${scope.base.name}` : '全量快照'}`;
-    const snapshot = `代码 ${scope.head.version}${scope.base ? ` · 基线 ${scope.base.name} (${scope.base.version})` : ' · 全量快照，无比较基线'} · 演示快照 ${state.scopeReview.selection.snapshot}`;
-    const conclusionLabel = gate.eligible ? state.submission ? `已记录${verdictLabels[state.submission.verdict]}` : '待人工结论' : gate.critical.length ? `${gate.critical.length} 项关键阻断` : '查看结论边界';
-    document.getElementById('context-bar').innerHTML = `<div class="context-left"><span class="context-scope" title="${escape(snapshot)}">${icon('branch')}<span>${escape(scopeSummary)}</span></span>${badge(state.mode === 'technical' ? '需求未评审' : `需求 v${state.baselineVersion} · ${state.baselineConfirmed ? '已确认理解' : '待确认'}`, 'blue')}${state.stale ? badge('依据已变 · 待重审', 'amber') : ''}</div><div class="context-right"><span>${icon('check')}${runLabels[state.runStatus]}</span><button class="text-button ${gate.eligible ? 'ready' : ''}" data-action="stage" data-stage="conclusion">${icon(gate.eligible ? 'shield' : 'lock')}${conclusionLabel} ${icon('arrow')}</button></div>`;
-    document.querySelector('.review-shell').classList.toggle('focus-layout', state.center.focus && state.center.stage === 'review');
-    document.querySelector('.review-shell').classList.toggle('prepare-layout', preparing);
+    run.hidden = false;
+    run.dataset.action = running ? 'cancel' : 'prepare-start';
+    run.disabled = !running && !preparation.canStart;
+    run.title = preparation.canStart ? '' : preparation.reasons.join('；');
+    run.innerHTML = `${icon(running ? 'close' : 'play')}${running ? '取消审查' : preparation.needsConfirmation ? preparation.label : ['partial', 'cancelled'].includes(state.runStatus) && !state.stale ? '继续审查' : state.runStatus === 'idle' ? '开始审查' : '重新审查'}`;
+    document.getElementById('review-opinion-toggle').hidden = !state.hasResults;
   }
 
   function progressStrip() {
     let progress = '';
-    if (state.runStatus === 'running') progress = `<div class="progress-strip" aria-live="polite">${icon('refresh', 'spin')}<strong>模拟步骤 ${Math.min(state.center.stageIndex + 1, 4)} / 4</strong><span>${runStages[Math.min(state.center.stageIndex, 3)]}</span><button class="text-button" data-action="cancel">取消</button></div>`;
-    else if (state.runStatus === 'cancelled') progress = `<div class="progress-strip">${icon('info')}审查已取消，保留此前有效结果；可使用顶部按钮继续审查。</div>`;
+    if (state.runStatus === 'running') progress = `<div class="progress-strip" aria-live="polite">${icon('refresh', 'spin')}<strong>模拟步骤 ${Math.min(state.center.stageIndex + 1, 4)} / 4</strong><span>${runStages[Math.min(state.center.stageIndex, 3)]}</span></div>`;
+    else if (state.runStatus === 'cancelled') progress = `<div class="progress-strip">${icon('info')}${state.hasResults ? '审查已取消，保留此前有效结果。' : '审查已取消，本次尚未形成有效结果。'}可使用顶部按钮继续审查。</div>`;
     else if (state.stale) progress = `<div class="progress-strip">${icon('refresh')}依据已变化，旧结果不可直接用于结论。${state.mode === 'requirements' && !state.baselineConfirmed ? '<button class="text-button" data-action="stage" data-stage="prepare">重新确认需求</button>' : '请使用顶部按钮重新审查。'}</div>`;
     const limits = coverageLimits(state);
     const coverage = limits.length ? `<div class="progress-strip coverage-limits" role="status">${icon('alert')}${state.center.stage === 'conclusion' ? `<span>${limits.length} 项覆盖限制，详情见下方待提交内容。</span>` : `<div><strong>审查覆盖受限</strong><ul>${limits.map((limit) => `<li>${escape(limit)}</li>`).join('')}</ul></div>`}</div>` : '';
@@ -1206,17 +1274,21 @@
     if (!file) throw new Error('找不到当前示例文件');
     const item = currentFeedback();
     const finding = item ? null : currentFinding(state);
-    const source = state.center.codeView === 'source';
+    const scope = scopeState(state);
+    const navigation = fileNavigation(state), change = navigation.changes.find((entry) => entry.key === file.key);
+    const path = change?.path ?? file.path;
+    const diffAvailable = file.kind === 'code' && !!change;
+    const source = state.center.codeView === 'source' || !diffAvailable;
     let body;
     if (file.kind === 'document') {
-      body = `<article class="document-copy"><p class="doc-kicker">${escape(file.sourceInfo || '需求 / 契约证据')} · ${file.userProvided ? '用户提供的原文快照' : '演示原文'}</p><h2>${escape(file.title)}</h2>${typeof file.markdownText === 'string' ? markdownReader(file.markdownText) : file.paragraphs.map(([line, text]) => `<div class="doc-paragraph ${line === file.highlight ? 'highlighted' : ''}"><span class="mono">L${line}</span><p>${escape(text)}</p></div>`).join('')}</article>`;
+      body = `<article class="document-copy"><p class="doc-kicker">${escape(file.sourceInfo || '需求 / 契约证据')} · ${file.userProvided ? '用户提供的原文快照' : '演示原文'}</p><h2>${escape(file.title)}</h2>${typeof file.markdownText === 'string' ? markdownReader(file.markdownText) : file.paragraphs.map(([line, text]) => `<div id="sample-doc-line-${line}" class="doc-paragraph ${line === file.highlight ? 'highlighted' : ''}"><span class="mono">L${line}</span><p>${escape(text)}</p></div>`).join('')}</article>`;
     } else {
-      const primary = !!finding && primaryFiles[state.selectedFinding] === file.key;
-      const lines = file.lines.map((line, index) => `<div class="code-line ${source ? 'source-view' : ''} ${!source && line.change ? line.change : ''} ${line.highlighted ? 'emphasized' : ''}" id="sample-line-${line.number}">${source ? '' : `<span class="line-no">${line.change ? '' : line.number}</span>`}<span class="line-no">${line.number}</span><span class="change">${source ? '' : line.change === 'added' ? '+' : line.change === 'removed' ? '−' : ''}</span><code>${syntax(line.text) || ' '}</code></div>${primary && index === Math.min(file.lines.length - 1, file.lines.findIndex((item) => item.highlighted) + 2) ? findingMarker(finding) : ''}`).join('');
-      body = `<div class="code-caption"><span>旧 / 新行号 · ${source ? '当前源码' : '行内 Diff'}</span><strong>演示片段 ${file.start}–${file.lines.at(-1).number} · 非完整文件</strong></div><div class="code-table">${lines}</div>`;
+      const displayedLines = file.lines.map((line) => ({ ...line, change: change?.status === 'A' ? 'added' : change?.status === 'D' ? 'removed' : line.change }));
+      const lines = displayedLines.map((line) => `<div class="code-line ${source ? 'source-view' : ''} ${!source && line.change ? line.change : ''} ${line.highlighted ? 'emphasized' : ''}" id="sample-line-${line.number}">${source ? '' : `<span class="line-no">${line.change === 'added' ? '' : line.number}</span>`}<span class="line-no">${!source && line.change === 'removed' ? '' : line.number}</span><span class="change">${source ? '' : line.change === 'added' ? '+' : line.change === 'removed' ? '−' : ''}</span><code>${syntax(line.text) || ' '}</code></div>`).join('');
+      body = `<div class="code-caption"><span>${change?.status === 'D' ? '删除前源码' : source ? '当前源码' : `行内 Diff · 相对 ${escape(navigation.base.name)}`}</span><strong>演示片段 ${file.start}–${file.lines.at(-1).number} · 非完整文件</strong></div><div class="code-table">${lines}</div>`;
     }
     const feedbackContext = item ? `<div class="feedback-location"><strong>${escape(item.id)} · ${escape(item.title)}</strong><span>${item.isOutdated ? '原位置 Outdated；当前代码只作对照，不会自动重定位。' : '阅读关联代码不会改变 Reply 目标。'}</span>${item.originalDiff ? `<button class="text-button" data-action="feedback-original" data-id="${item.id}">查看评论时的 Diff</button>` : ''}</div>` : '';
-    return `<h1 class="sr-only">源码与证据审查</h1><div class="editor-tools"><div class="editor-breadcrumb">${escape(scopeState(state).repository.name)} <span class="muted">/</span> <strong>${escape(file.path)}</strong></div><div class="editor-view-controls">${file.kind === 'code' ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge('需求 / 契约原文', 'blue')}<button class="icon-button focus-button" data-action="focus" aria-label="${state.center.focus ? '恢复业务导航' : '收起导航，专注代码'}" title="收起/恢复导航">${icon('focus')}</button></div></div>${feedbackContext}${progressStrip()}<div class="editor-scroll">${body}</div>`;
+    return `<div class="editor-tools"><div class="editor-breadcrumb" title="${escape(path)} · ${escape(scope.head.version)} · 只读演示${state.center.patchRevision ? ` · 浏览器补丁 ${state.center.patchRevision}` : ''}${scope.pr && !change ? ' · 关联文件，不在 PR Changes 内' : ''}"><strong>${escape(path)}</strong></div><div class="editor-view-controls">${diffAvailable ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge(file.kind === 'code' ? '源码' : '项目文档', 'blue')}${state.hasResults && finding ? '<button class="button small" data-action="finding-details">问题详情</button>' : ''}</div></div>${feedbackContext}<div class="editor-scroll">${body}</div>`;
   }
 
   function requirementOrigins(requirement) {
@@ -1255,15 +1327,13 @@
     const selection = state.scopeReview.selection;
     const disabled = state.runStatus === 'running' || state.center.requirementEdit ? 'disabled' : '';
     const branchOptions = (value, omit = '') => branches.map((branch) => `<option value="${escape(branch.name)}" ${branch.name === value ? 'selected' : ''} ${branch.name === omit ? 'disabled' : ''}>${escape(branch.name)}</option>`).join('');
-    return `<div class="scope-form">
+    return `<div class="scope-form compact-scope">
       <label class="scope-field" for="scope-repository"><span>Repository</span><select id="scope-repository" class="text-field" ${disabled}>${repositories.map((repository) => `<option value="${repository.id}" ${repository.id === selection.repository ? 'selected' : ''}>${repository.name}</option>`).join('')}</select></label>
       <fieldset class="scope-kind"><legend>审查对象</legend><div>${[['pr', 'PR'], ['branch', '分支']].map(([value, label]) => `<label><input type="radio" name="scope-kind" value="${value}" ${selection.kind === value ? 'checked' : ''} ${disabled}><span>${label}</span></label>`).join('')}</div></fieldset>
       ${selection.kind === 'pr'
         ? `<label class="scope-field scope-wide" for="scope-pr"><span>PR</span><select id="scope-pr" class="text-field" ${disabled}>${scope.repository.prs.map((pr) => `<option value="${pr.id}" ${selection.pr === pr.id ? 'selected' : ''}>PR ${pr.id} · ${pr.title}</option>`).join('')}</select></label>`
-        : `<label class="scope-field" for="scope-branch"><span>被审查分支</span><select id="scope-branch" class="text-field" ${disabled}>${branchOptions(selection.branch)}</select></label><label class="scope-field" for="scope-mode"><span>分支范围</span><select id="scope-mode" class="text-field" ${disabled}><option value="changes" ${selection.mode === 'changes' ? 'selected' : ''}>分支变更（默认）</option><option value="full" ${selection.mode === 'full' ? 'selected' : ''}>分支全量代码</option></select></label>${selection.mode === 'changes' ? `<label class="scope-field scope-wide" for="scope-base"><span>比较基线</span><select id="scope-base" class="text-field" ${disabled}>${branchOptions(selection.base, selection.branch)}</select></label>` : ''}`}
-      </div><p class="scope-caption">${icon('branch')}<span>${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 全量快照，不以 Diff 定义范围'}<strong>${scope.files.length} 个审查文件 · 整文件及相关业务链核查</strong></span></p>
-      <p class="form-hint">代码 ${escape(scope.head.version)} · 演示快照 ${selection.snapshot}。${scope.pr ? '文件来自 PR 变更列表；描述不自动成为需求。' : scope.mode === 'full' ? '所选分支的全量文件清单。' : '文件来自分支相对基线的差异，不限于新增行。'} ${!scope.supportsFindings ? '此范围暂无预设分析结果。' : ''}</p>
-      ${state.scopeReview.discardedResults || state.scopeReview.reincluded ? `<p class="form-hint scope-changed">范围已变更：旧发现与补丁不再沿用，需求需重新核对适用范围。${state.scopeReview.reincluded ? `旧范围 ${state.scopeReview.reincluded} 项不适用记录已归档并重新纳入，不静默跳过。` : ''}</p>` : ''}`;
+        : `<label class="scope-field" for="scope-branch"><span>分支</span><select id="scope-branch" class="text-field" ${disabled}>${branchOptions(selection.branch)}</select></label>`}
+      </div>`;
   }
 
   function understandingExtras(preparation, expanded = false) {
@@ -1282,16 +1352,12 @@
     const selected = sources.selectedSources(state);
     const edit = state.center.requirementEdit;
     const items = edit && !preparation.items.some((item) => item.id === edit.id) ? [edit.original, ...preparation.items] : preparation.items;
-    return `<div class="prepare-scroll simple-prepare">
-      <h1 class="stage-title">准备一次审查</h1>
-      <section class="preparation-card"><div class="prepare-section-title"><h2><span class="preparation-number">1</span>选择审查对象</h2></div>
-      ${renderScopeSelection()}</section>
-      <section class="preparation-card"><div class="prepare-section-title"><h2><span class="preparation-number">2</span>提供需求依据 <small>可选</small></h2></div>
-      <div class="material-input-actions"><button class="button small" data-action="paste-material">${icon('edit')}粘贴内容</button><button class="button small" data-action="link-material">${icon('link')}读取链接</button><button class="button small" data-action="file-material" ${state.sourceReview.readingFile ? 'disabled' : ''}>${icon('file')}${state.sourceReview.readingFile ? '读取中…' : '读取本地文件'}</button></div>
-      <input type="file" id="requirement-file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden>
-      <p class="form-hint">支持 Markdown。本地文件只在浏览器读取，不上传；链接仅支持演示快照。</p>
+    return `<div class="settings-body">
+      <section class="requirements-settings"><div class="prepare-section-title"><h2>需求依据 <small>可选</small></h2><button class="button small" data-action="add-material" ${state.runStatus === 'running' || state.sourceReview.readingFile ? 'disabled' : ''}>${icon('edit')}添加需求</button></div>
+      <p class="form-hint">${preparation.requirements.length ? '需求是适用业务链的审核标准；同时整仓查 Bug。' : '无需求时默认整仓综合 Bug 审查，不需要额外选择。'}</p>
       <div class="compact-materials">${selected.map((source) => `<div class="material-row"><button class="material-chip" data-action="material" data-source-id="${source.id}">${icon(source.kind === 'pr' ? 'branch' : source.kind === 'link' ? 'link' : 'file')}<span>${escape(source.name)}</span>${badge(source.userProvided && !source.demoRecognized ? '待分析' : '演示', source.userProvided && !source.demoRecognized ? 'amber' : '')}</button><button class="text-button" data-action="remove-material" data-source-id="${source.id}" aria-label="移除 ${escape(source.name)}">移除</button></div>`).join('')}</div></section>
-      <section class="preparation-card"><div class="prepare-section-title"><h2><span class="preparation-number">3</span>AI 对本次需求的理解</h2><button class="text-button" data-action="add-explicit-requirement">补充明确要求</button></div>
+      <details id="understanding-details" ${edit || preparation.needsConfirmation && items.length ? 'open' : ''}><summary>本次理解 · ${preparation.requirements.length} 条明确要求${preparation.needsConfirmation ? ' · 开始前需确认' : ''}</summary>
+      <div class="understanding-body"><div class="prepare-section-title"><h2>核对需求理解</h2><button class="text-button" data-action="add-explicit-requirement">补充明确要求</button></div>
       ${preparation.summary ? `<p class="understanding-intent">${escape(preparation.summary)}</p>` : ''}
       ${conflictMarkup(preparation.conflicts)}
       <div class="requirement-list">${items.map(requirementMarkup).join('') || `<p class="small-copy">${selected.length ? '原文已保留，尚未形成可确认的要求。' : '尚未提供明确要求。'}可补充要求，或开始需求一致性未评审的技术审查。</p>`}</div>
@@ -1299,9 +1365,16 @@
       ${preparation.notices.length ? `<details class="analysis-pending"><summary>${preparation.notices.length} 份材料尚待分析或重新提取</summary><ul>${preparation.notices.map((notice) => `<li>${escape(notice)}</li>`).join('')}</ul></details>` : ''}
       ${state.sourceReview.draft?.removed.length ? `<p class="form-hint analysis-pending">旧条目 ${state.sourceReview.draft.removed.join('、')} 未在新材料中提取；原文与历史保留，旧结论失效。</p>` : ''}
       ${preparation.reasons.length ? `<div class="inline-notice" role="status">${icon('info')}<strong>${escape(preparation.reasons.join('；'))}</strong></div>` : ''}
-      </section>
-      <div class="simple-prepare-footer"><p>${preparation.needsConfirmation ? '确认理解准确且适用于当前代码；不代表需求本身正确。' : preparation.mode === 'technical' ? '本次需求一致性未评审；已知关键未决项仍限制通过。' : '沿用未变化的已确认理解。'}</p><button class="button primary" id="prepare-start" data-action="prepare-start" ${preparation.canStart ? '' : 'disabled'}>${icon('play')}${preparation.label}</button></div>
+      <p class="form-hint">${preparation.needsConfirmation ? '使用顶部按钮确认理解并开始；确认不代表需求本身正确。' : '来源与修订分别保存，不改变原文。'}</p></div></details>
       </div>`;
+  }
+
+  function addMaterialDialog() {
+    openModal('添加需求依据', `<div class="modal-body material-input-actions">
+      <button class="button" data-action="paste-material">${icon('edit')}粘贴内容</button>
+      <button class="button" data-action="link-material">${icon('link')}读取链接</button>
+      <button class="button" data-action="file-material">${icon('file')}读取本地文件</button>
+      <p class="form-hint">支持 Markdown。本地文件只在浏览器读取，不上传；链接仅支持演示快照。</p></div>`);
   }
 
   function materialsDialog() {
@@ -1330,25 +1403,37 @@
 
   function renderFindingInspector() {
     const finding = currentFinding(state);
-    if (!state.hasResults || !finding) return `<div class="inspector-heading">尚无有效发现</div><div class="inspector-scroll"><div class="empty-state">${icon('search')}<h2>${scopeState(state).supportsFindings ? '先建立本次依据' : '此范围未执行分析'}</h2><p>${scopeState(state).supportsFindings ? '准备好后一次启动，不需要逐个文件点击。' : '仅演示选择范围与读取位置；没有此快照的预设分析，不能沿用其他范围的发现。'}当前预览片段不代表已完成审查，空列表不代表没有问题。</p><button class="button" data-action="stage" data-stage="prepare">查看准备阶段</button></div></div>`;
-    const requirement = state.requirements.find((item) => item.id === finding.requirement);
-    const originCaption = requirement
-      ? `<div class="inspector-provenance"><span>${requirement.id} · ${requirement.origins?.length || 0} 处原文${requirement.manualRevision ? ' · 人工已修订表述' : ''}</span><button class="text-button" data-action="trace-requirement" data-id="${requirement.id}">${icon('link')}来源与版本</button></div>`
-      : finding.requirement ? `<div class="inline-notice">${icon('info')}<div><strong>原需求 ${finding.requirement} 已不在当前基线</strong><p>此示例发现只供历史对照，不能将未纳入的需求伪装成当前依据。</p></div></div>` : '';
-    const content = `${originCaption}${state.center.inspector === 'evidence' ? renderEvidence(finding) : state.center.inspector === 'history' ? renderHistory(finding) : renderJudgment(finding)}`;
-    const patch = state.center.patches[finding.id];
-    const hint = finding.type === 'question' ? '补充证据后仍需重审。' : patch ? '示例补丁已应用，尚未验证。' : '';
-    return `<div class="inspector-heading"><span>当前判断</span><button class="text-button" data-action="next" title="下一问题（F8）" aria-keyshortcuts="F8">下一问题 ${icon('arrow')}</button></div><div class="inspector-scroll"><div class="issue-badges">${findingBadges(finding)}</div><h2 class="inspector-title" tabindex="-1">${escape(finding.title)}</h2><p class="inspector-summary">${escape(finding.summary)}</p><div class="origin-line">${icon('flow')}<span>${escape(finding.origin)}</span><span>·</span><span>${finding.severity === 'none' ? '不计入缺陷' : finding.severity === 'potential' ? '潜在高影响' : '高业务影响'}</span></div>${finding.disposition === 'commented' && !finding.resolved && finding.critical ? `<div class="inline-notice">${icon('lock')}<strong>已记录评论，关键项仍未闭合</strong></div>` : ''}${state.stale ? `<div class="inline-notice">${icon('refresh')}<strong>依据变化，当前裁决待重审</strong></div>` : ''}<div class="inspector-tabs" role="tablist" aria-label="裁决详情">${[['judgment', '业务判断'], ['evidence', '证据与反证'], ['history', '处置']].map(([id, label]) => `<button class="inspector-tab ${state.center.inspector === id ? 'active' : ''}" role="tab" aria-selected="${state.center.inspector === id}" data-action="inspector-tab" data-tab="${id}">${label}</button>`).join('')}</div>${content}</div><div class="inspector-actions"><div class="inspector-action-row">${finding.type === 'requirement' ? `<button class="button primary small" data-action="edit-requirement" data-id="${finding.requirement}">${icon('edit')}澄清并修订需求</button>` : finding.type === 'question' ? `<button class="button primary small" data-action="evidence">${icon('file')}补充契约证据</button>` : finding.type === 'implementation' ? `<button class="button primary small" data-action="fix-preview" data-id="${finding.id}">${icon('code')}${patch ? '查看已应用的示例' : '修复方案（示例）'}</button>${state.center.fixSnapshots[finding.id] ? `<button class="button small" data-action="undo-fix" data-id="${finding.id}">${icon('refresh')}撤销示例</button>` : ''}` : `<button class="button small" data-action="boundary" data-id="${finding.id}">${icon('message')}补充适用边界</button>`}${finding.type !== 'reasonable' ? `<button class="button small" data-action="comment" data-id="${finding.id}">${icon('message')}评论</button>` : ''}</div>${hint ? `<p>${hint}</p>` : ''}</div>`;
+    if (!state.hasResults || !finding) return `<div class="judgment-body empty-state">${icon('search')}<h2>${state.runStatus === 'idle' ? '尚未开始审查' : '当前没有有效问题判断'}</h2><p>可以先浏览左侧文件。审查完成后，点击问题自动定位代码，并在这里核对判断与操作。</p></div>`;
+    if (!problemGroups(state).open.length && !state.center.closedOpen) return `<div class="judgment-body empty-state">${icon('search')}<h2>本次没有待处理问题</h2><p>展开左侧已处理 / 排除记录可查看依据。代码仍可阅读；演示结果不证明真实代码正确。</p></div>`;
+    const keyEvidence = finding.evidence[0];
+    const files = sourceFiles(state);
+    const linked = currentChain(state).files.filter((key) => files[key]);
+    const patched = !!state.center.patches[finding.id], busy = state.runStatus === 'running';
+    const cannotFix = busy || !patched && (state.stale || finding.resolved);
+    const location = findingLocation(state);
+    return `<div class="judgment-body"><div class="problem-heading"><div class="issue-badges">${findingBadges(finding)}</div><button class="text-button" data-action="next" title="下一问题（F8）" aria-keyshortcuts="F8" ${problemGroups(state).open.length ? '' : 'disabled'}>下一问题 ${icon('arrow')}</button></div>
+      <h2 class="inspector-title" tabindex="-1">${escape(finding.title)}</h2><p class="inspector-summary">${escape(finding.summary)}</p>
+      <p class="form-hint">归因：${scopeState(state).head.name !== fileNavigation(state).base.name ? escape(finding.origin) : '当前为默认分支，未区分新增与既有'} · 演示判断</p>
+      ${finding.resolved ? '<p class="form-hint">当前显示已处理或排除的判断，用于对照，不作为待修改问题。</p>' : ''}
+      <button class="evidence-link primary-location" data-action="locate-finding" data-id="${finding.id}">${icon('link')}${escape(location.path)}:${location.line} · 定位主要代码</button>
+      ${finding.disposition === 'patch-applied' ? '<div class="inline-notice">示例补丁已应用，判断过期、等待复审；不能视为问题已解决。</div>' : ''}
+      <section class="problem-impact"><h3>${finding.type === 'reasonable' ? '成立的边界' : '影响与触发条件'}</h3><p>${escape(finding.impact)}</p></section>
+      ${keyEvidence ? `<section class="key-evidence"><h3>关键证据</h3><p>${escape(keyEvidence.text)}</p><button class="evidence-link" data-action="source" data-source="${evidenceTarget(finding, 0)}">${icon('link')}${escape(keyEvidence.source)}</button></section>` : ''}
+      ${finding.counter[0] ? `<p class="counter-summary"><strong>反证核查：</strong>${escape(finding.counter[0].title)}——${escape(finding.counter[0].text)}</p>` : ''}
+      <details id="problem-basis" ${state.center.basisOpen ? 'open' : ''}><summary>业务路径与需求依据</summary>${renderJudgment(finding)}</details>
+      <details id="problem-evidence" ${state.center.evidenceOpen ? 'open' : ''}><summary>全部证据与反证 · ${finding.evidence.length + finding.counter.length}</summary>${renderEvidence(finding)}</details>
+      <details class="related-source-list"><summary>关联文件与原文 · ${linked.length}</summary><div class="related-files">${linked.map((key) => `<button class="text-button" data-action="source" data-source="${key}">${escape(files[key].path)}</button>`).join('')}</div></details>
+      <details id="problem-history" ${state.center.historyOpen ? 'open' : ''}><summary>记录与处理${finding.disposition === 'commented' && finding.critical && !finding.resolved ? ' · 已评论，关键项仍未闭合' : ''}</summary>${renderHistory(finding)}
+      </details></div><div class="judgment-actions">${finding.type === 'implementation' ? `<button class="button primary" data-action="fix-preview" data-id="${finding.id}" ${cannotFix ? 'disabled' : ''}>${icon('code')}${patched ? '查看已应用的示例' : '生成修复方案（演示）'}</button>` : finding.type === 'requirement' ? `<button class="button primary" data-action="edit-requirement" data-id="${finding.requirement}" ${busy ? 'disabled' : ''}>澄清需求</button>` : finding.type === 'question' ? `<button class="button primary" data-action="evidence" ${busy ? 'disabled' : ''}>补充契约证据</button>` : ''}
+      ${state.center.fixSnapshots[finding.id] ? `<button class="button" data-action="undo-fix" data-id="${finding.id}" ${busy ? 'disabled' : ''}>撤销示例补丁</button>` : ''}
+      <button class="button" data-action="${finding.type === 'reasonable' ? 'boundary' : 'comment'}" data-id="${finding.id}" ${busy ? 'disabled' : ''}>${finding.type === 'reasonable' ? '记录边界' : '记录说明 / 反证'}</button></div>`;
   }
 
   function renderConclusion() {
-    const scope = scopeState(state);
-    return `${progressStrip()}<div class="conclusion-scroll">
-      <h1 class="stage-title">提交审查结论</h1>
-      <p class="stage-description">${escape(scope.repository.name)} · ${escape(scope.label)}</p>
+    return `<div class="conclusion-scroll">
       ${state.submission ? `<div class="inline-notice blue submission-record">${icon('check')}<div><strong>已在当前原型记录：${verdictLabels[state.submission.verdict]}</strong><p>没有写回 GitHub。新的依据、内容或处置会使这份模拟记录失效。</p></div></div>` : ''}
       <section class="prepare-section"><label class="field-label" for="center-notes">补充说明 <span class="muted">可选</span></label><textarea class="textarea" id="center-notes" placeholder="补充业务判断、风险或需要协调的事项…">${escape(state.notes)}</textarea></section>
-      <section class="prepare-section submission-preview"><div class="prepare-section-title"><h2>待提交内容</h2><div class="summary-actions"><button class="text-button" data-action="copy-summary">复制</button><button class="text-button" data-action="download">${icon('download')}下载</button></div></div><pre class="summary-text" id="center-summary">${escape(summaryText(state))}</pre><details class="conclusion-sources"><summary>查看材料原文与版本</summary>${sources.selectedSources(state).map((source) => `<button class="text-button origin-button" data-action="material" data-source-id="${source.id}">${icon('link')}${escape(source.name)} · v${source.version}</button>`).join('') || '<p class="form-hint">没有选入需求材料。</p>'}</details></section>
+      <section class="prepare-section submission-preview"><div class="prepare-section-title"><h2>待提交内容</h2><div class="summary-actions"><button class="text-button" data-action="copy-summary">复制</button><button class="text-button" data-action="download">${icon('download')}下载</button></div></div><div class="summary-text" id="center-summary">${escape(summaryText(state))}</div></section>
       </div>`;
   }
 
@@ -1358,21 +1443,22 @@
     const preparation = preparationState(state);
     const needsPreparation = !preparation.canStart || preparation.needsConfirmation || !preparation.scope.supportsFindings;
     const status = state.submission?.verdict === state.verdict ? `已记录${verdictLabels[state.verdict]}` : decision.allowed ? state.verdict === 'approve' ? '待最终确认' : '可提交反馈' : '暂不可提交';
-    return `<div class="inspector-heading"><span>选择结论</span>${badge(status, decision.allowed ? 'blue' : 'amber')}</div><div class="inspector-scroll"><div class="verdict-options" role="radiogroup" aria-label="选择审查结论">${[['approve', '通过当前范围', gate.eligible ? '通过条件已满足，提交时最终确认' : `${gate.reasons.length} 项通过限制，可选择查看原因`], ['request-changes', '要求修改', '提交需要修改或确认的问题'], ['comment', '仅评论', '提交反馈，不代表通过']].map(([id, title, note]) => `<label class="verdict-option"><input type="radio" name="center-verdict" value="${id}" ${state.verdict === id ? 'checked' : ''}><span><strong>${title}</strong><small>${note}</small></span></label>`).join('')}</div>${decision.blockers.length ? `<section class="decision-blockers" role="status"><h2>当前不能${verdictLabels[state.verdict]}</h2><ul>${decision.blockers.map((reason) => `<li>${escape(reason)}</li>`).join('')}</ul><button class="text-button" data-action="stage" data-stage="${needsPreparation ? 'prepare' : 'review'}">${needsPreparation ? '返回准备，核对依据' : '查看待处理问题'} ${icon('arrow')}</button></section>` : gate.critical.length ? `<p class="form-hint">${gate.critical.length} 项关键未决仍保留在报告中，不因提交反馈而解除。</p>` : ''}</div><div class="inspector-actions"><button class="button primary" id="center-submit" data-action="submit" ${decision.allowed ? '' : 'disabled'}>${icon('message')}提交${verdictLabels[state.verdict]}</button></div>`;
+    return `<div class="opinion-status">${badge(status, decision.allowed ? 'blue' : 'amber')}</div><div class="verdict-options" role="radiogroup" aria-label="选择审查意见">${[['request-changes', '要求修改', '需要修改或核实的问题'], ['comment', '仅评论', '反馈不代表通过'], ['approve', '通过当前范围', gate.eligible ? '提交时最终确认边界' : `${gate.reasons.length} 项通过限制`]].map(([id, title, note]) => `<label class="verdict-option"><input type="radio" name="center-verdict" value="${id}" ${state.verdict === id ? 'checked' : ''}><span><strong>${title}</strong><small>${note}</small></span></label>`).join('')}</div>
+      ${decision.blockers.length ? `<section class="decision-blockers" role="status"><h2>当前不能${verdictLabels[state.verdict]}</h2><ul>${decision.blockers.map((reason) => `<li>${escape(reason)}</li>`).join('')}</ul>${needsPreparation ? '<button class="text-button" data-action="settings">就地核对审查设置</button>' : ''}</section>` : gate.critical.length ? `<p class="form-hint">${gate.critical.length} 项关键未决仍保留，不因提交反馈解除。</p>` : ''}
+      <button class="button primary" id="center-submit" data-action="submit" ${decision.allowed ? '' : 'disabled'}>${icon('message')}记录${verdictLabels[state.verdict]}（演示）</button>`;
   }
 
   function render(preserve = true) {
     const focused = document.activeElement;
     const focusId = focused?.id;
-    const selection = focused instanceof HTMLInputElement && focused.type === 'search' ? [focused.selectionStart, focused.selectionEnd] : null;
-    const positions = preserve ? Object.fromEntries(['.editor-scroll', '.inspector-scroll', '.navigator-scroll', '.prepare-scroll', '.conclusion-scroll'].map((selector) => [selector, document.querySelector(selector)?.scrollTop || 0])) : {};
+    const selection = focused instanceof HTMLTextAreaElement || focused instanceof HTMLInputElement && ['text', 'search', 'url'].includes(focused.type) ? [focused.selectionStart, focused.selectionEnd] : null;
+    const positions = preserve ? Object.fromEntries(['.center-workspace', '.editor-scroll', '.navigator-scroll', '.judgment-body'].map((selector) => [selector, document.querySelector(selector)?.scrollTop || 0])) : {};
     renderTop();
-    navigator.innerHTML = state.center.stage === 'prepare' ? '' : renderNavigator();
-    main.innerHTML = state.center.stage === 'prepare' ? renderPrepare() : state.center.stage === 'conclusion' ? renderConclusion() : state.center.navigator === 'feedback' && !state.center.file ? renderFeedbackOverview() : renderEditor();
-    if (state.center.stage === 'prepare' && state.center.requirementEdit?.preview) {
-      setMarkdownEditorMode(main.querySelector('#center-requirement-form [data-markdown-editor]'), 'preview');
+    main.innerHTML = `<div class="linked-workspace"><aside class="problem-list" aria-label="问题与仓库文件">${renderNavigator()}</aside><section id="review-code" class="code-pane" aria-label="代码块与定位">${renderEditor()}</section></div>`;
+    if (modal.open && modalRenderer) {
+      modal.querySelector('#workspace-dialog-body').innerHTML = modalRenderer();
+      if (state.center.requirementEdit?.preview) setMarkdownEditorMode(modal.querySelector('#center-requirement-form [data-markdown-editor]'), 'preview');
     }
-    inspector.innerHTML = state.center.stage === 'prepare' ? '' : state.center.stage === 'conclusion' ? renderConclusionInspector() : state.center.navigator === 'feedback' ? renderFeedbackInspector() : renderFindingInspector();
     for (const [selector, top] of Object.entries(positions)) {
       const element = document.querySelector(selector);
       if (element) element.scrollTop = top;
@@ -1381,24 +1467,35 @@
       const element = document.getElementById(focusId);
       if (element) {
         element.focus({ preventScroll: true });
-        if (selection && element instanceof HTMLInputElement) element.setSelectionRange(...selection);
+        if (selection && (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) element.setSelectionRange(...selection);
       }
     }
   }
 
   function stage(id) {
     if (!stages.some(([key]) => key === id)) throw new Error('未知审查阶段');
-    state.center.stage = id;
-    render(false);
+    render();
+    if (id === 'prepare') openRequirements();
+    if (id === 'conclusion') openOpinion();
   }
 
   function openSource(key) {
-    if (!sourceFiles(state)[key]) throw new Error('示例证据位置不存在');
-    state.center.file = key;
+    selectFile(state, key);
     state.center.stage = 'review';
     render();
-    const scroll = main.querySelector('.editor-scroll');
-    if (scroll) scroll.scrollTop = 0;
+    locateCurrentCode();
+  }
+
+  function locateCurrentCode() {
+    const scroll = main.querySelector('#review-code .editor-scroll');
+    if (!scroll) return;
+    const line = state.center.targetLine ?? (state.hasResults && state.center.file === primaryFiles[state.selectedFinding] ? findingLocation(state).line : null);
+    const target = line ? scroll.querySelector(`#sample-line-${line},#sample-doc-line-${line}`) : null;
+    scroll.querySelectorAll('.targeted-line').forEach((element) => element.classList.remove('targeted-line'));
+    if (target) {
+      target.classList.add('targeted-line');
+      scroll.scrollTop += target.getBoundingClientRect().top - scroll.getBoundingClientRect().top - scroll.clientHeight / 3;
+    } else scroll.scrollTop = 0;
   }
 
   function nextFinding() {
@@ -1408,23 +1505,42 @@
       const at = items.findIndex((item) => item.id === state.center.feedbackId);
       return showFeedback(items[(at + 1) % items.length].id);
     }
-    const findings = getFindings();
-    if (!findings.length) return notify('请先完成模拟审查。', true);
+    const findings = problemGroups(state).open;
+    if (!findings.length) return notify(state.hasResults ? '本次没有待处理问题，已处理记录可单独查看。' : '请先开始审查。', !state.hasResults);
     const index = findings.findIndex((finding) => finding.id === state.selectedFinding);
     selectFinding(state, findings[(index + 1) % findings.length].id);
     render(false);
+    locateCurrentCode();
   }
 
   function openModal(title, body, footer = '<button class="button" data-action="close">关闭</button>') {
     pendingApproval = null;
+    pendingFix = null;
+    modalRenderer = null;
+    modal.classList.remove('workspace-dialog');
     if (modal.open) modal.close();
     modal.innerHTML = `<div class="modal-header"><h2 id="center-modal-title">${title}</h2><button class="icon-button" data-action="close" aria-label="关闭对话框">${icon('close')}</button></div>${body}<div class="modal-footer">${footer}</div>`;
     modal.classList.toggle('markdown-dialog', !!modal.querySelector('[data-markdown-editor],[data-markdown-reader]'));
     modal.showModal();
   }
 
+  function openWorkspaceDialog(title, renderer) {
+    openModal(title, `<div class="modal-body" id="workspace-dialog-body">${renderer()}</div>`);
+    modalRenderer = renderer;
+    modal.classList.add('workspace-dialog');
+  }
+
+  function openRequirements() {
+    openWorkspaceDialog('需求依据', renderPrepare);
+    if (state.center.requirementEdit?.preview) setMarkdownEditorMode(modal.querySelector('#center-requirement-form [data-markdown-editor]'), 'preview');
+  }
+
+  function openOpinion() {
+    openWorkspaceDialog('审查意见', () => `<div class="opinion-layout"><div id="opinion-controls">${renderConclusionInspector()}</div>${renderConclusion()}</div>`);
+  }
+
   function help() {
-    openModal('准备 → 审查 → 结论', `<div class="modal-body"><p>准备页直接核对需求正文，可就地修订。来源与版本按需展开；确认理解不等于证明需求正确。</p><p>左侧定位业务、问题或文件，中间阅读源码，右侧对照判断、证据与处置。F8 跳转下一问题。</p><p>结论页只保留一份待提交内容。评论和要求修改可提交有效的部分结果；通过必须满足门禁，并在提交时最终确认。</p><p>示例材料、预填输入、快照更新及重置集中在顶部“演示工具”。只有默认 PR 或对应分支比较提供预设发现，其他范围不能沿用旧结果。</p><p class="form-hint">输入仅存当前页面内存，刷新或切换独立场景会清除。原型不调用模型、读取真实仓库或写入 GitHub；文件仅本地读取，链接只提供示例快照。</p></div>`);
+    openModal('代码审查原型', `<div class="modal-body"><p>在左侧审查导航上方选择仓库和分支 / PR。默认整仓查 Bug；需求按需提供，不增加审查选项。</p><p>PR文件列表只显示 Changes；分支显示全部文件，状态相对仓库默认分支。M 修改、A 新增、D 删除、R 重命名；未变化不标记。文件导航不改变整仓审查范围。</p><p>工作区只有文件 / 问题导航和代码。点击问题定位代码，需要判断或修复时打开“问题详情”；F8 切换待处理问题。</p><p>修复先预览，只改浏览器示例，应用后需复审。需求和审查意见按需打开，不占代码区。</p><p class="form-hint">全部代码与结果为离线演示，不连接模型、真实仓库或 GitHub，不执行真实测试。不上传本地文件，刷新或切换场景会清除输入。</p></div>`);
   }
 
   function sourceDetails(id, version) {
@@ -1452,6 +1568,7 @@
       return notify(error.message, true);
     }
     render();
+    openRequirements();
     document.getElementById('center-requirement-title').focus();
   }
 
@@ -1461,7 +1578,7 @@
       <input name="material-kind" type="hidden" value="${explicit ? 'requirement' : 'auto'}">
       <label class="field-label" for="center-source-name">${explicit ? '要求标题' : '材料名称（可选）'}</label><input class="text-field" id="center-source-name" ${explicit ? 'required' : ''} value="${escape(material?.name || '')}" placeholder="${explicit ? '例如：退款不得超过实收金额' : '例如：本次业务背景'}">
       <label class="field-label" for="center-source-text">${explicit ? '你希望实现满足什么条件？' : '原文或补充说明'}</label>${markdownEditor('center-source-text', material?.text || '')}
-      <p class="form-hint">${explicit ? '作为人工明确要求加入理解，仍需在准备页确认后开始。' : '自由文本只保留原文，尚待模型分析；也可在准备页直接补充明确要求。'}只在当前页面保存，不上传。</p>
+      <p class="form-hint">${explicit ? '作为人工明确要求加入理解，仍需核对后开始。' : '自由文本只保留原文，尚待模型分析；也可直接补充明确要求。'}只在当前页面保存，不上传。</p>
       </div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="center-source-form" type="submit">保存</button>');
   }
 
@@ -1505,12 +1622,19 @@
     openModal(title, `<form id="center-note-form"><div class="modal-body"><input name="finding-id" type="hidden" value="${id}"><input name="note-kind" type="hidden" value="${kind}"><label class="field-label" for="center-note">说明与依据</label><textarea id="center-note" class="textarea" rows="5" required placeholder="说明触发条件、业务取舍或还需核实的证据…"></textarea><p class="form-hint">仅记录在本次原型；不写入 GitHub。补充事实会使相关判断待重审。</p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" type="submit" form="center-note-form">记录到当前示例</button>');
   }
 
+  function fixContextKey(id) {
+    return JSON.stringify([id, scopeState(state).key, state.sourceReview.revision, state.center.patchRevision]);
+  }
+
   function fixPreview(id) {
     const finding = state.findings.find((item) => item.id === id);
-    if (finding.type !== 'implementation') return notify('需求矛盾或必要前提应先澄清，不能直接生成修复。', true);
-    const before = id === 'F-01' ? 'order.markPaymentFailed();\nreturn { canPayAgain: true };' : state.center.findingMode === 'technical' ? 'const reservation = await inventory.findByOrder(order.id);\nreturn { reservationId: reservation.id };' : 'await order.restore();\nreturn { status: "awaiting_payment" };';
-    const after = id === 'F-01' ? 'order.markPaymentUnknown();\nreturn { canPayAgain: false, status: "unknown" };' : state.center.findingMode === 'technical' ? 'const reservation = await inventory.reserveForOrder(order);\nawait order.restore();\nreturn { reservationId: reservation.id };' : 'await inventory.reserveForOrder(order);\nawait order.restore();\nreturn { status: "awaiting_payment" };';
-    openModal('修复方案 · 仅替换浏览器内示例', `<div class="modal-body"><p>${id === 'F-01' ? '把超时保留为未知状态，暂不开放再次支付。' : '在恢复状态前，重新建立示例库存保障。'}这里只验证交互，不代表真实系统的最终正确修复。</p><pre class="fix-before">${escape(before)}</pre><pre class="fix-after">${escape(after)}</pre><p class="form-hint">不会修改真实文件，不执行测试。接受后标记为人工接受示例补丁；本次应用可撤销。</p></div>`, `<button class="button" data-action="close">返回代码</button><button class="button primary" data-action="apply-fix" data-id="${id}" ${state.center.patches[id] ? 'disabled' : ''}>${state.center.patches[id] ? '示例已应用' : '人工接受并应用到示例'}</button>`);
+    if (!finding || finding.type !== 'implementation') return notify('需求矛盾或必要前提应先澄清，不能直接生成修复。', true);
+    if (!state.center.patches[id] && (state.stale || finding.resolved)) return notify('当前判断已过期或已处理，请先完成有效复审。', true);
+    const location = findingLocation(state, id);
+    const before = id === 'F-01' ? 'order.markPaymentFailed();\nreturn { canPayAgain: true };' : 'await order.restore();\nconst reservation = await inventory.findByOrder(order.id);\nreturn { reservationId: reservation.id };';
+    const after = id === 'F-01' ? 'order.markPaymentUnknown();\nreturn { canPayAgain: false, status: "unknown" };' : 'const reservation = await inventory.reserveForOrder(order);\nawait order.restore();\nreturn { reservationId: reservation.id };';
+    openModal('修复方案 · 预览后再应用', `<div class="modal-body"><p><strong>${escape(location.path)} · ${escape(scopeState(state).head.version)}</strong></p><p>${id === 'F-01' ? '把超时保留为未知状态，暂不开放再次支付。' : '在恢复状态前，重新建立示例库存保障。'}</p><h3>修改前</h3><pre class="fix-before">${escape(before)}</pre><h3>示例方案</h3><pre class="fix-after">${escape(after)}</pre><p class="form-hint">只修改浏览器内的虚构代码，不写入分支 / PR。应用后判断过期，必须复审；这不是实际修复或验证通过。</p></div>`, `<button class="button" data-action="close">返回代码</button><button class="button primary" data-action="apply-fix" data-id="${id}" ${state.center.patches[id] ? 'disabled' : ''}>${state.center.patches[id] ? '示例已应用' : '应用到浏览器示例，等待复审'}</button>`);
+    pendingFix = { id, key: fixContextKey(id) };
   }
 
   async function startRun(fromPreparation = false) {
@@ -1525,12 +1649,13 @@
       }
     } else if (preparation.needsConfirmation || !preparation.canStart || state.mode !== preparation.mode) {
       stage('prepare');
-      return notify('本次依据已变化，请在准备页确认本次理解并开始。无需额外选择审查方式。', true);
+      return notify('本次依据已变化，请在当前页核对审查设置，再用顶部按钮开始。', true);
     }
     const generation = ++runGeneration;
     state.runStatus = 'running';
     state.center.stageIndex = 0;
     state.center.stage = 'review';
+    state.center.settingsOpen = false;
     invalidate(state);
     render(false);
     for (let index = 0; index < runStages.length; index += 1) {
@@ -1541,6 +1666,7 @@
     }
     completeReview(state);
     render();
+    locateCurrentCode();
     notify(!scopeState(state).supportsFindings ? '此范围没有预设分析结果，未执行真实审查；没有沿用其他范围的发现。' : state.sourceReview.limited ? '来源流程演示完成；自定义材料未做语义评审，结果标为部分完成。' : '模拟流程完成：未连接模型、分析输入或执行测试。');
   }
 
@@ -1581,6 +1707,8 @@
   }
 
   document.addEventListener('click', (event) => {
+    const contextToggle = event.target instanceof Element ? event.target.closest('#context-bar > summary') : null;
+    if (contextToggle) { state.center.contextExpanded = !contextToggle.parentElement.open; return; }
     const target = event.target instanceof Element ? event.target.closest('[data-action]') : null;
     if (!target || target.disabled) return;
     const action = target.dataset.action;
@@ -1593,19 +1721,22 @@
     if (action === 'markdown-read-mode') return setMarkdownReaderMode(target.closest('[data-markdown-reader]'), target.dataset.mode);
     if (action === 'close') { pendingApproval = null; return modal.close(); }
     if (action === 'stage') return stage(target.dataset.stage);
+    if (action === 'requirements') return openRequirements();
+    if (action === 'opinion') return openOpinion();
+    if (action === 'finding-details') return openWorkspaceDialog('问题详情', renderFindingInspector);
     if (action === 'help') return help();
     if (action === 'theme') { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; return render(); }
     if (action === 'reset') { runGeneration += 1; pendingApproval = null; state = createCenterState(state.scenario); if (modal.open) modal.close(); render(false); return notify('已重置当前演示。'); }
-    if (action === 'finding') { selectFinding(state, target.dataset.id); return render(false); }
-    if (action === 'source') return openSource(target.dataset.source);
-    if (action === 'navigator') { if (target.dataset.tab === 'feedback') return showFeedback(); state.center.navigator = target.dataset.tab; return render(); }
+    if (action === 'finding' || action === 'locate-finding') { if (modal.open) modal.close(); selectFinding(state, target.dataset.id); render(false); return locateCurrentCode(); }
+    if (action === 'source') { if (modal.open) modal.close(); return openSource(target.dataset.source); }
+    if (action === 'navigator') { state.center.navigator = target.dataset.tab; state.center.search = ''; return render(); }
     if (action === 'inspector-tab') { state.center.inspector = target.dataset.tab; render(); return; }
     if (action === 'code-view') { state.center.codeView = target.dataset.view; return render(); }
     if (action === 'focus-finding') {
       state.center.inspector = 'judgment';
+      selectFinding(state, state.selectedFinding);
       render();
-      inspector.querySelector('.inspector-scroll').scrollTop = 0;
-      return inspector.querySelector('.inspector-title').focus({ preventScroll: true });
+      return locateCurrentCode();
     }
     if (action === 'focus') { state.center.focus = !state.center.focus; return render(); }
     if (action === 'next') return nextFinding();
@@ -1617,6 +1748,7 @@
     if (action === 'trace-requirement') return traceRequirement(target.dataset.id);
     if (action === 'material') return sourceDetails(target.dataset.sourceId, Number(target.dataset.version) || undefined);
     if (action === 'materials') return materialsDialog();
+    if (action === 'settings') return stage('prepare');
     if (state.runStatus === 'running') return notify('请先结束或取消模拟审查，再修改依据或处置。', true);
     if (action === 'simulate-code-change') {
       changeScope(state, { snapshot: state.scopeReview.selection.snapshot + 1 });
@@ -1636,9 +1768,10 @@
       return;
     }
     if (action === 'remove-material') { chooseMaterial(state, target.dataset.sourceId, false); return render(); }
+    if (action === 'add-material') return addMaterialDialog();
     if (action === 'paste-material') return materialInput();
     if (action === 'link-material') return linkInput();
-    if (action === 'file-material') return document.getElementById('requirement-file').click();
+    if (action === 'file-material') { if (modal.open) modal.close(); return document.getElementById('requirement-file').click(); }
     if (action === 'use-example-materials') {
       chooseMaterial(state, 'payments', true);
       chooseMaterial(state, 'orders', true);
@@ -1648,7 +1781,11 @@
     if (action === 'add-explicit-requirement') return materialInput(true);
     if (action === 'comment' || action === 'boundary') return noteModal(action, target.dataset.id);
     if (action === 'fix-preview') return fixPreview(target.dataset.id);
-    if (action === 'apply-fix') { applySampleFix(state, target.dataset.id); modal.close(); render(); return notify('仅应用到浏览器内示例，未运行测试，可撤销。'); }
+    if (action === 'apply-fix') {
+      if (!pendingFix || pendingFix.id !== target.dataset.id || pendingFix.key !== fixContextKey(target.dataset.id)) return notify('修复方案对应的快照已变化，请重新预览。', true);
+      applySampleFix(state, target.dataset.id); pendingFix = null; modal.close(); render(); locateCurrentCode();
+      return notify('仅应用到浏览器示例，原判断过期、等待复审；未运行测试。');
+    }
     if (action === 'undo-fix') { undoSampleFix(state, target.dataset.id); render(); return notify('示例补丁已撤销，原问题与通过限制已恢复。'); }
     if (action === 'evidence') return openModal('补充关键契约 · 预设证据分支', `<form id="center-evidence-form"><div class="modal-body"><p>本分支演示稳定事件键与唯一约束得到补充。它不是对任意输入执行的实际契约验证。</p><label class="field-label" for="center-evidence">来源与适用范围</label><textarea id="center-evidence" class="textarea" required rows="5">示例契约 v2 第 4 条：同一支付事件重投保持 event.id 稳定；示例账本对该键具备唯一约束。仅适用于当前演示。</textarea><p class="form-hint">补充后仍要重审，关键前提不会在点击保存时立即解除。</p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" form="center-evidence-form" type="submit">补充示例证据，等待重审</button>');
     if (action === 'submit') {
@@ -1754,6 +1891,7 @@
     } else return;
     if (modal.open) modal.close();
     render();
+    if (['center-requirement-form', 'center-source-form', 'requirement-link-form', 'exclude-requirement-form', 'source-snapshot-form'].includes(form.id)) openRequirements();
   });
 
   document.addEventListener('input', (event) => {
@@ -1771,9 +1909,9 @@
       const preview = document.getElementById('center-summary');
       if (preview) preview.textContent = summaryText(state);
       if (changed) {
-        main.querySelector('.submission-record')?.remove();
+        modal.querySelector('.submission-record')?.remove();
         renderTop();
-        inspector.innerHTML = renderConclusionInspector();
+        document.getElementById('opinion-controls').innerHTML = renderConclusionInspector();
         if (hadSubmission) notify('待提交内容已变化，请重新提交结论。');
       }
     }
@@ -1792,6 +1930,7 @@
       pendingApproval = null;
       if (modal.open) modal.close();
       state = createCenterState(event.target.value);
+      document.getElementById('demo-tools').open = false;
       render(false);
       return notify('已切换独立演示快照，不是清除当前审查的关键阻断。');
     }
@@ -1800,7 +1939,7 @@
     const scopeField = event.target.name === 'scope-kind' ? 'kind' : scopeFields[event.target.id];
     if (scopeField) {
       try {
-        changeScope(state, { [scopeField]: event.target.value });
+        changeScope(state, event.target.name === 'scope-kind' && event.target.value === 'branch' ? { kind: 'branch', mode: 'full' } : { [scopeField]: event.target.value });
       } catch (error) {
         render();
         return notify(error.message, true);
@@ -1825,12 +1964,21 @@
     }
   });
 
+  document.addEventListener('toggle', (event) => {
+    if (!(event.target instanceof HTMLDetailsElement) || !event.target.isConnected) return;
+    const fields = { 'context-bar': 'contextExpanded', 'review-settings': 'settingsOpen', 'review-opinion': 'opinionOpen', 'review-source': 'sourceOpen',
+      'closed-problems': 'closedOpen', 'problem-basis': 'basisOpen', 'problem-evidence': 'evidenceOpen', 'problem-history': 'historyOpen' };
+    const field = fields[event.target.id];
+    if (field) state.center[field] = event.target.open;
+  }, true);
+
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && modal.open) { event.preventDefault(); pendingApproval = null; modal.close(); }
     else if (event.key === 'Escape') document.getElementById('demo-tools').open = false;
-    if (event.key === 'F8' && !modal.open && state.center.stage === 'review') { event.preventDefault(); nextFinding(); }
+    if (event.key === 'F8' && !modal.open && state.hasResults) { event.preventDefault(); nextFinding(); }
   });
   window.addEventListener('error', (event) => notify(`原型脚本错误：${event.message}`, true));
   window.addEventListener('unhandledrejection', (event) => notify(`原型操作失败：${String(event.reason)}`, true));
   render(false);
+  locateCurrentCode();
 }());

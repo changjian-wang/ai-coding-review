@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Review vNext 审查中心原型：选择 Repository 与 PR/分支、提供需求、确认 AI 理解后审查。不连接模型或真实仓库；本地文本可在浏览器读取，不上传。">
+  <meta name="description" content="Review vNext 极简审查原型：左侧选择对象并切换文件/问题，代码占据其余空间；需求、问题详情和修复按需打开。未连接模型或真实仓库。">
   <title>Review vNext · 审查中心</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23182226'/%3E%3Cpath d='m8 16 5 5 11-12' fill='none' stroke='%2376d6b7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./center.css">
@@ -16,20 +16,21 @@
 </head>
 <body>
   <a class="skip-link" href="#review-main">跳到主要内容</a>
-  <div class="review-shell">
+  <div class="review-shell single-page code-linked">
     <div class="demo-bar">
       <div class="demo-identity"><span class="prototype-indicator"></span><strong>Review vNext · 离线原型</strong><span>未连接模型与真实仓库</span></div>
       <div class="demo-controls">
-        <label><span class="sr-only">选择独立演示场景</span><select id="demo-scenario" aria-label="选择独立演示场景">
-          <option value="fresh" selected>准备 · 选择代码与需求</option>
-          <option value="standard">审查中 · 关键问题未闭合</option>
-          <option value="technical">有限技术审查 · 无需求</option>
-          <option value="partial">部分完成 · 证据受限</option>
-          <option value="ready">结论 · 已处理的独立示例</option>
-        </select></label>
         <details id="demo-tools" class="demo-tools">
           <summary>演示工具</summary>
           <div class="demo-tool-panel">
+            <label class="field-label" for="demo-scenario">演示场景（非实际审查状态）</label>
+            <select id="demo-scenario" aria-label="选择独立演示场景">
+              <option value="fresh" selected>未开始 · 选择审查对象</option>
+              <option value="standard">有问题 · 等待核对</option>
+              <option value="technical">整仓 Bug 审查 · 无需求</option>
+              <option value="partial">部分完成 · 证据受限</option>
+              <option value="ready">无待处理问题 · 独立示例</option>
+            </select>
             <div class="demo-tool-actions">
               <button class="button small" data-action="use-example-materials">载入示例需求</button>
               <button class="button small" data-action="materials">选择可用材料</button>
@@ -50,21 +51,19 @@
     </div>
     <header class="command-bar">
       <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">demo/checkout-service · 演示 Repository</span></div></div>
-      <nav id="stage-navigation" class="stage-navigation" aria-label="审查阶段"></nav>
       <div class="command-actions">
         <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
         <button id="center-theme" class="icon-button" data-action="theme" aria-label="切换为浅色主题" title="切换主题"></button>
+        <button id="review-opinion-toggle" class="button" data-action="opinion" hidden>审查意见</button>
         <button id="run-review" class="button primary" data-action="run"></button>
       </div>
     </header>
-    <div id="context-bar" class="context-bar"></div>
     <div class="center-workspace">
-      <aside id="review-navigator" class="review-navigator" aria-label="审查对象导航"></aside>
       <main id="review-main" tabindex="-1"></main>
-      <aside id="review-inspector" class="review-inspector" aria-label="判断依据与处置"></aside>
     </div>
   </div>
-  <dialog id="center-modal" aria-labelledby="center-modal-title"></dialog>
+  <dialog id="center-modal" class="single-page" aria-labelledby="center-modal-title"></dialog>
+  <input type="file" id="requirement-file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden>
   <div id="center-toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript><div class="noscript">交互原型需要启用 JavaScript。脚本、样式与演示均在本地；文件只在浏览器内读取，不调用外部服务。</div></noscript>
 </body>
