@@ -60,16 +60,19 @@ test('切换问题保留当前页设置与意见，只重置关联阅读内容',
   assert.equal(state.notes, '保留人工说明。');
 });
 
-test('工作区区分任务准备和代码审查，问题详情按需展开而不挤入准备页', () => {
+test('工作区渐进显示Repo和代码，不创建任务页或常驻问题详情栏', () => {
   const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
   assert.doesNotMatch(html, /id="stage-navigation"|id="review-navigator"|id="review-inspector"/);
   const renderer = controller.slice(controller.indexOf('  function render(preserve'), controller.indexOf('  function stage(id)'));
   for (const id of ['linked-workspace', 'review-code', 'problem-list']) assert.ok(renderer.includes(id));
   assert.doesNotMatch(renderer, /id="review-settings"|class="review-result"|id="review-opinion"|class="judgment-pane"|result-heading/);
-  assert.match(renderer, /renderRepositoryOverview\(\)/);
-  assert.match(renderer, /renderTaskPreparation\(\)/);
-  assert.match(renderer, /class="issue-inspector"/);
+  assert.match(renderer, /renderRepositoryWelcome\(\)/);
+  assert.match(renderer, /activeTask\(\) \? renderEditor\(\)/);
+  assert.doesNotMatch(controller, /renderRepositoryOverview|renderTaskPreparation|data-action="new-review"|id="task-picker"|id="task-title"/);
+  assert.doesNotMatch(renderer, /class="issue-inspector"|with-inspector/);
+  assert.doesNotMatch(html, /id="workspace-navigation"|data-action="new-review"/);
+  assert.match(controller, /action === 'finding-details'\) return openWorkspaceDialog\('问题详情', renderFindingInspector\)/);
   const navigation = controller.slice(controller.indexOf('  function renderNavigator()'), controller.indexOf('  function renderTop()'));
   assert.match(navigation, /data-tab="files"/);
   assert.match(navigation, /data-tab="findings"/);
@@ -158,13 +161,13 @@ test('需求与比较基线都不能改写同一个头提交的代码', () => {
   assert.equal(text(withRequirements, 'restore'), original);
 });
 
-test('任务绑定Repo，分支提供明确比较基线与全量选项，需求与意见按需查看', () => {
+test('选择Repo后用单个分支PR入口加载，无额外加载、审查范围或基线选项', () => {
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
   assert.doesNotMatch(controller, /changeReviewFocus|review-focus|reviewFocuses|optional-focus/);
   const controls = controller.slice(controller.indexOf('  function renderScopeSelection()'), controller.indexOf('  function understandingExtras('));
-  assert.match(controls, /id="scope-base"/);
-  assert.match(controls, /id="scope-mode"/);
-  assert.doesNotMatch(controls, /id="scope-repository"/);
+  assert.match(controls, /id="scope-target"/);
+  assert.doesNotMatch(controls, /id="scope-(?:repository|base|mode|pr|branch)"/);
+  assert.match(controller, /event.target.id === 'scope-target'\) return loadTarget\(event.target.value\)/);
   assert.match(controller, /function openRequirements\(\)/);
   assert.match(controller, /function openOpinion\(\)/);
   assert.match(controller, /modalRenderer = renderer/);

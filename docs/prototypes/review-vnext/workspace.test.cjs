@@ -2,21 +2,99 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const sources = require('./sources.js');
 const {
-  createWorkspaceState, currentReviewTask, openRepository, createReviewTask, selectReviewTask,
+  createWorkspaceState, addRepositories, loadRepositoryTarget, currentReviewTask, openRepository, createReviewTask, selectReviewTask,
   rememberRepositoryMaterial, configureSkill, parseWorkspace, preparationState, prepareForReview,
   scopeState, applySampleFix, recordFixValidation, completeReview, approvalGate, undoSampleFix, statusLabel,
   saveManualEdit, undoManualEdit, fixValidationKey, sourceFiles, changeScope,
 } = require('./center.js');
 
-test('工作区从 Repo 的任务列表开始，支持同时打开多个 Repo', () => {
+test('首页从零Repo开始，单选直接进入，多选等待选定Repo，不预建审查', () => {
   const workspace = createWorkspaceState();
+  assert.deepEqual(workspace.openRepositories, []);
+  assert.equal(workspace.selectedRepository, null);
   assert.equal(workspace.view, 'repository');
   assert.equal(workspace.remember, false);
   assert.equal(currentReviewTask(workspace), null);
+  addRepositories(workspace, ['checkout', 'sandbox', 'checkout']);
+  assert.deepEqual(workspace.openRepositories, ['checkout', 'sandbox']);
+  assert.equal(workspace.selectedRepository, null);
+  assert.deepEqual(workspace.tasks, []);
   openRepository(workspace, 'sandbox');
   openRepository(workspace, 'checkout');
   assert.deepEqual(workspace.openRepositories, ['checkout', 'sandbox']);
+  const single = createWorkspaceState();
+  addRepositories(single, ['checkout']);
+  assert.equal(single.selectedRepository, 'checkout');
+  assert.equal(currentReviewTask(single), null);
+  assert.deepEqual(single.tasks, []);
+  assert.throws(() => addRepositories(single, []), /至少选择/);
+  assert.throws(() => addRepositories(single, ['sandbox', 'unknown']), /演示 Repo/);
+  assert.deepEqual(single.openRepositories, ['checkout']);
   assert.throws(() => openRepository(workspace, 'unknown'), /演示 Repo/);
+});
+
+test('明确选择分支PR后才加载代码，分支固定整仓，选相同对象不丢材料和状态', () => {
+  const workspace = createWorkspaceState();
+  assert.throws(() => loadRepositoryTarget(workspace, 'checkout', 'pr:104'), /先从左侧选择/);
+  addRepositories(workspace, ['sandbox']);
+  const task = loadRepositoryTarget(workspace, 'sandbox', 'branch:main');
+  assert.equal(scopeState(task.state).head.name, 'main');
+  assert.equal(scopeState(task.state).mode, 'full');
+  assert.equal(task.state.hasResults, false);
+  const sourceId = sources.addManualSource(task.state, '保留要求', '仅此Repo适用的验收要求。', 'requirement');
+  task.state.center.file = 'cancel';
+  assert.equal(loadRepositoryTarget(workspace, 'sandbox', 'branch:main'), task);
+  assert.equal(task.state.center.file, 'cancel');
+  assert.ok(task.state.sources.some((item) => item.id === sourceId));
+  assert.equal(workspace.tasks.length, 1);
+});
+
+test('切Repo保留上下文，换目标不冒用旧结果，失败保留已有代码且不新增任务', () => {
+  const workspace = createWorkspaceState();
+  addRepositories(workspace, ['checkout', 'sandbox']);
+  openRepository(workspace, 'checkout');
+  const first = loadRepositoryTarget(workspace, 'checkout', 'pr:104');
+  prepareForReview(first.state, true);
+  completeReview(first.state);
+  applySampleFix(first.state, 'F-02');
+  first.state.notes = '保留当前人工判断';
+  first.state.center.readingPositions = { '.editor-scroll': 128 };
+  const sourceId = sources.addManualSource(first.state, '当前需求', '这个Repo自己的要求。', 'requirement');
+  openRepository(workspace, 'sandbox');
+  assert.equal(currentReviewTask(workspace), null);
+  const second = loadRepositoryTarget(workspace, 'sandbox', 'pr:207');
+  assert.ok(!second.state.sources.some((item) => item.id === sourceId));
+  openRepository(workspace, 'checkout');
+  assert.equal(currentReviewTask(workspace), first);
+  assert.equal(first.state.center.patches['F-02'], true);
+  assert.equal(first.state.notes, '保留当前人工判断');
+  assert.equal(first.state.center.readingPositions['.editor-scroll'], 128);
+  const before = JSON.stringify(first.state);
+  assert.throws(() => loadRepositoryTarget(workspace, 'checkout', 'pr:207'), /未替换已有代码/);
+  assert.equal(JSON.stringify(first.state), before);
+  assert.equal(loadRepositoryTarget(workspace, 'checkout', 'pr:105'), first);
+  assert.equal(first.state.hasResults, false);
+  assert.equal(first.state.findings.length, 0);
+  assert.deepEqual(first.state.center.patches, {});
+  assert.equal(first.state.scopeReview.discardedResults, true);
+  assert.equal(first.state.center.file, 'status');
+  assert.ok(first.state.sources.some((item) => item.id === sourceId));
+  assert.equal(workspace.tasks.length, 2);
+});
+
+test('零Repo和多Repo未选中状态可恢复，未完成修订不允许被换目标清除', () => {
+  const empty = parseWorkspace(JSON.stringify(createWorkspaceState()));
+  assert.deepEqual(empty.openRepositories, []);
+  assert.equal(empty.selectedRepository, null);
+  const workspace = createWorkspaceState();
+  addRepositories(workspace, ['checkout', 'sandbox']);
+  assert.equal(parseWorkspace(JSON.stringify(workspace)).selectedRepository, null);
+  openRepository(workspace, 'checkout');
+  const task = loadRepositoryTarget(workspace, 'checkout', 'pr:104');
+  task.state.center.requirementEdit = { title: '未保存输入' };
+  assert.throws(() => loadRepositoryTarget(workspace, 'checkout', 'pr:105'), /保存、取消需求修订/);
+  assert.equal(scopeState(task.state).pr.id, '104');
+  assert.equal(task.state.center.requirementEdit.title, '未保存输入');
 });
 
 test('多 Repo 与同 Repo 的多个任务分别保留范围、原文、输入和进度', () => {

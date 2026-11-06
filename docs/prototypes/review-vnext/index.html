@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Review vNext Repo 审查工作区：同时打开多个 Repo，分别创建审查任务，准备参考材料与 Skill，定位问题、预览修复并模拟验证。未连接模型或真实仓库。">
-  <title>Review vNext · Repo 审查工作区</title>
+  <meta name="description" content="Review vNext 离线原型：选择一个或多个 Repo，选择分支或 PR 后直接浏览代码，补充可选需求，审查并定位问题。未连接模型或真实仓库。">
+  <title>Review vNext · 代码审查</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23182226'/%3E%3Cpath d='m8 16 5 5 11-12' fill='none' stroke='%2376d6b7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./center.css">
   <script defer src="./app.js"></script>
@@ -24,6 +24,7 @@
           <summary>演示工具</summary>
           <div class="demo-tool-panel">
             <label class="field-label" for="demo-scenario">演示场景（非实际审查状态）</label>
+            <p class="form-hint">先选择 Repo 和分支 / PR。切换场景会重置当前 Repo 的演示上下文。</p>
             <select id="demo-scenario" aria-label="选择独立演示场景">
               <option value="fresh" selected>未开始 · 选择审查对象</option>
               <option value="standard">有问题 · 等待核对</option>
@@ -44,22 +45,21 @@
             <div class="demo-tool-actions">
               <button id="center-code-change" class="button small" data-action="simulate-code-change" title="仅切换演示快照，不创建真实提交">模拟新提交</button>
               <button id="center-reset" class="button small" data-action="reset">重置当前演示</button>
+              <button class="button small" data-action="workspace-storage">工作区保存与隐私</button>
             </div>
           </div>
         </details>
       </div>
     </div>
     <header class="command-bar">
-      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">demo/checkout-service · 演示 Repository</span></div></div>
+      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">离线原型 · 未连接模型与真实仓库</span></div></div>
       <div class="command-actions">
         <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
         <button id="center-theme" class="icon-button" data-action="theme" aria-label="切换为浅色主题" title="切换主题"></button>
         <button id="review-opinion-toggle" class="button" data-action="opinion" hidden>审查意见</button>
-        <button class="button" data-action="new-review">新建审查</button>
-        <button id="run-review" class="button primary" data-action="run"></button>
+        <button id="run-review" class="button primary" data-action="run" hidden></button>
       </div>
     </header>
-    <div id="workspace-navigation"></div>
     <div class="center-workspace">
       <main id="review-main" tabindex="-1"></main>
     </div>

@@ -69,10 +69,19 @@
 
   function createWorkspaceState() {
     return {
-      version: 1, nextTask: 1, openRepositories: ['checkout'], selectedRepository: 'checkout',
+      version: 1, nextTask: 1, openRepositories: [], selectedRepository: null,
       activeTasks: {}, view: 'repository', tasks: [], remember: false,
       repositoryMaterials: Object.fromEntries(repositories.map((item) => [item.id, defaultRepositoryMaterials(item.id)])),
     };
+  }
+
+  function addRepositories(workspace, ids) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('请至少选择一个 Repo');
+    if (ids.some((id) => !repositories.some((item) => item.id === id))) throw new Error('原型只支持列表中的演示 Repo，不会读取真实仓库');
+    const added = [...new Set(ids)].filter((id) => !workspace.openRepositories.includes(id));
+    workspace.openRepositories.push(...added);
+    if (!workspace.selectedRepository && workspace.openRepositories.length === 1) openRepository(workspace, workspace.openRepositories[0]);
+    return added;
   }
 
   function currentReviewTask(workspace) {
@@ -113,6 +122,37 @@
     workspace.tasks.push(task);
     selectReviewTask(workspace, task.id);
     return task;
+  }
+
+  function loadRepositoryTarget(workspace, repositoryId, target) {
+    const repository = repositories.find((item) => item.id === repositoryId);
+    if (!repository || !workspace.openRepositories.includes(repositoryId) || workspace.selectedRepository !== repositoryId) throw new Error('请先从左侧选择一个已添加的 Repo');
+    if (typeof target !== 'string') throw new Error('请选择分支或 PR');
+    const kind = target.startsWith('pr:') ? 'pr' : target.startsWith('branch:') ? 'branch' : null;
+    const value = target.slice(target.indexOf(':') + 1);
+    const pr = kind === 'pr' ? repository.prs.find((item) => item.id === value) : null;
+    const branch = kind === 'branch' ? branches.find((item) => item.name === value) : null;
+    if (!pr && !branch) throw new Error('所选分支或 PR 不属于当前 Repo 的演示列表，未替换已有代码');
+    const task = currentReviewTask(workspace);
+    const previous = task?.state.scopeReview.selection;
+    if (previous?.kind === kind && (pr ? previous.pr === pr.id : previous.branch === branch.name)) {
+      workspace.view = 'task';
+      return task;
+    }
+    if (task?.state.sourceReview.readingFile || task?.state.center.requirementEdit) throw new Error('请先完成文件读取或保存、取消需求修订，再切换审查对象');
+    const selection = {
+      kind, pr: pr?.id ?? repository.prs[0].id, branch: pr?.head ?? branch.name,
+      base: pr?.base ?? repository.defaultBranch, mode: pr ? 'changes' : 'full', snapshot: 1,
+    };
+    const loaded = task || createReviewTask(workspace, repositoryId, { selection });
+    if (task) changeScope(task.state, selection);
+    loaded.title = reviewTaskTitle(loaded.state);
+    loaded.state.center.stage = 'review';
+    loaded.state.center.readingPositions = {};
+    loaded.state.center.search = '';
+    loaded.state.center.file = fileNavigation(loaded.state).rows[0]?.key ?? scopeState(loaded.state).files[0];
+    workspace.view = 'task';
+    return loaded;
   }
 
   function selectReviewTask(workspace, id) {
@@ -157,9 +197,10 @@
     const knownRepository = (id) => repositories.some((item) => item.id === id);
     const invalid = () => { throw new Error('保存的工作区格式无效，未覆盖原存档；可清除存档后重新创建'); };
     if (!workspace || workspace.version !== 1 || !Array.isArray(workspace.tasks) || !Array.isArray(workspace.openRepositories)
-      || !workspace.openRepositories.length || workspace.openRepositories.some((id) => !knownRepository(id))
+      || workspace.openRepositories.some((id) => !knownRepository(id))
       || new Set(workspace.openRepositories).size !== workspace.openRepositories.length
-      || !workspace.openRepositories.includes(workspace.selectedRepository) || !['repository', 'task'].includes(workspace.view)
+      || workspace.selectedRepository !== null && !workspace.openRepositories.includes(workspace.selectedRepository)
+      || !['repository', 'task'].includes(workspace.view)
       || !Number.isSafeInteger(workspace.nextTask) || workspace.nextTask < 1 || !workspace.activeTasks || !workspace.repositoryMaterials) invalid();
     const ids = new Set();
     for (const repository of repositories) {
@@ -190,6 +231,7 @@
       if (!workspace.tasks.some((task) => task.id === id && task.repositoryId === repositoryId)) invalid();
     }
     if (workspace.view === 'task' && !currentReviewTask(workspace)) invalid();
+    workspace.view = currentReviewTask(workspace) ? 'task' : 'repository';
     workspace.remember = true;
     return workspace;
   }
@@ -280,9 +322,9 @@
     if (patch.repository && patch.repository !== state.scopeReview.selection.repository) {
       const repository = repositories.find((item) => item.id === patch.repository);
       if (!repository) throw new Error('请选择可用的演示 Repository');
-      Object.assign(selection, { pr: repository.prs[0].id, branch: repository.prs[0].head, base: repository.prs[0].base, snapshot: 1 });
+      Object.assign(selection, { pr: repository.prs[0].id, branch: repository.prs[0].head, base: repository.prs[0].base, snapshot: 1 }, patch);
     }
-    if (patch.pr && patch.pr !== state.scopeReview.selection.pr) {
+    if (selection.kind === 'pr' && patch.pr && patch.pr !== state.scopeReview.selection.pr) {
       const repository = repositories.find((item) => item.id === selection.repository);
       const pr = repository.prs.find((item) => item.id === patch.pr);
       if (!pr) throw new Error('所选 PR 不属于这个 Repository');
@@ -483,6 +525,7 @@
       closedOpen: false, evidenceOpen: false, basisOpen: false, historyOpen: false,
       focus: false, patches: {}, fixSnapshots: {}, stageIndex: 0, requirementEdit: null,
       detailsOpen: false, fixValidations: {}, manualEdits: {},
+      readingPositions: {},
       findingMode: state.mode, patchRevision: 0, feedbackId: null, feedbackReadSource: false, feedbackFilter: 'open', linkedFeedbackPr: null,
     };
     state.reviewContext = { taskId: null, skillIds: [] };
@@ -1291,7 +1334,7 @@
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createCenterState, currentFinding, currentChain, problemGroups, findingLocation, selectFile, fileNavigation, comparisonChanges, gitStatusLabels, switchMode, selectFinding, completeReview, applySampleFix, undoSampleFix, sourceFiles, summaryText, approvalGate, confirmBaseline, submitVerdict, statusLabel, preparationState, prepareForReview, chooseMaterial, changeRequirementInclusion, repositories, branches, scopeState, changeScope, coverageLimits, understandingChecks, beginRequirementEdit, saveRequirementEdit, conclusionState, requestApproval, confirmApproval, updateNotes, linkFeedbackPr, selectFeedback, importFeedbackRequirement, syncFeedbackContext,
-      createWorkspaceState, currentReviewTask, openRepository, createReviewTask, selectReviewTask, rememberRepositoryMaterial, configureSkill, parseWorkspace, reviewSkills, recordFixValidation, saveManualEdit, undoManualEdit, fixValidationKey };
+      createWorkspaceState, addRepositories, loadRepositoryTarget, currentReviewTask, openRepository, createReviewTask, selectReviewTask, rememberRepositoryMaterial, configureSkill, parseWorkspace, reviewSkills, recordFixValidation, saveManualEdit, undoManualEdit, fixValidationKey };
     return;
   }
 
@@ -1386,6 +1429,7 @@
   let state = createCenterState('fresh');
   let runGeneration = 0;
   const runningTasks = new Map();
+  const targetLoadErrors = new Map();
   let fileReadGeneration = 0;
   let toastTimer;
   let pendingApproval = null;
@@ -1414,83 +1458,88 @@
     } catch (error) {
       workspace.remember = false;
       storageError = `本机保存失败：${error.message}。当前任务仍在内存，未宣称保存成功。`;
-      renderWorkspaceNavigation();
       notify(storageError, true);
       return false;
     }
   }
 
   function showWorkspaceSelection() {
+    rememberReadingPosition();
     pendingFix = null;
     pendingApproval = null;
     modalRenderer = null;
     if (modal.open) modal.close();
     state = currentReviewTask(workspace)?.state || createCenterState('fresh');
     render(false);
-    if (workspace.view === 'task') locateCurrentCode();
+    restoreReadingPosition();
   }
 
-  function newReview(scenario = 'fresh') {
-    createReviewTask(workspace, workspace.selectedRepository, { scenario });
-    showWorkspaceSelection();
+  function restoreReadingPosition() {
+    for (const [selector, top] of Object.entries(state.center.readingPositions || {})) {
+      const element = main.querySelector(selector);
+      if (element) element.scrollTop = top;
+    }
+    if (activeTask()) locateCurrentCode(false);
   }
 
-  function taskStatus(task) {
-    if (task.state.stale) return '依据变化 · 待重审';
-    if (task.state.runStatus === 'idle') return '草稿';
-    return runLabels[task.state.runStatus];
+  function rememberReadingPosition() {
+    state.center.readingPositions = Object.fromEntries(
+      ['.problem-list', '.editor-scroll', '.navigator-scroll'].map((selector) => [selector, main.querySelector(selector)?.scrollTop || 0]),
+    );
   }
 
-  function renderWorkspaceNavigation() {
+  function loadTarget(value) {
+    rememberReadingPosition();
+    const previousKey = activeTask() ? scopeState(state).key : null;
+    try {
+      const task = loadRepositoryTarget(workspace, workspace.selectedRepository, value);
+      targetLoadErrors.delete(workspace.selectedRepository);
+      state = task.state;
+    } catch (error) {
+      targetLoadErrors.set(workspace.selectedRepository, { value, message: error.message });
+      render();
+      return notify(error.message, true);
+    }
+    pendingFix = null;
+    pendingApproval = null;
+    const changed = scopeState(state).key !== previousKey;
+    render(!changed);
+    if (changed) locateCurrentCode();
+  }
+
+  function resetDemoScenario(scenario) {
     const task = activeTask();
-    const tasks = workspace.tasks.filter((item) => item.repositoryId === workspace.selectedRepository);
-    document.getElementById('workspace-navigation').innerHTML = `<nav class="repository-navigation" aria-label="Repo 工作区">
-      <div class="repository-tabs" role="tablist" aria-label="已打开的 Repo">${workspace.openRepositories.map((id) => {
-        const repository = repositories.find((item) => item.id === id);
-        const running = workspace.tasks.some((item) => item.repositoryId === id && item.state.runStatus === 'running');
-        return `<button class="repository-tab ${id === workspace.selectedRepository ? 'active' : ''}" role="tab" aria-selected="${id === workspace.selectedRepository}" data-action="select-repository" data-id="${id}">${icon('branch')}<span>${escape(repository.name)}</span>${running ? badge('运行中', 'blue') : ''}</button>`;
-      }).join('')}</div>
-      <button class="button small ghost" data-action="open-repository">＋ 打开 Repo</button>
-      <button class="button small ghost" data-action="workspace-storage">${icon(workspace.remember ? 'check' : 'lock')}${workspace.remember ? '本机保存已开启' : '仅页面内存'}</button>
-      </nav><div class="task-toolbar"><button class="text-button" data-action="repository-overview">${icon('file')}审查任务 ${tasks.length}</button>
-      <span class="task-divider">/</span><select id="task-picker" aria-label="当前 Repo 的审查任务"><option value="" ${!task ? 'selected' : ''}>选择审查任务</option>${tasks.map((item) => `<option value="${item.id}" ${item.id === task?.id ? 'selected' : ''}>${escape(item.title)} · ${escape(taskStatus(item))} · ${item.id}</option>`).join('')}</select>
-      ${task ? badge(taskStatus(task), task.state.stale ? 'amber' : 'blue') : '<span class="form-hint">每个任务分别保留代码范围、参考材料与处理记录</span>'}
-      ${storageError ? `<span class="storage-error" role="status">${escape(storageError)}</span>` : ''}</div>`;
+    if (!task) return notify('请先选择 Repo 和分支 / PR。', true);
+    runningTasks.delete(state);
+    const selection = state.scopeReview.selection;
+    state = createCenterState(scenario);
+    changeScope(state, selection);
+    state.reviewContext = { taskId: task.id, skillIds: ['business-path'] };
+    state.sources.push(...JSON.parse(JSON.stringify(workspace.repositoryMaterials[task.repositoryId])));
+    if (!state.hasResults) sources.organize(state);
+    task.state = state;
+    pendingApproval = null;
+    if (modal.open) modal.close();
+    modalRenderer = null;
+    render(false);
   }
 
-  function renderRepositoryOverview() {
-    const repository = repositories.find((item) => item.id === workspace.selectedRepository);
-    const tasks = workspace.tasks.filter((item) => item.repositoryId === repository.id);
-    const materials = workspace.repositoryMaterials[repository.id];
-    return `<div class="repository-overview"><header class="overview-heading"><div><p class="doc-kicker">REPOSITORY · 离线演示</p><h1>${escape(repository.name)}</h1><p class="small-copy">一个 Repo，多次独立审查。打开其他 Repo 不会清除这里的材料、代码阅读位置或修复进度。</p></div><button class="button primary" data-action="new-review">${icon('play')}新建审查</button></header>
-      <div class="overview-metrics"><span>${tasks.length} 个审查任务</span><span>${materials.length} 份 Repo 常用参考</span><span>${workspace.openRepositories.length} 个 Repo 已打开</span></div>
-      <section class="task-list" aria-label="本 Repo 的审查任务">${tasks.map((task) => {
-        const scope = scopeState(task.state);
-        return `<button class="task-card" data-action="select-task" data-id="${task.id}"><span class="task-card-icon">${icon(scope.pr ? 'message' : 'branch')}</span><span class="task-card-content"><strong>${escape(task.title)}</strong><small>${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 全量快照'} · ${escape(scope.head.version)} · 快照 ${task.state.scopeReview.selection.snapshot}</small><small>${sources.selectedSources(task.state).length} 份材料 · ${task.state.hasResults ? `${problemGroups(task.state).open.length} 项待处理` : '尚无有效结果'} · ${escape(task.id)}</small></span>${badge(taskStatus(task), task.state.stale ? 'amber' : 'blue')}${icon('chevron')}</button>`;
-      }).join('') || `<div class="repository-empty">${icon('shield')}<h2>为这个 Repo 创建第一次审查</h2><p>选择 PR 或分支，添加需求与验收标准，再开始审查。没有需求也可以做有边界的技术审查。</p><button class="button primary" data-action="new-review">创建审查任务</button>${repository.id === 'checkout' ? '<button class="text-button" data-action="example-review">打开有问题的演示任务</button>' : ''}</div>`}</section>
-      <section class="repo-material-summary"><h2>Repo 常用参考</h2><p class="form-hint">新任务继承原文快照，可单独移除。任务中添加的材料可保存为本 Repo 常用参考；不会改写已有任务。</p>${materials.map((material) => `<details><summary>${escape(material.name)} · v${material.version}</summary><div class="markdown-body">${markdown.render(material.text)}</div></details>`).join('')}</section>
-      <p class="prototype-boundary">原型只提供两个虚构 Repo；不读取真实仓库、不调用模型。Skill 与验证均为交互演示。</p></div>`;
+  function renderRepositoryWelcome() {
+    return `<section class="repo-welcome" aria-labelledby="repo-welcome-title">${icon('branch')}<h1 id="repo-welcome-title">选择 Repo，开始代码审查</h1><p>添加一个或多个 Repo，再选择分支或 PR 查看代码。</p><button class="button primary" data-action="open-repository">选择 Repo</button><p class="form-hint">离线原型仅提供虚构 Repo，不读取真实仓库。</p>${storageError ? `<p class="input-error" role="status">${escape(storageError)}</p>` : ''}</section>`;
   }
 
-  function renderReviewContext() {
-    const busy = state.runStatus === 'running';
-    const inherited = state.sources.filter((source) => source.binding === 'repository');
-    return `<div class="review-context-settings"><h3>Repo 参考 · 适用范围可调整</h3>${inherited.map((source) => `<label class="context-choice"><input type="checkbox" name="material-selection" value="${source.id}" ${source.selected ? 'checked' : ''} ${busy ? 'disabled' : ''}><span><strong>${escape(source.name)} · v${source.version}</strong><small>仅本次任务的原文快照 · 作为背景，不自动成为验收要求</small></span></label>`).join('')}
-      <h3>审查 Skill · 可复用的方法</h3><div class="skill-choices">${reviewSkills.map((skill) => `<label class="context-choice"><input type="checkbox" name="review-skill" value="${skill.id}" ${state.reviewContext.skillIds.includes(skill.id) ? 'checked' : ''} ${busy ? 'disabled' : ''}><span><strong>${escape(skill.name)} <small>v${skill.version}</small></strong><small>${escape(skill.description)}</small></span></label>`).join('')}</div>
-      <p class="form-hint">需求说明“应该实现什么”，Skill 说明“如何检查”。本原型只演示按需选择，不加载脚本、不实际注入模型，也不让方法覆盖需求。</p></div>`;
-  }
-
-  function renderTaskPreparation() {
-    const task = activeTask();
-    return `<div class="task-preparation"><header class="overview-heading"><div><p class="doc-kicker">${escape(scopeState(state).repository.name)} / ${escape(task.id)}</p><h1>${state.hasResults ? '调整本次审查' : '准备审查'}</h1><p class="small-copy">确定代码范围，准备参考依据，核对理解后开始。修改范围或依据会使旧结论失效。</p></div><button class="button" data-action="browse-code">${icon('code')}预览代码</button></header>
-      <section class="setup-section"><h2><span class="setup-number">1</span>审查对象</h2><label class="field-label" for="task-title">任务名称</label><input id="task-title" class="text-field" required value="${escape(task.title)}">${renderScopeSelection()}</section>
-      <section class="setup-section"><h2><span class="setup-number">2</span>Repo 参考与审查方法</h2>${renderReviewContext()}</section>
-      <section class="setup-section"><h2><span class="setup-number">3</span>本次需求与验收标准</h2>${renderPrepare()}</section>
-      <p class="prototype-boundary">使用右上角按钮一次确认并开始。自定义原文可真实读取，但原型不分析其语义，不会伪造完整审查结果。${workspace.remember ? '已按你的设置保存到当前浏览器。' : '当前仅保留在页面内存；可从顶部明确启用本机保存。'}</p></div>`;
+  function renderRepositoryList() {
+    return `<section class="repo-navigation" aria-label="Repo 列表"><div class="repo-list-heading"><h2>Repo</h2><button class="text-button" data-action="open-repository" ${workspace.openRepositories.length === repositories.length ? 'disabled title="所有演示 Repo 均已添加"' : ''}>＋ 添加 Repo</button></div><div class="repo-list">${workspace.openRepositories.map((id) => {
+      const repository = repositories.find((item) => item.id === id);
+      const running = workspace.tasks.some((item) => item.repositoryId === id && item.state.runStatus === 'running');
+      return `<button class="repo-item ${id === workspace.selectedRepository ? 'active' : ''}" data-action="select-repository" data-id="${id}" aria-pressed="${id === workspace.selectedRepository}" title="${escape(repository.name)}${running ? ' · 审查中' : ''}">${icon(running ? 'refresh' : 'branch', running ? 'spin' : '')}<span>${escape(repository.name)}</span></button>`;
+    }).join('')}</div>${storageError ? `<p class="input-error" role="status">${escape(storageError)}</p>` : ''}</section>`;
   }
 
   function openRepositoryDialog() {
-    openModal('打开 Repo · 演示工作区', `<div class="modal-body"><p class="small-copy">同时打开多个 Repo，每个 Repo 的审查任务和材料独立。这里只切换虚构示例，不读取本地磁盘或远程仓库。</p><div class="repository-options">${repositories.map((repository) => `<button class="task-card" data-action="open-repository-option" data-id="${repository.id}">${icon('branch')}<span class="task-card-content"><strong>${escape(repository.name)}</strong><small>${workspace.openRepositories.includes(repository.id) ? '已打开 · 切换到该 Repo' : '打开此演示 Repo'}</small></span>${icon('arrow')}</button>`).join('')}</div></div>`);
+    const available = repositories.filter((repository) => !workspace.openRepositories.includes(repository.id));
+    if (!available.length) return notify('所有演示 Repo 均已添加，可从左侧切换。');
+    openModal('选择 Repo', `<form id="repository-selection-form"><div class="modal-body"><p class="small-copy">支持多选。这里只加载虚构示例，不读取本地磁盘或远程仓库。</p><div class="repository-options">${available.map((repository) => `<label class="context-choice"><input type="checkbox" name="repository" value="${repository.id}"><span><strong>${escape(repository.name)}</strong><small>${repository.id === 'checkout' ? '支付、订单与跨文件业务链示例' : '独立的订单恢复示例'}</small></span></label>`).join('')}</div><p id="repository-selection-error" class="input-error" role="alert" hidden></p></div></form>`, '<button class="button" data-action="close">取消</button><button class="button primary" type="submit" form="repository-selection-form">添加所选 Repo</button>');
   }
 
   function storageDialog() {
@@ -1512,14 +1561,17 @@
   }
 
   function renderContextControls() {
-    const preparation = preparationState(state), running = state.runStatus === 'running';
-    const scope = scopeState(state);
-    const summary = `${scope.repository.name} · ${scope.pr ? `PR ${scope.pr.id}` : scope.head.name}`;
-    const status = running ? runStages[Math.min(state.center.stageIndex, 3)] : state.stale ? '判断已过期，请重新审查' : state.runStatus === 'partial' ? '结果受限' : runLabels[state.runStatus];
-    return `<details id="context-bar" class="context-bar" aria-label="审查对象与需求" ${state.center.contextExpanded ? 'open' : ''}><summary class="context-toggle" title="${escape(summary)}">${icon('chevron')}<span>${scope.pr ? `PR ${scope.pr.id}` : escape(scope.head.name)}</span></summary><div class="context-controls"><p class="scope-caption">${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 全量快照'}<br>${escape(scope.head.version)} · 快照 ${state.scopeReview.selection.snapshot}</p><button class="button small" data-action="settings" ${running ? 'disabled' : ''}>审查设置</button><button class="button small" data-action="requirements">${state.center.requirementEdit ? '修订未保存' : `依据 · ${sources.selectedSources(state).length} 份`}</button><span id="review-status" class="${state.stale ? 'status-warning' : ''}" role="status" title="${escape([...coverageLimits(state), ...preparation.reasons].join('；'))}">${escape(status)}</span></div></details>`;
+    const task = activeTask(), scope = task ? scopeState(state) : null;
+    const preparation = task ? preparationState(state) : null;
+    const summary = scope ? scope.pr ? `PR ${scope.pr.id}` : scope.head.name : '选择分支 / PR';
+    const status = state.runStatus === 'running' ? runStages[Math.min(state.center.stageIndex, 3)] : state.scopeReview.discardedResults && !state.hasResults ? '对象已更换，旧结果已失效' : state.stale ? '判断已过期，请重新审查' : state.runStatus === 'partial' ? '结果受限' : runLabels[state.runStatus];
+    return `<details id="context-bar" class="context-bar" aria-label="审查对象与需求" ${state.center.contextExpanded ? 'open' : ''}><summary class="context-toggle" title="${escape(summary)}">${icon('chevron')}<span>${escape(summary)}</span></summary><div class="context-controls">${renderScopeSelection()}${task ? `<button class="button" data-action="requirements">${state.center.requirementEdit ? '需求 · 修订未保存' : preparation.requirements.length ? `需求 ${preparation.requirements.length}${preparation.needsConfirmation ? ' · 待确认' : ''}` : '需求（可选）'}</button><span id="review-status" class="${state.stale ? 'status-warning' : ''}" role="status" title="${escape([...coverageLimits(state), ...preparation.reasons].join('；'))}">${escape(status)}</span>` : ''}</div></details>`;
   }
 
   function renderNavigator() {
+    const repositoryList = renderRepositoryList();
+    if (!workspace.selectedRepository) return repositoryList;
+    if (!activeTask()) return repositoryList + renderContextControls();
     const search = state.center.search.toLowerCase();
     const groups = problemGroups(state);
     const matches = (finding) => `${finding.title} ${finding.source} ${finding.id}`.toLowerCase().includes(search);
@@ -1529,7 +1581,7 @@
       const status = file.status ? `${gitStatusLabels[file.status]} · 相对 ${navigation.base.name}` : `未变化 · 相对 ${navigation.base.name}`;
       return `<button class="file-nav ${state.center.file === file.key ? 'active' : ''}" data-action="source" data-source="${file.key}" aria-pressed="${state.center.file === file.key}" title="${escape(path)} · ${escape(status)}">${icon(file.kind === 'code' ? 'code' : 'file')}<span>${escape(path)}</span>${file.status ? `<small class="file-role git-status git-${file.status.toLowerCase()}" aria-label="${escape(status)}">${file.status}</small>` : ''}</button>`;
     }).join('');
-    return `${renderContextControls()}<div class="navigator-heading"><h2>审查导航</h2></div>
+    return `${repositoryList}${renderContextControls()}<div class="navigator-heading"><h2>审查导航</h2></div>
       <div class="nav-segments" role="tablist" aria-label="问题与文件"><button class="nav-segment ${!fileView ? 'active' : ''}" role="tab" aria-selected="${!fileView}" data-action="navigator" data-tab="findings">问题 ${groups.open.length}</button><button class="nav-segment ${fileView ? 'active' : ''}" role="tab" aria-selected="${fileView}" data-action="navigator" data-tab="files" title="状态相对 ${escape(navigation.base.name)}">${navigation.label} ${navigation.rows.length}</button></div>
       <div class="navigator-search">${icon('search')}<input id="center-search" type="search" placeholder="${fileView ? `搜索${navigation.label === 'Changes' ? '变更文件' : '仓库文件'}` : '搜索问题'}" aria-label="搜索导航" value="${escape(state.center.search)}"></div>
       <div class="navigator-scroll">${fileView ? fileList || '<p class="small-copy">没有匹配的仓库文件。</p>' : groups.open.filter(matches).map(issueNav).join('') || `<p class="small-copy">${search ? '没有匹配的问题。' : state.hasResults ? '本次没有待处理问题。' : '尚未开始审查，可以先浏览代码。'}</p>`}
@@ -1540,7 +1592,7 @@
     const task = activeTask();
     const preparation = preparationState(state);
     document.getElementById('product-mark').innerHTML = icon('shield');
-    document.getElementById('repository-context').textContent = `${repositories.find((item) => item.id === workspace.selectedRepository).name}${task ? ` / ${task.title}` : ' / 审查任务'}`;
+    document.getElementById('repository-context').textContent = '离线原型 · 未连接模型与真实仓库';
     document.querySelector('.command-actions [data-action="help"]').innerHTML = icon('info');
     const dark = document.documentElement.dataset.theme === 'dark';
     document.getElementById('center-theme').innerHTML = icon(dark ? 'sun' : 'moon');
@@ -1548,7 +1600,8 @@
     document.getElementById('demo-scenario').value = state.scenario;
     const running = state.runStatus === 'running';
     const toolsDisabled = !task || running || state.sourceReview.readingFile || !!state.center.requirementEdit;
-    document.querySelectorAll('#demo-tools button').forEach((button) => { button.disabled = toolsDisabled; });
+    document.querySelectorAll('#demo-tools button').forEach((button) => { button.disabled = button.dataset.action !== 'workspace-storage' && toolsDisabled; });
+    document.getElementById('demo-scenario').disabled = toolsDisabled;
     document.getElementById('center-reset').disabled = !task;
     document.getElementById('demo-requirement').disabled = toolsDisabled || !preparationState(state).items.some((item) => item.id === 'RQ-02');
     const sourcePicker = document.getElementById('demo-source');
@@ -1558,8 +1611,9 @@
     const run = document.getElementById('run-review');
     run.hidden = !task;
     run.dataset.action = running ? 'cancel' : 'prepare-start';
-    run.disabled = !running && !preparation.canStart;
-    run.title = preparation.canStart ? '' : preparation.reasons.join('；');
+    const loadError = targetLoadErrors.get(workspace.selectedRepository);
+    run.disabled = !running && (!preparation.canStart || !!loadError);
+    run.title = loadError ? '新对象未加载，当前保留旧代码。请重试或重新选择分支 / PR。' : preparation.canStart ? '' : preparation.reasons.join('；');
     run.innerHTML = `${icon(running ? 'close' : 'play')}${running ? '取消审查' : preparation.needsConfirmation ? preparation.label : ['partial', 'cancelled'].includes(state.runStatus) && !state.stale ? '继续审查' : state.runStatus === 'idle' ? '开始审查' : '重新审查'}`;
     document.getElementById('review-opinion-toggle').hidden = !task || !state.hasResults;
   }
@@ -1597,6 +1651,7 @@
     const item = currentFeedback();
     const finding = item ? null : currentFinding(state);
     const scope = scopeState(state);
+    const patched = Object.keys(state.center.patches).length > 0;
     const navigation = fileNavigation(state), change = navigation.changes.find((entry) => entry.key === file.key);
     const path = change?.path ?? file.path;
     const diffAvailable = file.kind === 'code' && !!change && !state.center.manualEdits[file.key];
@@ -1610,7 +1665,7 @@
       body = `<div class="code-caption"><span>${change?.status === 'D' ? '删除前源码' : source ? '当前源码' : `行内 Diff · 相对 ${escape(navigation.base.name)}`}</span><strong>演示片段 ${file.start}–${file.lines.at(-1).number} · 非完整文件</strong></div><div class="code-table">${lines}</div>`;
     }
     const feedbackContext = item ? `<div class="feedback-location"><strong>${escape(item.id)} · ${escape(item.title)}</strong><span>${item.isOutdated ? '原位置 Outdated；当前代码只作对照，不会自动重定位。' : '阅读关联代码不会改变 Reply 目标。'}</span>${item.originalDiff ? `<button class="text-button" data-action="feedback-original" data-id="${item.id}">查看评论时的 Diff</button>` : ''}</div>` : '';
-    return `<div class="editor-tools"><div class="editor-breadcrumb" title="${escape(path)} · ${escape(scope.head.version)} · 只读演示${state.center.patchRevision ? ` · 浏览器补丁 ${state.center.patchRevision}` : ''}${scope.pr && !change ? ' · 关联文件，不在 PR Changes 内' : ''}"><strong>${escape(path)}</strong></div><div class="editor-view-controls">${diffAvailable ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge(file.kind === 'code' ? '源码' : '项目文档', 'blue')}${file.kind === 'code' ? `<button class="button small" data-action="manual-edit" data-source="${file.key}" ${state.runStatus === 'running' ? 'disabled' : ''}>修改代码副本</button>` : ''}${state.center.manualEdits[file.key] ? `<button class="button small" data-action="undo-manual" data-source="${file.key}">撤销手动修改</button>` : ''}${state.hasResults && finding ? '<button class="button small" data-action="finding-details">问题详情</button>' : ''}</div></div>${feedbackContext}<div class="code-snapshot">${escape(scope.repository.name)} · ${escape(scope.head.name)} · ${escape(scope.head.version)}${state.center.manualEdits[file.key] ? ' · 手动编辑副本，未分析，不能复用旧结论' : state.center.patchRevision ? ` · 浏览器补丁 ${state.center.patchRevision}` : ' · 只读快照'}</div><div class="editor-scroll">${progressStrip()}${body}</div>`;
+    return `<div class="editor-tools"><div class="editor-breadcrumb" title="${escape(path)} · ${escape(scope.head.version)} · 只读演示${patched ? ` · 浏览器补丁 ${state.center.patchRevision}` : ''}${scope.pr && !change ? ' · 关联文件，不在 PR Changes 内' : ''}"><strong>${escape(path)}</strong></div><div class="editor-view-controls">${diffAvailable ? `<button class="tiny-toggle ${!source ? 'active' : ''}" data-action="code-view" data-view="diff">Diff</button><button class="tiny-toggle ${source ? 'active' : ''}" data-action="code-view" data-view="source">源码</button>` : badge(file.kind === 'code' ? '源码' : '项目文档', 'blue')}${file.kind === 'code' ? `<button class="button small" data-action="manual-edit" data-source="${file.key}" ${state.runStatus === 'running' ? 'disabled' : ''}>修改代码副本</button>` : ''}${state.center.manualEdits[file.key] ? `<button class="button small" data-action="undo-manual" data-source="${file.key}">撤销手动修改</button>` : ''}${state.hasResults && finding ? '<button class="button small" data-action="finding-details">问题详情</button>' : ''}</div></div>${feedbackContext}<div class="code-snapshot">${escape(scope.repository.name)} · ${escape(scope.head.name)} · ${escape(scope.head.version)}${state.center.manualEdits[file.key] ? ' · 手动编辑副本，未分析，不能复用旧结论' : patched ? ` · 浏览器补丁 ${state.center.patchRevision}` : ' · 只读快照'}</div><div class="editor-scroll">${progressStrip()}${body}</div>`;
   }
 
   function requirementOrigins(requirement) {
@@ -1645,19 +1700,16 @@
   }
 
   function renderScopeSelection() {
-    const scope = scopeState(state);
-    const selection = state.scopeReview.selection;
-    const disabled = state.runStatus === 'running' || state.center.requirementEdit ? 'disabled' : '';
-    const branchOptions = (value, omit = '') => branches.map((branch) => `<option value="${escape(branch.name)}" ${branch.name === value ? 'selected' : ''} ${branch.name === omit ? 'disabled' : ''}>${escape(branch.name)}</option>`).join('');
+    const task = activeTask();
+    const repository = repositories.find((item) => item.id === workspace.selectedRepository);
+    const selection = task?.state.scopeReview.selection;
+    const disabled = task && (state.runStatus === 'running' || state.sourceReview.readingFile || state.center.requirementEdit) ? 'disabled' : '';
+    const selected = selection ? selection.kind === 'pr' ? `pr:${selection.pr}` : `branch:${selection.branch}` : '';
+    const loadError = targetLoadErrors.get(repository.id);
     return `<div class="scope-form compact-scope">
-      <div class="scope-field scope-wide"><span>绑定的 Repo</span><strong>${escape(scope.repository.name)}</strong><small class="form-hint">任务不跨 Repo。切换 Repo 请使用顶部标签；已有任务的依据不会被搬到另一个 Repo。</small></div>
-      <fieldset class="scope-kind"><legend>审查对象</legend><div>${[['pr', 'PR'], ['branch', '分支']].map(([value, label]) => `<label><input type="radio" name="scope-kind" value="${value}" ${selection.kind === value ? 'checked' : ''} ${disabled}><span>${label}</span></label>`).join('')}</div></fieldset>
-      ${selection.kind === 'pr'
-        ? `<label class="scope-field scope-wide" for="scope-pr"><span>PR</span><select id="scope-pr" class="text-field" ${disabled}>${scope.repository.prs.map((pr) => `<option value="${pr.id}" ${selection.pr === pr.id ? 'selected' : ''}>PR ${pr.id} · ${pr.title}</option>`).join('')}</select></label>`
-        : `<label class="scope-field" for="scope-branch"><span>分支</span><select id="scope-branch" class="text-field" ${disabled}>${branchOptions(selection.branch)}</select></label>
-          <label class="scope-field" for="scope-mode"><span>对象范围</span><select id="scope-mode" class="text-field" ${disabled}><option value="changes" ${selection.mode === 'changes' ? 'selected' : ''}>分支变更 · 指定比较基线</option><option value="full" ${selection.mode === 'full' ? 'selected' : ''}>分支全量快照</option></select></label>
-          ${selection.mode === 'changes' ? `<label class="scope-field" for="scope-base"><span>比较基线</span><select id="scope-base" class="text-field" ${disabled}>${branchOptions(selection.base, selection.branch)}</select></label>` : ''}`}
-      <p class="scope-caption scope-wide">${escape(scope.head.name)}${scope.base ? ` → ${escape(scope.base.name)}` : ' · 无 Diff 基线'} · 代码 ${escape(scope.head.version)} · 演示快照 ${selection.snapshot}<br>比较范围用于定位与归因；保留整仓与相关业务链上下文，不把审查限定在新增行。</p>
+      <label class="scope-field" for="scope-target"><span>分支 / PR</span><select id="scope-target" class="text-field" ${disabled}><option value="" disabled ${!selection ? 'selected' : ''}>选择分支或 PR</option><optgroup label="PR">${repository.prs.map((pr) => `<option value="pr:${pr.id}" ${selected === `pr:${pr.id}` ? 'selected' : ''}>PR ${pr.id} · ${escape(pr.title)}</option>`).join('')}</optgroup><optgroup label="分支">${branches.map((branch) => `<option value="branch:${escape(branch.name)}" ${selected === `branch:${branch.name}` ? 'selected' : ''}>${escape(branch.name)}</option>`).join('')}</optgroup></select></label>
+      ${loadError ? `<div id="scope-load-error" class="target-load-error" role="alert"><p>${escape(loadError.message)}</p><button class="text-button" data-action="retry-target">重试加载</button></div>` : ''}
+      ${task ? `<p class="scope-caption">${escape(scopeState(state).head.version)} · 快照 ${selection.snapshot}<br>${selection.kind === 'pr' ? `Changes 相对 ${escape(scopeState(state).base.name)}` : `文件状态相对 ${escape(repository.defaultBranch)}`}</p>` : ''}
       </div>`;
   }
 
@@ -1752,7 +1804,6 @@
       <details id="problem-history" ${state.center.historyOpen ? 'open' : ''}><summary>记录与处理${finding.disposition === 'commented' && finding.critical && !finding.resolved ? ' · 已评论，关键项仍未闭合' : ''}</summary>${renderHistory(finding)}
       </details></div><div class="judgment-actions">${finding.type === 'implementation' ? `<button class="button primary" data-action="fix-preview" data-id="${finding.id}" ${cannotFix ? 'disabled' : ''}>${icon('code')}${patched ? '查看已应用的示例' : '生成修复方案（演示）'}</button>` : finding.type === 'requirement' ? `<button class="button primary" data-action="edit-requirement" data-id="${finding.requirement}" ${busy ? 'disabled' : ''}>澄清需求</button>` : finding.type === 'question' ? `<button class="button primary" data-action="evidence" ${busy ? 'disabled' : ''}>补充契约证据</button>` : ''}
       ${state.center.fixSnapshots[finding.id] ? `<button class="button outline-accent" data-action="validate-fix" data-id="${finding.id}" ${busy ? 'disabled' : ''}>验证与复审（演示）</button><button class="button" data-action="undo-fix" data-id="${finding.id}" ${busy ? 'disabled' : ''}>撤销示例补丁</button>` : ''}
-      ${finding.type === 'implementation' ? `<button class="button" data-action="manual-edit" data-source="${location.file}" ${busy ? 'disabled' : ''}>手动修改代码副本</button>` : ''}
       <button class="button" data-action="${finding.type === 'reasonable' ? 'boundary' : 'comment'}" data-id="${finding.id}" ${busy ? 'disabled' : ''}>${finding.type === 'reasonable' ? '记录边界' : '记录说明 / 反证'}</button></div>`;
   }
 
@@ -1779,11 +1830,10 @@
     const focused = document.activeElement;
     const focusId = focused?.id;
     const selection = focused instanceof HTMLTextAreaElement || focused instanceof HTMLInputElement && ['text', 'search', 'url'].includes(focused.type) ? [focused.selectionStart, focused.selectionEnd] : null;
-    const positions = preserve ? Object.fromEntries(['.center-workspace', '.editor-scroll', '.navigator-scroll', '.judgment-body'].map((selector) => [selector, document.querySelector(selector)?.scrollTop || 0])) : {};
+    const positions = preserve ? Object.fromEntries(['.problem-list', '.editor-scroll', '.navigator-scroll', '.judgment-body'].map((selector) => [selector, document.querySelector(selector)?.scrollTop || 0])) : {};
     renderTop();
-    renderWorkspaceNavigation();
-    main.innerHTML = !activeTask() ? renderRepositoryOverview() : state.center.stage === 'prepare' ? renderTaskPreparation()
-      : `<div class="linked-workspace ${state.center.detailsOpen ? 'with-inspector' : ''}"><aside class="problem-list" aria-label="问题与仓库文件">${renderNavigator()}</aside><section id="review-code" class="code-pane" aria-label="代码块与定位">${renderEditor()}</section>${state.center.detailsOpen ? `<aside class="issue-inspector" aria-label="问题详情"><div class="inspector-toolbar"><strong>问题详情</strong><button class="icon-button" data-action="close-inspector" aria-label="收起问题详情">${icon('close')}</button></div>${renderFindingInspector()}</aside>` : ''}</div>`;
+    main.innerHTML = !workspace.openRepositories.length ? renderRepositoryWelcome()
+      : `<div class="linked-workspace"><aside class="problem-list" aria-label="Repo、问题与仓库文件">${renderNavigator()}</aside><section id="review-code" class="code-pane" aria-label="代码块与定位">${activeTask() ? renderEditor() : `<div class="target-placeholder">${icon(workspace.selectedRepository ? 'code' : 'branch')}<h2>${workspace.selectedRepository ? '选择分支或 PR' : '选择一个 Repo'}</h2><p>${workspace.selectedRepository ? '从左侧选择审查对象，即可浏览代码。无需先开始审查。' : '从左侧 Repo 列表选择一个仓库，再选择分支或 PR。'}</p></div>`}</section></div>`;
     if (modal.open && modalRenderer) {
       modal.querySelector('#workspace-dialog-body').innerHTML = modalRenderer();
       if (state.center.requirementEdit?.preview) setMarkdownEditorMode(modal.querySelector('#center-requirement-form [data-markdown-editor]'), 'preview');
@@ -1821,7 +1871,7 @@
     locateCurrentCode();
   }
 
-  function locateCurrentCode() {
+  function locateCurrentCode(scrollToTarget = true) {
     const scroll = main.querySelector('#review-code .editor-scroll');
     if (!scroll) return;
     const line = state.center.targetLine ?? (state.hasResults && state.center.file === primaryFiles[state.selectedFinding] ? findingLocation(state).line : null);
@@ -1829,8 +1879,8 @@
     scroll.querySelectorAll('.targeted-line').forEach((element) => element.classList.remove('targeted-line'));
     if (target) {
       target.classList.add('targeted-line');
-      scroll.scrollTop += target.getBoundingClientRect().top - scroll.getBoundingClientRect().top - scroll.clientHeight / 3;
-    } else scroll.scrollTop = 0;
+      if (scrollToTarget) scroll.scrollTop += target.getBoundingClientRect().top - scroll.getBoundingClientRect().top - scroll.clientHeight / 3;
+    } else if (scrollToTarget) scroll.scrollTop = 0;
   }
 
   function nextFinding() {
@@ -1854,7 +1904,8 @@
     modalRenderer = null;
     modal.classList.remove('workspace-dialog');
     if (modal.open) modal.close();
-    modal.innerHTML = `<div class="modal-header"><h2 id="center-modal-title">${title}</h2><button class="icon-button" data-action="close" aria-label="关闭对话框">${icon('close')}</button></div>${body}<div class="modal-footer">${footer}</div>`;
+    const headerClose = footer.includes('data-action="close"') ? '' : `<button class="icon-button" data-action="close" aria-label="关闭对话框">${icon('close')}</button>`;
+    modal.innerHTML = `<div class="modal-header"><h2 id="center-modal-title">${title}</h2>${headerClose}</div>${body}<div class="modal-footer">${footer}</div>`;
     modal.classList.toggle('markdown-dialog', !!modal.querySelector('[data-markdown-editor],[data-markdown-reader]'));
     modal.showModal();
   }
@@ -1866,15 +1917,7 @@
   }
 
   function openRequirements() {
-    if (state.center.stage === 'prepare') {
-      if (modal.open) modal.close();
-      modalRenderer = null;
-      render();
-      const understanding = document.getElementById('understanding-details');
-      if (understanding) understanding.open = true;
-      return;
-    }
-    openWorkspaceDialog('参考依据与审查方法', () => renderReviewContext() + renderPrepare());
+    openWorkspaceDialog('需求与参考材料', renderPrepare);
   }
 
   function openOpinion() {
@@ -1882,7 +1925,7 @@
   }
 
   function help() {
-    openModal('Repo 审查工作区', `<div class="modal-body"><p>顶部同时打开多个演示 Repo，每个 Repo 下创建多个独立任务。切换任务保留输入、代码位置和运行进度，不把上下文搬到另一 Repo。</p><p>新建审查先选 PR 或分支与比较基线，再准备 Repo 参考、本次需求和可选 Skill。材料是依据，Skill 是方法；没有需求时明确保留“需求一致性未评审”的边界。</p><p>审查时左侧切换文件 / 问题，中间查看 Diff / 源码，右侧按需展开问题详情。F8 切换问题，关联证据可定位其他文件。</p><p>修改先核对 Repo、任务、分支与快照。AI 方案先预览，应用后待验证；预设验证失败不会关闭问题。手动修改也仅编辑浏览器内的示例片段，自定义代码不能复用预设分析。</p><p class="form-hint">不连接模型、真实仓库或 GitHub，不执行真实测试。材料默认只在页面内存，明确开启“本机保存”后才写入当前浏览器；可随时清除存档。</p></div>`);
+    openModal('原型说明', `<div class="modal-body"><p>先选择一个或多个 Repo，从左侧选定一个，再选择分支或 PR，即可直接阅读代码，无需先创建审查任务。</p><p>PR 只列 Changes，分支列出全部文件并相对默认分支标注状态。两种方式都保留整仓审查上下文，变更清单不限制审查范围。</p><p>需求是可选标准。没有需求时整仓查 Bug，并明确保留“需求一致性未评审”的边界。使用顶部唯一的按钮开始或重新审查。</p><p>点击问题定位代码；问题详情、证据与修复按需打开。应用补丁不等于验证成功，修改代码或审查对象后旧结果不能继续使用。</p><p>切换 Repo 保留各自的需求、代码位置和进度。默认只保留在页面内存；本机保存与隐私设置位于演示工具中。</p><p class="form-hint">不连接模型、真实仓库或 GitHub，不执行真实测试；只提供虚构代码片段和预设分析。</p></div>`);
   }
 
   function sourceDetails(id, version) {
@@ -2023,7 +2066,7 @@
       if (runningTasks.get(runState) !== generation) return;
       runState.center.stageIndex = index + 1;
       if (state === runState) render();
-      else { renderWorkspaceNavigation(); persistWorkspace(); }
+      else render();
     }
     completeReview(runState);
     runningTasks.delete(runState);
@@ -2076,24 +2119,21 @@
     const target = event.target instanceof Element ? event.target.closest('[data-action]') : null;
     if (!target || target.disabled) return;
     const action = target.dataset.action;
-    if (action === 'new-review') return newReview();
-    if (action === 'example-review') return newReview('standard');
     if (action === 'open-repository') return openRepositoryDialog();
     if (action === 'workspace-storage') return storageDialog();
-    if (action === 'repository-overview') {
-      workspace.view = 'repository';
-      showWorkspaceSelection();
-      return;
-    }
-    if (action === 'select-repository' || action === 'open-repository-option' || action === 'select-task') {
+    if (action === 'select-repository') {
       try {
-        if (action === 'select-task') selectReviewTask(workspace, target.dataset.id);
-        else openRepository(workspace, target.dataset.id);
+        openRepository(workspace, target.dataset.id);
       } catch (error) {
         return notify(error.message, true);
       }
       showWorkspaceSelection();
       return;
+    }
+    if (action === 'retry-target') {
+      const failed = targetLoadErrors.get(workspace.selectedRepository);
+      if (!failed) return notify('没有待重试的代码加载，请重新选择分支 / PR。', true);
+      return loadTarget(failed.value);
     }
     if (action === 'clear-workspace-storage') return openModal('清除本机存档', '<div class="modal-body"><p>删除此原型在当前浏览器保存的任务和材料原文；当前页面内存中的工作区仍保留，不影响真实仓库。</p></div>', '<button class="button" data-action="close">取消</button><button class="button danger" data-action="confirm-clear-storage">确认清除本机存档</button>');
     if (action === 'confirm-clear-storage') {
@@ -2118,31 +2158,18 @@
     }
     if (action === 'markdown-read-mode') return setMarkdownReaderMode(target.closest('[data-markdown-reader]'), target.dataset.mode);
     if (action === 'close') { pendingApproval = null; return modal.close(); }
+    if (action === 'help') return help();
+    if (action === 'theme') { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; return render(); }
+    if (!activeTask()) return notify('请先选择 Repo 和分支 / PR。', true);
     if (action === 'stage') return stage(target.dataset.stage);
     if (action === 'requirements') return openRequirements();
     if (action === 'opinion') return openOpinion();
-    if (action === 'finding-details') { state.center.detailsOpen = true; return render(); }
-    if (action === 'close-inspector') { state.center.detailsOpen = false; return render(); }
-    if (action === 'browse-code') { state.center.stage = 'review'; render(false); return locateCurrentCode(); }
-    if (action === 'help') return help();
-    if (action === 'theme') { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; return render(); }
+    if (action === 'finding-details') return openWorkspaceDialog('问题详情', renderFindingInspector);
     if (action === 'reset') {
-      const task = activeTask();
-      if (!task) return notify('请先创建审查任务。', true);
-      runningTasks.delete(state);
-      const selection = state.scopeReview.selection;
-      state = createCenterState(state.scenario);
-      changeScope(state, selection);
-      state.reviewContext = { taskId: task.id, skillIds: ['business-path'] };
-      state.sources.push(...JSON.parse(JSON.stringify(workspace.repositoryMaterials[task.repositoryId])));
-      if (!state.hasResults) sources.organize(state);
-      task.state = state;
-      pendingApproval = null;
-      if (modal.open) modal.close();
-      render(false);
-      return notify('仅重置当前任务的演示，其他 Repo 和任务保持不变。');
+      resetDemoScenario(state.scenario);
+      return notify('仅重置当前 Repo 的演示，其他 Repo 保持不变。');
     }
-    if (action === 'finding' || action === 'locate-finding') { if (modal.open) modal.close(); selectFinding(state, target.dataset.id); state.center.detailsOpen = true; render(false); return locateCurrentCode(); }
+    if (action === 'finding' || action === 'locate-finding') { if (modal.open) modal.close(); selectFinding(state, target.dataset.id); render(false); return locateCurrentCode(); }
     if (action === 'source') { if (modal.open) modal.close(); return openSource(target.dataset.source); }
     if (action === 'navigator') { state.center.navigator = target.dataset.tab; state.center.search = ''; return render(); }
     if (action === 'inspector-tab') { state.center.inspector = target.dataset.tab; render(); return; }
@@ -2159,7 +2186,7 @@
     if (action === 'copy-summary') return void copySummary();
     if (action === 'run') return void startRun();
     if (action === 'prepare-start') return void startRun(true);
-    if (action === 'cancel') { runningTasks.delete(state); state.runStatus = 'cancelled'; invalidate(state); render(); return notify('已取消本任务的模拟流程，不影响其他任务。'); }
+    if (action === 'cancel') { runningTasks.delete(state); state.runStatus = 'cancelled'; invalidate(state); render(); return notify('已取消当前 Repo 的模拟流程，不影响其他 Repo。'); }
     if (action === 'trace-requirement') return traceRequirement(target.dataset.id);
     if (action === 'material') return sourceDetails(target.dataset.sourceId, Number(target.dataset.version) || undefined);
     if (action === 'materials') return materialsDialog();
@@ -2257,6 +2284,18 @@
     event.preventDefault();
     const form = event.target;
     if (!form.reportValidity()) return;
+    if (form.id === 'repository-selection-form') {
+      try {
+        addRepositories(workspace, new FormData(form).getAll('repository'));
+      } catch (error) {
+        const message = document.getElementById('repository-selection-error');
+        message.textContent = error.message;
+        message.hidden = false;
+        return;
+      }
+      showWorkspaceSelection();
+      return;
+    }
     if (form.id === 'workspace-storage-form') {
       if (document.getElementById('remember-workspace').checked) {
         workspace.remember = true;
@@ -2367,14 +2406,6 @@
   });
 
   document.addEventListener('input', (event) => {
-    if (event.target.id === 'task-title' && activeTask()) {
-      if (event.target.value.trim()) {
-        activeTask().title = event.target.value.trim();
-        activeTask().customTitle = true;
-        persistWorkspace();
-      }
-      return;
-    }
     if (event.target.matches('[data-markdown-input]') && event.target.hidden) {
       setMarkdownEditorMode(event.target.closest('[data-markdown-editor]'), 'preview');
     }
@@ -2409,48 +2440,15 @@
       if (button) button.disabled = !event.target.checked;
       return;
     }
-    if (event.target.id === 'task-picker') {
-      if (event.target.value) selectReviewTask(workspace, event.target.value);
-      else workspace.view = 'repository';
-      showWorkspaceSelection();
-      return;
-    }
-    if (event.target.id === 'task-title') {
-      if (!event.target.value.trim()) {
-        event.target.value = activeTask().title;
-        notify('任务名称不能为空，已保留原名称。', true);
-      }
-      renderTop();
-      renderWorkspaceNavigation();
-      persistWorkspace();
-      return;
-    }
-    if (event.target.name === 'review-skill') {
-      try { configureSkill(state, event.target.value, event.target.checked); } catch (error) { notify(error.message, true); }
-      render();
-      return;
-    }
     if (event.target.id === 'feedback-filter') { state.center.feedbackFilter = event.target.value; render(); return; }
     if (event.target.id === 'demo-scenario') {
       const scenario = event.target.value;
       document.getElementById('demo-tools').open = false;
-      newReview(scenario);
-      return notify('已新建独立演示任务，原任务及其关键问题仍然保留。');
+      resetDemoScenario(scenario);
+      return notify('已切换当前 Repo 的演示场景；没有调用模型，不影响其他 Repo。');
     }
     if (event.target.id === 'requirement-file') return void readLocalFile(event.target.files[0]);
-    const scopeFields = { 'scope-pr': 'pr', 'scope-branch': 'branch', 'scope-mode': 'mode', 'scope-base': 'base' };
-    const scopeField = event.target.name === 'scope-kind' ? 'kind' : scopeFields[event.target.id];
-    if (scopeField) {
-      try {
-        changeScope(state, event.target.name === 'scope-kind' && event.target.value === 'branch' ? { kind: 'branch', mode: 'changes' } : { [scopeField]: event.target.value });
-        if (activeTask() && !activeTask().customTitle) activeTask().title = reviewTaskTitle(state);
-      } catch (error) {
-        render();
-        return notify(error.message, true);
-      }
-      render();
-      return notify('审查对象已更新，材料保留；文件来自明确范围，不根据名称识别“入口”。');
-    }
+    if (event.target.id === 'scope-target') return loadTarget(event.target.value);
     if (event.target.name === 'material-selection') {
       if (state.runStatus === 'running') {
         event.target.checked = sources.getSource(state, event.target.value).selected;
@@ -2483,7 +2481,7 @@
   });
   window.addEventListener('error', (event) => notify(`原型脚本错误：${event.message}`, true));
   window.addEventListener('unhandledrejection', (event) => notify(`原型操作失败：${String(event.reason)}`, true));
-  window.addEventListener('pagehide', persistWorkspace);
+  window.addEventListener('pagehide', () => { rememberReadingPosition(); persistWorkspace(); });
   try {
     const saved = localStorage.getItem(storageKey);
     if (saved) {
@@ -2495,5 +2493,5 @@
     notify(storageError, true);
   }
   render(false);
-  locateCurrentCode();
+  restoreReadingPosition();
 }());
