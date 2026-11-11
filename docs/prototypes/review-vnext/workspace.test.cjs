@@ -2,10 +2,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const sources = require('./sources.js');
 const {
-  createWorkspaceState, addRepositories, loadRepositoryTarget, currentReviewTask, openRepository, createReviewTask, selectReviewTask,
+  createWorkspaceState, addRepositories, loadRepositoryTarget, currentReviewTask, openRepository, closeRepository, createReviewTask, selectReviewTask,
   rememberRepositoryMaterial, configureSkill, parseWorkspace, preparationState, prepareForReview,
   scopeState, applySampleFix, recordFixValidation, completeReview, approvalGate, undoSampleFix, statusLabel,
-  saveManualEdit, undoManualEdit, fixValidationKey, sourceFiles, changeScope,
+  saveManualEdit, undoManualEdit, fixValidationKey, sourceFiles, fileNavigation, changeScope,
 } = require('./center.js');
 
 test('首页从零Repo开始，单选直接进入，多选等待选定Repo，不预建审查', () => {
@@ -95,6 +95,89 @@ test('零Repo和多Repo未选中状态可恢复，未完成修订不允许被换
   assert.throws(() => loadRepositoryTarget(workspace, 'checkout', 'pr:105'), /保存、取消需求修订/);
   assert.equal(scopeState(task.state).pr.id, '104');
   assert.equal(task.state.center.requirementEdit.title, '未保存输入');
+});
+
+test('关闭仓库只隐藏列表，关闭最后一个后回首页，重新添加可恢复审查进度', () => {
+  const workspace = createWorkspaceState();
+  addRepositories(workspace, ['checkout', 'local-checkout']);
+  openRepository(workspace, 'checkout');
+  const task = loadRepositoryTarget(workspace, 'checkout', 'pr:104');
+  task.state.notes = '关闭后仍保留的草稿';
+  task.state.center.readingPositions = { '.editor-scroll': 96 };
+  closeRepository(workspace, 'checkout');
+  assert.equal(workspace.selectedRepository, 'local-checkout');
+  assert.equal(workspace.tasks[0], task);
+  closeRepository(workspace, 'local-checkout');
+  assert.deepEqual(workspace.openRepositories, []);
+  assert.equal(workspace.selectedRepository, null);
+  const restored = parseWorkspace(JSON.stringify(workspace));
+  addRepositories(restored, ['checkout']);
+  assert.equal(currentReviewTask(restored).id, task.id);
+  assert.equal(currentReviewTask(restored).state.notes, '关闭后仍保留的草稿');
+  assert.equal(currentReviewTask(restored).state.center.readingPositions['.editor-scroll'], 96);
+  assert.equal(scopeState(currentReviewTask(restored).state).pr.id, '104');
+});
+
+test('审查或文件读取中不能关闭仓库，失败保持当前上下文不变', () => {
+  const workspace = createWorkspaceState();
+  addRepositories(workspace, ['checkout']);
+  const task = loadRepositoryTarget(workspace, 'checkout', 'pr:104');
+  for (const status of ['running', 'reading']) {
+    task.state.runStatus = status === 'running' ? 'running' : 'idle';
+    task.state.sourceReview.readingFile = status === 'reading';
+    const before = JSON.stringify(workspace);
+    assert.throws(() => closeRepository(workspace, 'checkout'), /先结束审查或文件读取/);
+    assert.equal(JSON.stringify(workspace), before);
+  }
+  assert.throws(() => closeRepository(workspace, 'missing'), /不在当前工作区/);
+});
+
+test('同名GitHub与本地Repo分别保留上下文，本地无需远程授权即可加载分支', () => {
+  const workspace = createWorkspaceState();
+  addRepositories(workspace, ['checkout', 'local-checkout']);
+  openRepository(workspace, 'checkout');
+  const remote = loadRepositoryTarget(workspace, 'checkout', 'pr:104');
+  const sourceId = sources.addManualSource(remote.state, '远程要求', '仅用于远程仓库。', 'requirement');
+  remote.state.notes = '远程审查进度';
+  openRepository(workspace, 'local-checkout');
+  assert.equal(currentReviewTask(workspace), null);
+  const local = loadRepositoryTarget(workspace, 'local-checkout', 'branch:feat/payment-timeout');
+  assert.equal(scopeState(local.state).repository.source, 'local');
+  assert.equal(scopeState(local.state).repository.path, 'C:\\demo\\checkout-service');
+  assert.equal(scopeState(remote.state).repository.source, 'github');
+  assert.equal(scopeState(local.state).files.length, 12);
+  assert.equal(fileNavigation(local.state).rows.filter((row) => row.status === 'M').length, 3);
+  assert.ok(!local.state.sources.some((source) => source.id === sourceId));
+  local.state.notes = '本地审查进度';
+  const before = JSON.stringify(local.state);
+  assert.throws(() => loadRepositoryTarget(workspace, 'local-checkout', 'pr:104'), /未替换已有代码/);
+  assert.equal(JSON.stringify(local.state), before);
+  addRepositories(workspace, ['checkout', 'local-checkout']);
+  assert.deepEqual(workspace.openRepositories, ['checkout', 'local-checkout']);
+  openRepository(workspace, 'checkout');
+  assert.equal(currentReviewTask(workspace), remote);
+  assert.equal(remote.state.notes, '远程审查进度');
+  assert.equal(local.state.notes, '本地审查进度');
+});
+
+test('新增本地来源不破坏旧工作区存档，恢复时两来源仍独立', () => {
+  const workspace = createWorkspaceState();
+  const remote = createReviewTask(workspace, 'checkout');
+  remote.state.notes = '旧存档的内容';
+  delete workspace.repositoryMaterials['local-checkout'];
+  delete workspace.repositoryMaterials['local-sandbox'];
+  const restored = parseWorkspace(JSON.stringify(workspace));
+  assert.equal(currentReviewTask(restored).state.notes, '旧存档的内容');
+  assert.deepEqual(restored.openRepositories, ['checkout']);
+  assert.equal(restored.repositoryMaterials['local-checkout'][0].purpose, 'context');
+  addRepositories(restored, ['local-checkout']);
+  openRepository(restored, 'local-checkout');
+  const local = loadRepositoryTarget(restored, 'local-checkout', 'branch:main');
+  local.state.notes = '本地内容';
+  const reopened = parseWorkspace(JSON.stringify(restored));
+  assert.equal(currentReviewTask(reopened).state.notes, '本地内容');
+  openRepository(reopened, 'checkout');
+  assert.equal(currentReviewTask(reopened).state.notes, '旧存档的内容');
 });
 
 test('多 Repo 与同 Repo 的多个任务分别保留范围、原文、输入和进度', () => {

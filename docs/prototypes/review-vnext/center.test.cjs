@@ -72,12 +72,26 @@ test('工作区渐进显示Repo和代码，不创建任务页或常驻问题详�
   assert.doesNotMatch(controller, /renderRepositoryOverview|renderTaskPreparation|data-action="new-review"|id="task-picker"|id="task-title"/);
   assert.doesNotMatch(renderer, /class="issue-inspector"|with-inspector/);
   assert.doesNotMatch(html, /id="workspace-navigation"|data-action="new-review"/);
-  assert.match(controller, /action === 'finding-details'\) return openWorkspaceDialog\('问题详情', renderFindingInspector\)/);
+  assert.match(controller, /action === 'finding-details'\) return openInspector\('finding'\)/);
   const navigation = controller.slice(controller.indexOf('  function renderNavigator()'), controller.indexOf('  function renderTop()'));
   assert.match(navigation, /data-tab="files"/);
   assert.match(navigation, /data-tab="findings"/);
   assert.doesNotMatch(navigation, /data-tab="business"|data-tab="feedback"/);
   assert.match(controller, /problemGroups\(state\)\.open/);
+});
+
+test('首页直接提供Repo来源与授权选择，不再通过应用弹窗接入仓库', () => {
+  const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
+  const welcome = controller.slice(controller.indexOf('  function renderRepositoryWelcome()'), controller.indexOf('  function renderRepositoryList()'));
+  const picker = controller.slice(controller.indexOf('  function renderRepositoryPicker()'), controller.indexOf('  function closeCurrentModal()'));
+  assert.match(welcome, /renderRepositoryPicker\(\)/);
+  assert.doesNotMatch(welcome, /data-action="open-repository"/);
+  assert.doesNotMatch(picker, /openModal|showModal/);
+  assert.match(picker, /data-action="cancel-github-authorization"/);
+  assert.match(picker, /data-action="return-workspace"/);
+  assert.doesNotMatch(controller, /function openRepositoryDialog|function githubAuthorizationDialog/);
+  const positions = controller.slice(controller.indexOf('  function rememberReadingPosition()'), controller.indexOf('  function loadTarget('));
+  assert.match(positions, /if \(repositoryPicker\) return/);
 });
 
 test('三个关键案例都能映射到业务链和有效源码', () => {
@@ -170,7 +184,7 @@ test('选择Repo后用单个分支PR入口加载，无额外加载、审查范�
   assert.match(controller, /event.target.id === 'scope-target'\) return loadTarget\(event.target.value\)/);
   assert.match(controller, /function openRequirements\(\)/);
   assert.match(controller, /function openOpinion\(\)/);
-  assert.match(controller, /modalRenderer = renderer/);
+  assert.match(controller, /function renderDesktopInspector\(\)/);
 });
 
 test('问题定位到主要代码而非第一条证据，跨文件阅读不改变问题', () => {
@@ -667,43 +681,46 @@ test('场景切换仅属于演示工具，不常驻产品顶部或被当作实�
   assert.equal([...html.matchAll(/id="demo-scenario"/g)].length, 1);
 });
 
-test('仓库与对象选择放在左侧审查导航上方，不挤入顶栏或代码区', () => {
+test('桌面审查对象只放在代码区顶部，侧栏与品牌栏不重复提供', () => {
   const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
   const header = html.match(/<header class="command-bar">[\s\S]*?<\/header>/);
   assert.ok(header);
-  assert.doesNotMatch(header[0], /id="context-bar"/);
+  assert.doesNotMatch(header[0], /id="scope-target"|id="run-review"|id="review-opinion-toggle"/);
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
   const navigation = controller.slice(controller.indexOf('  function renderNavigator()'), controller.indexOf('  function renderTop()'));
-  assert.match(navigation, /renderContextControls\(\)/);
-  assert.ok(navigation.indexOf('renderContextControls()') < navigation.indexOf('navigator-heading'));
-  assert.equal([...controller.matchAll(/id="context-bar"/g)].length, 1);
+  assert.doesNotMatch(navigation, /renderContextControls|renderScopeSelection|scope-target/);
+  const renderer = controller.slice(controller.indexOf('  function render(preserve'), controller.indexOf('  function stage(id)'));
+  assert.match(renderer, /class="review-stage">\$\{renderContextControls\(\)\}/);
+  assert.equal([...controller.matchAll(/id="scope-target"/g)].length, 1);
 });
 
-test('审查对象可手动折叠，选择、审查与范围切换不覆盖手动状态', () => {
+test('桌面辅助面板按需呈现，切换审查对象关闭旧面板而保留需求输入', () => {
   const state = createCenterState('fresh');
-  assert.equal(state.center.contextExpanded, true);
-  state.center.contextExpanded = false;
+  assert.equal(state.center.panel, null);
+  state.center.panel = 'requirements';
   selectFile(state, 'callback');
   prepareForReview(state);
   completeReview(state);
   selectFinding(state, 'F-02');
-  assert.equal(state.center.contextExpanded, false);
+  assert.equal(state.center.panel, 'requirements');
   changeScope(state, { repository: 'sandbox' });
-  assert.equal(state.center.contextExpanded, false);
+  assert.equal(state.center.panel, null);
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
-  assert.match(controller, /<details id="context-bar"/);
-  assert.match(controller, /class="context-toggle"/);
-  assert.match(controller, /'context-bar': 'contextExpanded'/);
+  assert.doesNotMatch(controller, /<details id="context-bar"|openWorkspaceDialog/);
+  assert.match(controller, /id="desktop-inspector"/);
+  assert.match(controller, /data-action="close-panel"/);
 });
 
-test('折叠箭头复用固定尺寸SVG图标，不用字体字符模拟箭头', () => {
+test('桌面提供可操作分隔条与键盘仓库菜单，不模拟无效的窗口按钮', () => {
   const controller = readFileSync(join(__dirname, 'center.js'), 'utf8');
-  const control = controller.slice(controller.indexOf('  function renderContextControls()'), controller.indexOf('  function renderNavigator()'));
-  assert.ok(control.includes("${icon('chevron')}<span>"));
-  const css = readFileSync(join(__dirname, 'center.css'), 'utf8');
-  assert.doesNotMatch(css, /\.context-toggle::before/);
-  assert.match(css, /\.context-toggle > svg\s*\{[^}]*width: 12px;[^}]*height: 12px;/);
-  assert.match(css, /\.context-toggle\s*\{[^}]*align-items: center;/);
+  assert.match(controller, /id="sidebar-resize"[^>]*role="separator"/);
+  assert.match(controller, /setPointerCapture\(event.pointerId\)/);
+  assert.match(controller, /event.shiftKey && event.key === 'F10'/);
+  const menu = controller.slice(controller.indexOf('  function openRepositoryMenu('), controller.indexOf('  function setSidebarWidth('));
+  assert.doesNotMatch(menu, /scope-target|选择分支|data-action="requirements"/);
+  assert.match(menu, /data-action="close-repository"/);
+  const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
+  assert.doesNotMatch(html, /data-action="(?:minimize|maximize|close-window)"/);
 });
 
 test('需求就地修订先保留草稿，保存不覆盖来源原文', () => {
@@ -967,7 +984,7 @@ test('字号统一为12px辅助、13px操作、14px正文和16/20px标题', () =
     .map((match) => [match[1], Number(match[2])]));
   assert.deepEqual(sizes, { xs: 12, sm: 13, md: 14, lg: 16, xl: 20 });
   assert.match(root, /font-size:\s*var\(--font-md\)/);
-  for (const selector of ['.button', '.scope-field select', '.context-toggle', '.code-linked .file-nav > span']) {
+  for (const selector of ['.button', '.scope-field select', '.repo-item-label strong', '.code-linked .file-nav > span']) {
     const rule = stylesheet.slice(stylesheet.indexOf(`${selector} {`)).split('}')[0];
     assert.match(rule, /font-size:\s*var\(--font-sm\)/, selector);
   }

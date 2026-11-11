@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="Review vNext 离线原型：选择一个或多个 Repo，选择分支或 PR 后直接浏览代码，补充可选需求，审查并定位问题。未连接模型或真实仓库。">
-  <title>Review vNext · 代码审查</title>
+  <meta name="description" content="AI Coding Review 独立桌面应用交互原型：主页连接 GitHub 或本地仓库，代码区选择分支/PR，定位问题并按需核对需求、证据与修复。仅使用离线演示数据。">
+  <title>AI Coding Review · 桌面原型</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23182226'/%3E%3Cpath d='m8 16 5 5 11-12' fill='none' stroke='%2376d6b7' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="./center.css">
   <script defer src="./app.js"></script>
@@ -16,9 +16,20 @@
 </head>
 <body>
   <a class="skip-link" href="#review-main">跳到主要内容</a>
-  <div class="review-shell single-page code-linked">
-    <div class="demo-bar">
-      <div class="demo-identity"><span class="prototype-indicator"></span><strong>Review vNext · 离线原型</strong><span>未连接模型与真实仓库</span></div>
+  <div class="review-shell single-page code-linked desktop-app">
+    <header class="command-bar">
+      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">桌面原型</span></div></div>
+      <div class="command-actions">
+        <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
+        <button id="center-theme" class="icon-button" data-action="theme" aria-label="切换为浅色主题" title="切换主题"></button>
+      </div>
+    </header>
+    <div class="center-workspace">
+      <main id="review-main" tabindex="-1"></main>
+    </div>
+    <footer class="demo-bar">
+      <div class="demo-identity"><span class="prototype-indicator"></span><span>离线演示 · 未连接真实仓库与模型</span></div>
+      <span id="workspace-status" role="status" aria-live="polite">选择代码仓库</span>
       <div class="demo-controls">
         <details id="demo-tools" class="demo-tools">
           <summary>演示工具</summary>
@@ -50,20 +61,9 @@
           </div>
         </details>
       </div>
-    </div>
-    <header class="command-bar">
-      <div class="product-lockup"><span id="product-mark" class="product-mark"></span><div><strong>AI Coding Review</strong><span id="repository-context">离线原型 · 未连接模型与真实仓库</span></div></div>
-      <div class="command-actions">
-        <button class="icon-button" data-action="help" aria-label="原型说明" title="原型说明"></button>
-        <button id="center-theme" class="icon-button" data-action="theme" aria-label="切换为浅色主题" title="切换主题"></button>
-        <button id="review-opinion-toggle" class="button" data-action="opinion" hidden>审查意见</button>
-        <button id="run-review" class="button primary" data-action="run" hidden></button>
-      </div>
-    </header>
-    <div class="center-workspace">
-      <main id="review-main" tabindex="-1"></main>
-    </div>
+    </footer>
   </div>
+  <div id="repository-menu" class="repository-menu" role="menu" aria-label="仓库操作" tabindex="-1" hidden></div>
   <dialog id="center-modal" class="single-page" aria-labelledby="center-modal-title"></dialog>
   <input type="file" id="requirement-file" accept=".md,.markdown,.txt,text/markdown,text/plain" hidden>
   <div id="center-toast" class="toast" role="status" aria-live="polite" hidden></div>
